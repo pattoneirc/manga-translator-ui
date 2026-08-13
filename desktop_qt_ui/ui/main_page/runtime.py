@@ -1,18 +1,11 @@
 from PyQt6.QtCore import QTimer
 
-from ui.theme import repolish_widget
-
-
 def _set_progress_state(self, state: str):
-    if hasattr(self, "progress_bar"):
-        self.progress_bar.setProperty("progressState", state)
-        repolish_widget(self.progress_bar)
+    return
 
 
 def _set_start_button_state(self, state: str):
-    if hasattr(self, "start_button"):
-        self.start_button.setProperty("translationState", state)
-        repolish_widget(self.start_button)
+    return
 
 
 def update_workflow_mode_description(self, index: int | None = None):
@@ -62,11 +55,16 @@ def update_workflow_mode_description(self, index: int | None = None):
 
 def update_progress(self, current: int, total: int, message: str = ""):
     """更新进度条。"""
+    progress_state = (int(current), int(total), str(message or ""))
+    if getattr(self, "_last_progress_state", None) == progress_state:
+        return
+    self._last_progress_state = progress_state
+
     if total > 0:
         self.progress_bar.setMaximum(total)
         self.progress_bar.setValue(current)
         percentage = int((current / total) * 100) if total > 0 else 0
-        self.progress_bar.setFormat(f"{current}/{total} ({percentage}%)")
+        self.progress_count_label.setText(f"{current}/{total} ({percentage}%)")
         if hasattr(self, "progress_info_label"):
             self.progress_info_label.setText(message or f"已完成 {current}/{total}")
 
@@ -77,7 +75,7 @@ def update_progress(self, current: int, total: int, message: str = ""):
         self._progress_active = False
         self.progress_bar.setMaximum(100)
         self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("0/0 (0%)")
+        self.progress_count_label.setText("0/0 (0%)")
         if hasattr(self, "progress_info_label"):
             self.progress_info_label.setText("")
         _set_progress_state(self, "idle")
@@ -85,10 +83,11 @@ def update_progress(self, current: int, total: int, message: str = ""):
 
 def reset_progress(self):
     """重置进度条为初始状态（灰色）。"""
+    self._last_progress_state = None
     self._progress_active = False
     self.progress_bar.setMaximum(100)
     self.progress_bar.setValue(0)
-    self.progress_bar.setFormat("0/0 (0%)")
+    self.progress_count_label.setText("0/0 (0%)")
     if hasattr(self, "progress_info_label"):
         self.progress_info_label.setText("")
     _set_progress_state(self, "idle")
@@ -96,6 +95,22 @@ def reset_progress(self):
 
 def on_translation_state_changed(self, is_translating: bool):
     """根据翻译状态更新开始/停止按钮。"""
+    # 文件列表保持可选择，以便翻译期间仍可从主页进入编辑器；文件增删
+    # 控件和业务层修改入口继续锁定，避免改变当前任务的输入。
+    for name in (
+        "add_files_button",
+        "add_folder_button",
+        "clear_list_button",
+        "env_page",
+    ):
+        widget = getattr(self, name, None)
+        if widget is not None:
+            widget.setEnabled(not is_translating)
+
+    file_list = getattr(self, "file_list", None)
+    if file_list is not None and hasattr(file_list, "set_remove_enabled"):
+        file_list.set_remove_enabled(not is_translating)
+
     if is_translating:
         self.start_button.setEnabled(False)
         self.start_button.setText(self._t("Starting..."))
@@ -114,7 +129,10 @@ def on_translation_state_changed(self, is_translating: bool):
 
 def enable_stop_button(self):
     """启用停止按钮（延迟调用）。"""
-    if self.controller.state_manager.is_translating():
+    if (
+        self.controller.state_manager.is_translating()
+        and not getattr(self.controller, "_stop_requested", False)
+    ):
         self.start_button.setEnabled(True)
         self.start_button.setText(self._t("Stop Translation"))
         _set_start_button_state(self, "stop")
@@ -141,27 +159,27 @@ def sync_workflow_mode_from_config(self):
     try:
         config = self.config_service.get_config()
         self.workflow_mode_combo.blockSignals(True)
-
-        if config.cli.replace_translation:
-            self.workflow_mode_combo.setCurrentIndex(8)
-        elif config.cli.inpaint_only:
-            self.workflow_mode_combo.setCurrentIndex(7)
-        elif config.cli.upscale_only:
-            self.workflow_mode_combo.setCurrentIndex(6)
-        elif config.cli.colorize_only:
-            self.workflow_mode_combo.setCurrentIndex(5)
-        elif config.cli.load_text:
-            self.workflow_mode_combo.setCurrentIndex(4)
-        elif config.cli.translate_json_only:
-            self.workflow_mode_combo.setCurrentIndex(3)
-        elif config.cli.template:
-            self.workflow_mode_combo.setCurrentIndex(2)
-        elif config.cli.generate_and_export:
-            self.workflow_mode_combo.setCurrentIndex(1)
-        else:
-            self.workflow_mode_combo.setCurrentIndex(0)
-
-        self.workflow_mode_combo.blockSignals(False)
+        try:
+            if config.cli.replace_translation:
+                self.workflow_mode_combo.setCurrentIndex(8)
+            elif config.cli.inpaint_only:
+                self.workflow_mode_combo.setCurrentIndex(7)
+            elif config.cli.upscale_only:
+                self.workflow_mode_combo.setCurrentIndex(6)
+            elif config.cli.colorize_only:
+                self.workflow_mode_combo.setCurrentIndex(5)
+            elif config.cli.load_text:
+                self.workflow_mode_combo.setCurrentIndex(4)
+            elif config.cli.translate_json_only:
+                self.workflow_mode_combo.setCurrentIndex(3)
+            elif config.cli.template:
+                self.workflow_mode_combo.setCurrentIndex(2)
+            elif config.cli.generate_and_export:
+                self.workflow_mode_combo.setCurrentIndex(1)
+            else:
+                self.workflow_mode_combo.setCurrentIndex(0)
+        finally:
+            self.workflow_mode_combo.blockSignals(False)
         update_workflow_mode_description(self, self.workflow_mode_combo.currentIndex())
     except Exception as e:
         print(f"Error syncing workflow mode: {e}")

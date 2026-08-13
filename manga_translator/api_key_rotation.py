@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
+import hmac
 import re
+import secrets
 import threading
 import time
 from dataclasses import dataclass
@@ -28,10 +29,11 @@ ROTATION_STRATEGIES = {
 }
 
 _STATUS_RE = re.compile(r"\b(400|402|404|429)\b")
-_INDEXED_ENV_RE = re.compile(r"^(?P<base>.+)_(?P<index>[2-9]\d*)$")
+_INDEXED_ENV_RE = re.compile(r"^(?P<base>.+)_(?P<index>[1-9]\d*)$")
 _STATUS_LOCK = threading.RLock()
 _API_STATUS: dict[str, dict[str, Any]] = {}
 _ROUND_ROBIN_CURSORS: dict[str, int] = {}
+_STATUS_KEY_SECRET = secrets.token_bytes(32)
 
 T = TypeVar("T")
 
@@ -139,7 +141,8 @@ def make_endpoint_status_key(
 ) -> str:
     api_key_text = str(api_key or "").strip()
     api_key_fingerprint = (
-        hashlib.sha256(api_key_text.encode("utf-8")).hexdigest()[:12]
+        # This is a keyed, process-local cache identifier, not a stored password hash.
+        hmac.digest(_STATUS_KEY_SECRET, api_key_text.encode("utf-8"), "sha256").hex()[:12]  # lgtm[py/weak-sensitive-data-hashing]
         if api_key_text
         else "no-key"
     )
@@ -179,6 +182,15 @@ def is_endpoint_unavailable(endpoint: APIEndpoint) -> bool:
     return False
 
 
+def get_api_status(endpoint: APIEndpoint) -> dict[str, Any] | None:
+    return _get_status(endpoint.status_key)
+
+
+def clear_api_status(endpoint: APIEndpoint) -> None:
+    with _STATUS_LOCK:
+        _API_STATUS.pop(endpoint.status_key, None)
+
+
 def record_api_success(endpoint: APIEndpoint) -> None:
     with _STATUS_LOCK:
         payload = _endpoint_identity(endpoint)
@@ -207,8 +219,6 @@ def _extract_status_code(error: Exception) -> int | None:
             return int(getattr(response, "status_code", None))
         except (TypeError, ValueError):
             pass
-    if isinstance(error, (RuntimeError, ValueError, TypeError, KeyError, AttributeError)):
-        return None
     match = _STATUS_RE.search(str(error or ""))
     if match:
         try:
@@ -223,9 +233,47 @@ def _message_contains(error: Exception, markers: Iterable[str]) -> bool:
     return any(marker in message for marker in markers)
 
 
+def _is_bad_request_api_unavailable_error(error: Exception) -> bool:
+    return _message_contains(
+        error,
+        (
+            "api key not valid",
+            "api_key_invalid",
+            "invalid api key",
+            "invalid api_key",
+            "api key expired",
+            "api key has expired",
+            "api key revoked",
+            "invalid authentication",
+            "invalid credentials",
+            "permission denied",
+            "access denied",
+            "model not found",
+            "not found for api version",
+            "supported api model names",
+            "model does not exist",
+            "unsupported model",
+            "invalid model",
+            "unknown variant `image_url`",
+            "unknown variant 'image_url'",
+            "expected `text`",
+            "expected 'text'",
+            "did not contain an image",
+            "did not contain image data",
+            "compatible image output interface",
+            "only support text chat",
+            "not image generation/editing output",
+        ),
+    )
+
+
 def is_permanent_api_unavailable_error(error: Exception) -> bool:
     status_code = _extract_status_code(error)
-    if status_code in (400, 402, 404):
+    if status_code == 400:
+        return _is_bad_request_api_unavailable_error(error)
+    if status_code in (402, 404):
+        return True
+    if _is_bad_request_api_unavailable_error(error):
         return True
     return _message_contains(
         error,
@@ -343,7 +391,9 @@ async def run_with_api_candidates(
 ) -> T:
     candidates = iter_api_candidates(endpoints, strategy)
     if not candidates:
-        raise RuntimeError(f"{provider_name} has no available API candidates for {operation_name}.")
+        raise APIRotationExhaustedError(
+            f"{provider_name} has no available API candidates for {operation_name}."
+        )
 
     if retry_attempts is None:
         retry_attempts = get_retry_attempts_from_config(

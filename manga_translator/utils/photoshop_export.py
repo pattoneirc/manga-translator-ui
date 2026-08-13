@@ -13,8 +13,23 @@ import tempfile
 from typing import Optional
 
 from . import Context
+from ..rendering.rich_text import plain_text_of
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_photoshop_font(config) -> str | None:
+    """获取 PSD 文本层使用的渲染字体。"""
+    render_cfg = getattr(config, 'render', None)
+    font_family = getattr(render_cfg, 'font_family', None)
+    if isinstance(font_family, str) and font_family.strip():
+        return font_family.strip()
+    return None
+
+
+def _translation_plain_text(value) -> str:
+    # 薄委托：富文本→纯文本的唯一实现在 rendering.rich_text.plain_text_of
+    return plain_text_of(value)
 
 
 # 对齐方式映射到 Photoshop 的 Justification 枚举
@@ -352,6 +367,20 @@ def escape_jsx_string(text: str) -> str:
     return text
 
 
+def escape_jsx_path(path: str) -> str:
+    """将文件路径转换为可安全嵌入 JSX 单引号字符串的形式。
+
+    Photoshop 的 ExtendScript 使用单引号包裹路径；路径中的英文单引号
+    必须转义，否则会提前结束字符串并导致脚本语法错误。Windows 反斜杠
+    同时统一转换为正斜杠，避免被 JSX 当作转义序列解析。
+    """
+    if not path:
+        return ""
+
+    # 先统一路径分隔符，再转义 JSX 字符串中的特殊字符。
+    return path.replace("\\", "/").replace("'", "\\'")
+
+
 # 竖排文字中需要縦中横（横排显示）的符号映射
 # 将多字符符号替换为单个全角字符，避免竖排时分开显示
 VERTICAL_HORIZONTAL_MAP = {
@@ -410,7 +439,7 @@ def generate_text_layer_jsx(index: int, text_region, default_font: str, line_spa
     
     # 文本内容（使用翻译后的文本）
     # 先进行竖排文字预处理（縦中横等）
-    raw_text = text_region.translation
+    raw_text = _translation_plain_text(text_region.translation)
     processed_text = preprocess_vertical_text(raw_text, is_vertical)
     text = escape_jsx_string(processed_text)
     
@@ -424,7 +453,7 @@ def generate_text_layer_jsx(index: int, text_region, default_font: str, line_spa
         logger.warning(f"文本层 {index} 的translation为空，跳过")
         return ""
     
-    logger.debug(f"文本层 {index}: 原文='{' '.join(text_region.text)[:30]}', 译文='{text_region.translation[:30]}'")
+    logger.debug(f"文本层 {index}: 原文='{' '.join(text_region.text)[:30]}', 译文='{raw_text[:30]}'")
     
     # 位置和尺寸 - 使用渲染阶段计算的 dst_points
     # dst_points 是 shape (1, 4, 2) 的数组，包含4个角点
@@ -442,7 +471,7 @@ def generate_text_layer_jsx(index: int, text_region, default_font: str, line_spa
     # 计算行数 (使用与 escape_jsx_string 相同的正则逻辑)
     import re
     # 支持半角 [BR] 和全角 【BR】
-    num_lines = len(re.split(r'\s*(?:\[|【)BR(?:\]|】)\s*', text_region.translation, flags=re.IGNORECASE))
+    num_lines = len(re.split(r'\s*(?:\[|【)BR(?:\]|】)\s*', raw_text, flags=re.IGNORECASE))
     
     # 字体大小
     font_size = text_region.font_size
@@ -518,7 +547,7 @@ def generate_text_layer_jsx(index: int, text_region, default_font: str, line_spa
         has_tcy = any(c in processed_text for c in tcy_chars)
         if has_tcy:
             tcy_code = f"""
-    // 应用縦中横（竖排内横排）
+    // 应用 Photoshop 縦中横
     var tcyPositions{index} = findTateChuYokoPositions(textItem{index}.contents);
     var tcyFontSize{index} = {font_size};
     for (var ti{index} = 0; ti{index} < tcyPositions{index}.length; ti{index}++) {{
@@ -674,7 +703,7 @@ def photoshop_export(output_file: str, ctx: Context, default_font: str = None, i
         font_basename = os.path.splitext(os.path.basename(default_font))[0]
         logger.warning(f"检测到 default_font 是文件路径: {default_font}")
         logger.warning(f"已提取字体名称: {font_basename}")
-        logger.warning("提示: 请在配置中使用 'psd_font' 参数指定字体名称，而不是文件路径")
+        logger.warning("提示: 请使用系统字体列表选择字体名称，而不是字体文件路径")
         default_font = font_basename
     
     # 创建临时文件（只用于修复图和遮罩）
@@ -710,14 +739,14 @@ def photoshop_export(output_file: str, ctx: Context, default_font: str = None, i
         inpainted_layer_code = ""
         if hasattr(ctx, 'img_inpainted') and ctx.img_inpainted is not None and _save_image_like_to_temp(ctx.img_inpainted, inpainted_file):
             inpainted_layer_code = INPAINTED_LAYER_TEMPLATE.format(
-                inpainted_file=inpainted_file.replace("\\", "/")  # 使用正斜杠
+                inpainted_file=escape_jsx_path(inpainted_file)
             )
             logger.info("PSD修复图使用当前会话结果")
         elif image_path:
             inpainted_path = get_inpainted_path(image_path, create_dir=False)
             if os.path.exists(inpainted_path):
                 inpainted_layer_code = INPAINTED_LAYER_TEMPLATE.format(
-                    inpainted_file=inpainted_path.replace("\\", "/")  # 使用正斜杠
+                    inpainted_file=escape_jsx_path(inpainted_path)
                 )
                 logger.info(f"PSD修复图回退工作目录: {inpainted_path}")
             else:
@@ -739,11 +768,11 @@ def photoshop_export(output_file: str, ctx: Context, default_font: str = None, i
                 text_layers_code += generate_text_layer_jsx(i, region, default_font, line_spacing)
         
         # 生成完整的 JSX 脚本
-        # 路径转义：Windows路径的反斜杠需要转义为双反斜杠
+        # 路径转义：统一使用正斜杠，并转义单引号，避免破坏 JSX 字符串。
         jsx_script = JSX_TEMPLATE.format(
-            input_file=input_file.replace("\\", "/"),  # 使用正斜杠，JSX支持
-            output_file=output_file.replace("\\", "/"),
-            error_file=error_file.replace("\\", "/"),
+            input_file=escape_jsx_path(input_file),
+            output_file=escape_jsx_path(output_file),
+            error_file=escape_jsx_path(error_file),
             inpainted_layer_code=inpainted_layer_code,
             mask_layer_code=mask_layer_code,
             text_layers_code=text_layers_code,

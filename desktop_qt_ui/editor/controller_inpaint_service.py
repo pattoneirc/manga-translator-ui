@@ -55,6 +55,11 @@ class EditorControllerInpaintService:
         cached_image = self.resource_manager.get_cache(self.controller.CACHE_LAST_INPAINTED)
         return image_like_to_rgb_array(cached_image, copy=True)
 
+    def clear_document_cache(self) -> None:
+        self.resource_manager.clear_cache(self.controller.CACHE_LAST_INPAINTED)
+        self.resource_manager.clear_cache(self.controller.CACHE_LAST_MASK)
+        self.resource_manager.clear_weak_cache(self.controller.WEAK_CACHE_BASE_IMAGE_RGB)
+
     def get_base_image_rgb_array(self) -> Optional[np.ndarray]:
         image = self.controller._get_current_image()
         if image is None:
@@ -354,33 +359,51 @@ class EditorControllerInpaintService:
         self.model.set_brush_color(color)
 
     def clear_paint_overlay(self) -> None:
+        self._clear_overlay_layer("paint")
+
+    def clear_stamp_overlay(self) -> None:
+        self._clear_overlay_layer("stamp")
+
+    def _clear_overlay_layer(self, layer: str) -> None:
         try:
             from editor.commands import PaintOverlayEditCommand
 
-            old = self.model.get_paint_overlay_image()
+            is_stamp = layer == "stamp"
+            old = (
+                self.model.get_stamp_overlay_image()
+                if is_stamp
+                else self.model.get_paint_overlay_image()
+            )
             if old is None:
                 return
             import numpy as np
 
+            def _set(image):
+                if is_stamp:
+                    self.model.set_stamp_overlay_image(image)
+                else:
+                    self.model.set_paint_overlay_image(image)
+
             old_arr = np.asarray(old)
             if old_arr.size == 0:
-                self.model.set_paint_overlay_image(None)
+                _set(None)
                 return
             if old_arr.ndim == 3 and old_arr.shape[2] == 4:
                 has_content = bool(np.any(old_arr[..., 3]))
             else:
                 has_content = bool(np.any(old_arr))
             if not has_content:
-                self.model.set_paint_overlay_image(None)
+                _set(None)
                 return
             command = PaintOverlayEditCommand(
                 model=self.model,
                 old_overlay=old_arr.copy(),
                 new_overlay=None,
+                layer=layer,
             )
             self.controller.execute_command(command)
         except Exception as e:
-            self.logger.error(f"Clear paint overlay failed: {e}", exc_info=True)
+            self.logger.error(f"Clear {layer} overlay failed: {e}", exc_info=True)
 
     def clear_all_masks(self) -> None:
         try:

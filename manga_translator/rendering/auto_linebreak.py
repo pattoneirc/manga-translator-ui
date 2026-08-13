@@ -1,9 +1,10 @@
 # auto_linebreak v2.1.0
-# 完全自包含的换行引擎：竖排 <H> 块、CJK 标点禁则、英文连字符均内嵌在布局决策阶段
+# 完全自包含的换行引擎：CJK 标点禁则、英文连字符均内嵌在布局决策阶段
 import math
 import os
 import re
 import tempfile
+import unicodedata
 from bisect import bisect_left
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
@@ -14,16 +15,16 @@ from shapely.geometry import Polygon
 from . import text_render
 from .text_render import (
     CJK_Compatibility_Forms_translate,
-    calc_horizontal_block_height,
-    compact_special_symbols,
     get_char_offset_x,
     get_char_offset_y,
     get_vertical_char_bitmap_width,
     get_string_width,
-    normalize_vertical_ellipsis_text,
     select_hyphenator,
 )
-from ..utils.textblock import LANGUAGE_ORIENTATION_PRESETS
+from .chinese_linebreak import append_chinese_linebreak_debug_record, layout_chinese_cjk
+from ..utils.log import get_logger
+
+logger = get_logger('render')
 
 _PYTHAINLP_DATA_DIR = os.path.join(tempfile.gettempdir(), "manga-translator-ui", "pythainlp-data")
 os.environ.setdefault("PYTHAINLP_DATA", _PYTHAINLP_DATA_DIR)
@@ -50,8 +51,14 @@ class NoBrLayoutResult:
 
 
 def _normalize_no_br_text(text: str, horizontal: bool = False) -> str:
-    text = compact_special_symbols(text or "", convert_ascii_ellipsis=not horizontal)
-    return re.sub(r"\s*(\[BR\]|<br>|【BR】)\s*", "", text, flags=re.IGNORECASE)
+    return re.sub(r"\s*(\[BR\]|<br>|【BR】)\s*", "", text or "", flags=re.IGNORECASE)
+
+
+def _compact_debug_text(text: str, limit: int = 120) -> str:
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 1)] + "…"
 
 
 def _calculate_uniformity(values: List[float]) -> float:
@@ -64,8 +71,107 @@ def _calculate_uniformity(values: List[float]) -> float:
     return math.sqrt(variance) / mean_v
 
 
+_LINE_QUALITY_PREFERRED_BREAK_CHARS = set("，、。．｡､,.!?！？；;：:﹐﹑﹒﹔﹕﹖﹗︐︑︒︓︔︕︖…‥⋯︰⋮︙︴—－–−︱︲～〜〰~≀|")
+_LINE_QUALITY_STRONG_STANDALONE_MARKS = set("!?！？︕︖⁈⁉‼…‥⋯︰⋮︙♪♫♬♡♥❤★☆")
+_LINE_QUALITY_CLOSING_CHARS = set(
+    "”’〞〟＂＇»›"
+    "》，」』】）﹂﹄︶︸︺︼︾﹀﹚﹜﹞﹈)]｝｣》〉"
+    "⁆⟧⟩⟫⦄⦆⦈⦊⦌⦎⦐⦒⧽"
+)
+
+
+def _visible_line_quality_text(line: str) -> str:
+    return str(line or "").strip()
+
+
+def _line_quality_content_char_count(line: str) -> int:
+    visible = _visible_line_quality_text(line)
+    count = 0
+    for char in visible:
+        if char.isspace():
+            continue
+        if unicodedata.category(char)[:1] in {"L", "N"}:
+            count += 1
+    return count
+
+
+def _is_weak_single_char_quality_line(line: str, line_index: int = 0) -> bool:
+    visible = _visible_line_quality_text(line)
+    if not visible:
+        return False
+    content_count = _line_quality_content_char_count(visible)
+    if content_count == 0:
+        return True
+    if content_count == 1:
+        has_strong_mark = any(char in _LINE_QUALITY_STRONG_STANDALONE_MARKS for char in visible)
+        return line_index > 0 if has_strong_mark else True
+    return False
+
+
+def _line_ends_at_preferred_break(line: str) -> bool:
+    visible = _visible_line_quality_text(line)
+    if not visible:
+        return False
+    index = len(visible) - 1
+    while index >= 0 and visible[index] in _LINE_QUALITY_CLOSING_CHARS:
+        index -= 1
+    return index >= 0 and visible[index] in _LINE_QUALITY_PREFERRED_BREAK_CHARS
+
+
+def _target_line_count_penalty(line_count: int, target_segments: int) -> int:
+    target = max(1, int(target_segments))
+    if target <= 2:
+        return abs(line_count - target)
+    if line_count in (target - 1, target):
+        return 0
+    return min(abs(line_count - target), abs(line_count - (target - 1)))
+
+
+def _minimum_quality_line_count(target_segments: int) -> int:
+    target = max(1, int(target_segments))
+    if target <= 2:
+        return target
+    return target - 1
+
+
+def _line_break_quality_score(
+    lines: List[str],
+    metrics: List[int],
+    target_segments: int,
+) -> Tuple[int, int, int, int, int, float]:
+    line_count = len(lines)
+    target = max(1, int(target_segments))
+    target_penalty = _target_line_count_penalty(line_count, target)
+    too_many_penalty = max(0, line_count - target)
+    too_few_penalty = max(0, _minimum_quality_line_count(target) - line_count)
+    weak_single_count = sum(1 for idx, line in enumerate(lines) if _is_weak_single_char_quality_line(line, idx))
+    preferred_breaks = sum(1 for line in lines[:-1] if _line_ends_at_preferred_break(line))
+    uniformity = _calculate_uniformity(metrics if metrics else [len(line) for line in lines])
+    return (
+        target_penalty,
+        too_few_penalty + too_many_penalty,
+        weak_single_count,
+        -preferred_breaks,
+        too_many_penalty,
+        uniformity,
+    )
+
+
 def _hyphenate_enabled(config: Any) -> bool:
     return not (config and hasattr(config, "render") and getattr(config.render, "no_hyphenation", False))
+
+
+def _semantic_linebreak_enabled(config: Any) -> bool:
+    return bool(config and hasattr(config, "render") and getattr(config.render, "semantic_linebreak", False))
+
+
+_LINEBREAK_EDGE_PUNCT_RE = re.compile(r"([，。．｡,.︐︒﹐﹒‚„]+)?\s*(\[BR\]|<br>|【BR】)\s*([，。．｡,.︐︒﹐﹒‚„]+)?", re.IGNORECASE)
+
+
+def strip_linebreak_edge_punctuation(text: str) -> str:
+    if not text:
+        return text
+    return _LINEBREAK_EDGE_PUNCT_RE.sub(lambda match: match.group(2), text)
 
 
 def _resolve_current_region_render_horizontal(region: Any) -> bool:
@@ -78,12 +184,8 @@ def _resolve_current_region_render_horizontal(region: Any) -> bool:
     return bool(getattr(region, "horizontal", False))
 
 
-def _resolve_current_region_auto_direction(region: Any) -> str:
-    target_lang = getattr(region, "target_lang", None)
-    preset_direction = LANGUAGE_ORIENTATION_PRESETS.get(target_lang)
-    if preset_direction in ("h", "v", "hr", "vr"):
-        return preset_direction
-
+def _resolve_current_region_source_direction(region: Any) -> str:
+    """Infer the source bubble direction from OCR geometry, not the target language."""
     lines = getattr(region, "lines", None)
     if lines is not None and len(lines) > 0:
         max_area = -1.0
@@ -115,8 +217,8 @@ def _resolve_current_region_auto_direction(region: Any) -> str:
 
 
 def _current_region_direction_mismatch(region: Any) -> bool:
-    auto_direction = _resolve_current_region_auto_direction(region)
-    return auto_direction.startswith("h") != _resolve_current_region_render_horizontal(region)
+    source_direction = _resolve_current_region_source_direction(region)
+    return source_direction.startswith("h") != _resolve_current_region_render_horizontal(region)
 
 
 def should_force_no_wrap_single_region(region: Any) -> bool:
@@ -131,13 +233,7 @@ def should_force_no_wrap_single_region(region: Any) -> bool:
 # 竖排换行引擎（完全内嵌，不依赖 text_render.calc_vertical）
 # ---------------------------------------------------------------------------
 
-_H_BLOCK_RE = re.compile(r'(<H>.*?</H>)', re.IGNORECASE | re.DOTALL)
 _BR_RE = re.compile(r'\s*(\[BR\]|<br>|【BR】)\s*', re.IGNORECASE)
-
-
-def _h_block_height(font_size: int, content: str, letter_spacing: float = 1.0) -> int:
-    """计算 <H> 横排块在竖排列中占用的高度，直接复用 text_render 的精确实现。"""
-    return calc_horizontal_block_height(font_size, content, letter_spacing=letter_spacing)
 
 
 def _vert_char_advance(font_size: int, cdpt: str, letter_spacing: float = 1.0) -> int:
@@ -158,9 +254,8 @@ def _vert_char_metrics(font_size: int, cdpt: str, letter_spacing: float = 1.0) -
     """一次取竖排进量和字形宽度，避免 layout 尺寸计算重复查同一字形。"""
     try:
         base = text_render._vertical_base(font_size, '　' if cdpt == '＿' else cdpt, letter_spacing)
-        bitmap = base.get('bitmap')
-        width = font_size if bitmap is None or bitmap.size == 0 else int(bitmap.shape[1])
-        return int(base.get('advance_y') or font_size), width
+        width = int(base.frame_width or font_size)
+        return int(base.advance_y or font_size), width
     except Exception:
         return (
             _vert_char_advance(font_size, cdpt, letter_spacing=letter_spacing),
@@ -173,15 +268,13 @@ def _layout_vertical(font_size: int, text: str, max_height: int, config: Any = N
     竖排换行引擎，完全自包含。
 
     特性：
-    1. <H> 块用 _h_block_height 计算高度（和渲染一致）
-    2. 普通 CJK 字符用 vertAdvance 逐字累积
-    3. CJK_H2V 字形替换（通过 CJK_Compatibility_Forms_translate）
-    4. [BR]/<br> 等统一预处理为 \n
-    5. 输出的 line 文本保留 <H> 标签供渲染侧使用
+    1. 普通 CJK 字符用 vertAdvance 逐字累积
+    2. CJK_H2V 字形替换（通过 CJK_Compatibility_Forms_translate）
+    3. [BR]/<br> 等统一预处理为 \n
 
     返回 (line_text_list, line_height_list)
     """
-    text = normalize_vertical_ellipsis_text(compact_special_symbols(text))
+    text = text or ''
     text = _BR_RE.sub('\n', text)
 
     line_text_list: List[str] = []
@@ -196,38 +289,18 @@ def _layout_vertical(font_size: int, text: str, max_height: int, config: Any = N
         current_line_text = ""
         current_line_height = 0
 
-        for part in _H_BLOCK_RE.split(paragraph):
-            if not part:
+        for cdpt in paragraph:
+            if not cdpt:
                 continue
-
-            is_h = part.lower().startswith('<h>') and part.lower().endswith('</h>')
-
-            if is_h:
-                content = part[3:-4]
-                if not content:
-                    continue
-                block_h = _h_block_height(font_size, content, letter_spacing=letter_spacing)
-                if current_line_height + block_h > max_height and current_line_text:
-                    line_text_list.append(current_line_text)
-                    line_height_list.append(current_line_height)
-                    current_line_text = part
-                    current_line_height = block_h
-                else:
-                    current_line_text += part
-                    current_line_height += block_h
+            adv = _vert_char_advance(font_size, cdpt, letter_spacing=letter_spacing)
+            if current_line_height + adv > max_height and current_line_text:
+                line_text_list.append(current_line_text)
+                line_height_list.append(current_line_height)
+                current_line_text = cdpt
+                current_line_height = adv
             else:
-                for cdpt in part:
-                    if not cdpt:
-                        continue
-                    adv = _vert_char_advance(font_size, cdpt, letter_spacing=letter_spacing)
-                    if current_line_height + adv > max_height and current_line_text:
-                        line_text_list.append(current_line_text)
-                        line_height_list.append(current_line_height)
-                        current_line_text = cdpt
-                        current_line_height = adv
-                    else:
-                        current_line_text += cdpt
-                        current_line_height += adv
+                current_line_text += cdpt
+                current_line_height += adv
 
         if current_line_text:
             line_text_list.append(current_line_text)
@@ -242,7 +315,7 @@ def _layout_vertical(font_size: int, text: str, max_height: int, config: Any = N
 
 def _layout_vertical_metrics(font_size: int, text: str, max_height: int, config: Any = None, letter_spacing: float = 1.0) -> Tuple[List[str], List[int], List[int]]:
     """竖排换行 + 每列宽度，一次扫描完成尺寸测量。"""
-    text = normalize_vertical_ellipsis_text(compact_special_symbols(text))
+    text = text or ''
     text = _BR_RE.sub('\n', text)
 
     line_text_list: List[str] = []
@@ -263,40 +336,19 @@ def _layout_vertical_metrics(font_size: int, text: str, max_height: int, config:
         current_line_height = 0
         current_line_width = font_size
 
-        for part in _H_BLOCK_RE.split(paragraph):
-            if not part:
+        for cdpt in paragraph:
+            if not cdpt:
                 continue
-
-            is_h = part.lower().startswith('<h>') and part.lower().endswith('</h>')
-
-            if is_h:
-                content = part[3:-4]
-                if not content:
-                    continue
-                block_h = _h_block_height(font_size, content, letter_spacing=letter_spacing)
-                if current_line_height + block_h > max_height and current_line_text:
-                    append_line(current_line_text, current_line_height, current_line_width)
-                    current_line_text = part
-                    current_line_height = block_h
-                    current_line_width = font_size
-                else:
-                    current_line_text += part
-                    current_line_height += block_h
-                continue
-
-            for cdpt in part:
-                if not cdpt:
-                    continue
-                adv, width = _vert_char_metrics(font_size, cdpt, letter_spacing=letter_spacing)
-                if current_line_height + adv > max_height and current_line_text:
-                    append_line(current_line_text, current_line_height, current_line_width)
-                    current_line_text = cdpt
-                    current_line_height = adv
-                    current_line_width = max(font_size, width)
-                else:
-                    current_line_text += cdpt
-                    current_line_height += adv
-                    current_line_width = max(current_line_width, width)
+            adv, width = _vert_char_metrics(font_size, cdpt, letter_spacing=letter_spacing)
+            if current_line_height + adv > max_height and current_line_text:
+                append_line(current_line_text, current_line_height, current_line_width)
+                current_line_text = cdpt
+                current_line_height = adv
+                current_line_width = max(font_size, width)
+            else:
+                current_line_text += cdpt
+                current_line_height += adv
+                current_line_width = max(current_line_width, width)
 
         if current_line_text:
             append_line(current_line_text, current_line_height, current_line_width)
@@ -310,37 +362,20 @@ def _layout_vertical_metrics(font_size: int, text: str, max_height: int, config:
 def _vert_line_width(line_text: str, font_size: int) -> int:
     """竖排单列的实际最大字形宽度，与 put_text_vertical 的 line_widths 逻辑一致。"""
     max_width = font_size
-    for part in _H_BLOCK_RE.split(line_text):
-        if not part:
-            continue
-        is_h = part.lower().startswith('<h>') and part.lower().endswith('</h>')
-        if is_h:
-            # <H> 块居中置于列内，列宽取 font_size
-            pass
-        else:
-            for c in part:
-                w = _vert_char_bitmap_width(font_size, c)
-                if w > max_width:
-                    max_width = w
+    for c in line_text:
+        w = _vert_char_bitmap_width(font_size, c)
+        if w > max_width:
+            max_width = w
     return max_width
 
 
 def _vert_total_height(text: str, font_size: int, config: Any = None, letter_spacing: float = 1.0) -> int:
-    """不换行时竖排文本的总高度，考虑 <H> 块。"""
-    text = normalize_vertical_ellipsis_text(compact_special_symbols(text))
+    """不换行时竖排文本的总高度。"""
+    text = text or ''
     text = _BR_RE.sub('', text)
     total = 0
-    for part in _H_BLOCK_RE.split(text):
-        if not part:
-            continue
-        is_h = part.lower().startswith('<h>') and part.lower().endswith('</h>')
-        if is_h:
-            content = part[3:-4]
-            if content:
-                total += _h_block_height(font_size, content, letter_spacing=letter_spacing)
-        else:
-            for c in part:
-                total += _vert_char_advance(font_size, c, letter_spacing=letter_spacing)
+    for c in text:
+        total += _vert_char_advance(font_size, c, letter_spacing=letter_spacing)
     return total
 
 
@@ -409,7 +444,7 @@ def _layout_horizontal_cjk(font_size: int, text: str, max_width: int, letter_spa
         if current_line:
             lines.append((current_line, current_width))
 
-    return [l[0] for l in lines], [l[1] for l in lines]
+    return [line[0] for line in lines], [line[1] for line in lines]
 
 
 # ---------------------------------------------------------------------------
@@ -680,6 +715,13 @@ def _is_cjk_lang(lang: str) -> bool:
         or lang in ('chs', 'cht', 'jpn', 'zho', 'chi', 'japanese', 'chinese')
     )
 
+def _is_chinese_lang(lang: str) -> bool:
+    lang = (lang or '').lower().replace('-', '_')
+    return (
+        lang.startswith('zh_')
+        or lang in ('zh', 'zh_cn', 'zh_tw', 'zh_hans', 'zh_hant', 'chs', 'cht', 'zho', 'chi', 'chinese')
+    )
+
 def _is_korean_lang(lang: str) -> bool:
     lang = (lang or '').lower().replace('-', '_')
     return lang in ('kor', 'ko', 'ko_kr', 'korean') or lang.startswith('ko_')
@@ -785,6 +827,7 @@ def _calc_horizontal_layout(
     max_width: int,
     target_lang: str,
     hyphenate: bool,
+    semantic_linebreak: bool = False,
     letter_spacing: float = 1.0,
 ) -> Tuple[List[str], List[int]]:
     width = max(1, int(max_width))
@@ -793,6 +836,16 @@ def _calc_horizontal_layout(
     if _is_korean_lang(target_lang or 'en_US'):
         return _layout_horizontal_korean(font_size, text, width, letter_spacing=letter_spacing)
     if _is_cjk_lang(target_lang or 'en_US'):
+        if semantic_linebreak and _is_chinese_lang(target_lang or 'en_US'):
+            semantic_layout = layout_chinese_cjk(
+                font_size,
+                text,
+                width,
+                horizontal=True,
+                letter_spacing=letter_spacing,
+            )
+            if semantic_layout:
+                return semantic_layout
         return _layout_horizontal_cjk(font_size, text, width, letter_spacing=letter_spacing)
     return _layout_horizontal_eng(font_size, text, width, language=target_lang or 'en_US', hyphenate=hyphenate, letter_spacing=letter_spacing)
 
@@ -802,9 +855,21 @@ def _calc_vertical_layout(
     text: str,
     max_height: int,
     config: Any,
+    target_lang: str = "",
+    semantic_linebreak: bool = False,
     letter_spacing: float = 1.0,
 ) -> Tuple[List[str], List[int]]:
     height = max(1, int(max_height))
+    if semantic_linebreak and _is_chinese_lang(target_lang or ""):
+        semantic_layout = layout_chinese_cjk(
+            font_size,
+            text,
+            height,
+            horizontal=False,
+            letter_spacing=letter_spacing,
+        )
+        if semantic_layout:
+            return semantic_layout
     return _layout_vertical(font_size, text, height, config=config, letter_spacing=letter_spacing)
 
 
@@ -964,23 +1029,90 @@ def _find_best_lines_for_target_segments(
     target_lang: str,
     config: Any,
     letter_spacing_multiplier: float = 1.0,
+    max_line_budget: Optional[float] = None,
 ) -> List[str]:
     if not clean_text:
         return []
 
     hyphenate = _hyphenate_enabled(config)
+    semantic_linebreak = _semantic_linebreak_enabled(config)
 
     if horizontal:
-        base_lines, base_metrics = _calc_horizontal_layout(font_size, clean_text, 99999, target_lang, hyphenate, letter_spacing=letter_spacing_multiplier)
+        base_lines, base_metrics = _calc_horizontal_layout(
+            font_size,
+            clean_text,
+            99999,
+            target_lang,
+            hyphenate,
+            semantic_linebreak=semantic_linebreak,
+            letter_spacing=letter_spacing_multiplier,
+        )
         total_budget = max(1, int(max(base_metrics))) if base_metrics else max(1, get_string_width(font_size, clean_text, letter_spacing=letter_spacing_multiplier))
     else:
-        base_lines, base_metrics = _calc_vertical_layout(font_size, clean_text, 99999, config, letter_spacing=letter_spacing_multiplier)
+        base_lines, base_metrics = _calc_vertical_layout(
+            font_size,
+            clean_text,
+            99999,
+            config,
+            target_lang=target_lang,
+            semantic_linebreak=semantic_linebreak,
+            letter_spacing=letter_spacing_multiplier,
+        )
         total_budget = max(1, int(max(base_metrics))) if base_metrics else max(1, _vert_total_height(clean_text, font_size, config=config, letter_spacing=letter_spacing_multiplier))
 
     _ = base_lines
     min_budget = max(1, int(font_size))
     max_budget = max(min_budget, total_budget)
     target_segments = max(1, target_segments)
+    semantic_budget_limit = max_budget
+    if isinstance(max_line_budget, (int, float)) and math.isfinite(max_line_budget) and max_line_budget > 0:
+        semantic_budget_limit = max(min_budget, min(max_budget, int(max_line_budget)))
+
+    def layout_for_budget(budget: int):
+        budget = max(min_budget, min(int(budget), max_budget))
+        if horizontal:
+            return _calc_horizontal_layout(
+                font_size,
+                clean_text,
+                budget,
+                target_lang,
+                hyphenate,
+                semantic_linebreak=semantic_linebreak,
+                letter_spacing=letter_spacing_multiplier,
+            )
+        return _calc_vertical_layout(
+            font_size,
+            clean_text,
+            budget,
+            config,
+            target_lang=target_lang,
+            semantic_linebreak=semantic_linebreak,
+            letter_spacing=letter_spacing_multiplier,
+        )
+
+    if semantic_linebreak and _is_chinese_lang(target_lang or ""):
+        best_exact: Optional[Tuple[int, List[str]]] = None
+        low, high = min_budget, semantic_budget_limit
+        while low <= high:
+            mid = (low + high) // 2
+            lines, _ = layout_for_budget(mid)
+            line_count = len(lines) if lines else 0
+            if line_count <= 0:
+                break
+            if line_count == target_segments:
+                best_exact = (mid, lines)
+                low = mid + 1
+            elif line_count > target_segments:
+                low = mid + 1
+            else:
+                high = mid - 1
+
+        if best_exact is not None:
+            return best_exact[1]
+
+        budget = max(min_budget, min(semantic_budget_limit, int(math.ceil(total_budget / target_segments))))
+        lines, _ = layout_for_budget(budget)
+        return lines or []
 
     evaluated = {}
 
@@ -990,17 +1122,32 @@ def _find_best_lines_for_target_segments(
             return evaluated[budget]
 
         if horizontal:
-            lines, metrics = _calc_horizontal_layout(font_size, clean_text, budget, target_lang, hyphenate, letter_spacing=letter_spacing_multiplier)
+            lines, metrics = _calc_horizontal_layout(
+                font_size,
+                clean_text,
+                budget,
+                target_lang,
+                hyphenate,
+                semantic_linebreak=semantic_linebreak,
+                letter_spacing=letter_spacing_multiplier,
+            )
         else:
-            lines, metrics = _calc_vertical_layout(font_size, clean_text, budget, config, letter_spacing=letter_spacing_multiplier)
+            lines, metrics = _calc_vertical_layout(
+                font_size,
+                clean_text,
+                budget,
+                config,
+                target_lang=target_lang,
+                semantic_linebreak=semantic_linebreak,
+                letter_spacing=letter_spacing_multiplier,
+            )
 
         if not lines:
             evaluated[budget] = None
             return None
 
         line_count = len(lines)
-        uniformity = _calculate_uniformity(metrics if metrics else [len(line) for line in lines])
-        score = (abs(line_count - target_segments), 1 if line_count > target_segments else 0, uniformity)
+        score = _line_break_quality_score(lines, metrics, target_segments)
         evaluated[budget] = (score, lines, line_count)
         return evaluated[budget]
 
@@ -1029,7 +1176,7 @@ def _find_best_lines_for_target_segments(
     if not candidates:
         return []
     _, best_lines, _ = min(candidates, key=lambda item: item[0])
-    # 保留 <H> 标签，渲染侧用于竖排内嵌横排
+    # 返回候选断行文本；旧横排块标签不再作为渲染协议。
     return best_lines
 
 
@@ -1046,21 +1193,32 @@ def _measure_required_size(
     config: Any,
     letter_spacing_multiplier: float = 1.0,
 ) -> Tuple[int, float, float]:
-    hyphenate = _hyphenate_enabled(config)
+    semantic_linebreak = _semantic_linebreak_enabled(config)
 
     if horizontal:
-        lines, widths = _calc_horizontal_layout(font_size, text_with_br, 99999, target_lang, hyphenate, letter_spacing=letter_spacing_multiplier)
-        n = max(1, len(lines))
-        spacing_y = text_render.calc_horizontal_line_spacing_px(font_size, line_spacing_multiplier)
-        required_width = max(widths) if widths else get_string_width(
+        metrics = text_render.measure_rich_text_metrics(
             font_size,
-            _normalize_no_br_text(text_with_br, horizontal=True),
+            text_with_br,
+            True,
+            line_spacing_multiplier,
+            config=config,
             letter_spacing=letter_spacing_multiplier,
         )
-        required_height = font_size * n + spacing_y * max(0, n - 1)
-        return n, float(required_width), float(required_height)
+        return (
+            max(1, int(metrics['n_lines'])),
+            float(metrics['width']),
+            float(metrics['height']),
+        )
 
-    lines, heights = _calc_vertical_layout(font_size, text_with_br, 99999, config, letter_spacing=letter_spacing_multiplier)
+    lines, heights = _calc_vertical_layout(
+        font_size,
+        text_with_br,
+        99999,
+        config,
+        target_lang=target_lang,
+        semantic_linebreak=semantic_linebreak,
+        letter_spacing=letter_spacing_multiplier,
+    )
     n = max(1, len(lines))
     spacing_x = int(font_size * 0.2 * line_spacing_multiplier)
     required_height = max(heights) if heights else _vert_total_height(
@@ -1087,8 +1245,15 @@ def _measure_unwrapped_required_size(
         return 1, 0.0, 0.0
 
     if horizontal:
-        required_width = get_string_width(font_size, clean_text, letter_spacing=letter_spacing_multiplier)
-        return 1, float(required_width), float(font_size)
+        metrics = text_render.measure_rich_text_metrics(
+            font_size,
+            clean_text,
+            True,
+            1.0,
+            config=config,
+            letter_spacing=letter_spacing_multiplier,
+        )
+        return 1, float(metrics['width']), float(metrics['height'])
 
     required_height = _vert_total_height(clean_text, font_size, config=config, letter_spacing=letter_spacing_multiplier)
     required_width = _vert_line_width(clean_text, font_size)
@@ -1139,6 +1304,9 @@ def solve_no_br_layout(
     iterations: int = 3,
     letter_spacing_multiplier: float = 1.0,
     adjust_font_size: bool = True,
+    max_line_budget: Optional[float] = None,
+    debug_context: str = "",
+    debug_expected_segments: Optional[int] = None,
 ) -> NoBrLayoutResult:
     clean_text = _normalize_no_br_text(text, horizontal=horizontal)
     if not clean_text:
@@ -1155,6 +1323,45 @@ def solve_no_br_layout(
     current_segments = _resolve_initial_segments(text_len, horizontal, bw, bh, seed_segments)
     line_spacing_multiplier = line_spacing_multiplier or 1.0
     letter_spacing_multiplier = letter_spacing_multiplier or 1.0
+    semantic_debug = _semantic_linebreak_enabled(config) and _is_chinese_lang(target_lang or "")
+    initial_segments = current_segments
+    initial_font = current_font
+
+    def finish(result: NoBrLayoutResult, reason: str) -> NoBrLayoutResult:
+        if semantic_debug:
+            expected_segments = (
+                int(debug_expected_segments)
+                if isinstance(debug_expected_segments, (int, float)) and debug_expected_segments > 0
+                else None
+            )
+            append_chinese_linebreak_debug_record(
+                config,
+                {
+                    "stage": debug_context or "layout",
+                    "region_index": getattr(config, "_semantic_linebreak_current_region_idx", None) if config is not None else None,
+                    "input": clean_text,
+                    "direction": "h" if horizontal else "v",
+                    "seed_font": seed_font_size,
+                    "initial_font": initial_font,
+                    "output_font": result.font_size,
+                    "seed_target": seed_segments,
+                    "initial_target": initial_segments,
+                    "output_segments": result.n_segments,
+                    "box_budget": {"width": float(bw), "height": float(bh)},
+                    "line_budget": (
+                        float(max_line_budget)
+                        if isinstance(max_line_budget, (int, float)) and math.isfinite(max_line_budget)
+                        else None
+                    ),
+                    "adjust_font": bool(adjust_font_size),
+                    "expected_segments": expected_segments,
+                    "accepted": None if expected_segments is None else result.n_segments == expected_segments,
+                    "required": {"width": float(result.required_width), "height": float(result.required_height)},
+                    "reason": reason,
+                    "output": result.text_with_br,
+                },
+            )
+        return result
 
     if force_no_wrap_single_region:
         current_font = max(safe_min_font, min(int(seed_font_size), safe_max_font))
@@ -1166,7 +1373,7 @@ def solve_no_br_layout(
                 config=config,
                 letter_spacing_multiplier=letter_spacing_multiplier,
             )
-            return NoBrLayoutResult(clean_text, current_font, 1, required_width, required_height)
+            return finish(NoBrLayoutResult(clean_text, current_font, 1, required_width, required_height), "force_no_wrap/no_adjust")
         for _ in range(max(1, int(iterations))):
             _, required_width, required_height = _measure_unwrapped_required_size(
                 clean_text,
@@ -1185,7 +1392,7 @@ def solve_no_br_layout(
             next_font = max(safe_min_font, min(int(current_font * fit_scale), safe_max_font))
 
             if next_font == current_font:
-                return NoBrLayoutResult(clean_text, current_font, 1, required_width, required_height)
+                return finish(NoBrLayoutResult(clean_text, current_font, 1, required_width, required_height), "force_no_wrap/stable")
 
             current_font = next_font
 
@@ -1196,7 +1403,7 @@ def solve_no_br_layout(
             config=config,
             letter_spacing_multiplier=letter_spacing_multiplier,
         )
-        return NoBrLayoutResult(clean_text, current_font, 1, required_width, required_height)
+        return finish(NoBrLayoutResult(clean_text, current_font, 1, required_width, required_height), "force_no_wrap/final")
 
     for _ in range(max(1, int(iterations))):
         lines = _find_best_lines_for_target_segments(
@@ -1207,6 +1414,7 @@ def solve_no_br_layout(
             target_lang,
             config,
             letter_spacing_multiplier=letter_spacing_multiplier,
+            max_line_budget=max_line_budget,
         )
         if force_no_wrap_single_region:
             text_with_br = clean_text
@@ -1233,7 +1441,7 @@ def solve_no_br_layout(
         next_segments = max(1, min(n_actual, text_len))
         if not adjust_font_size:
             if next_segments == current_segments:
-                return NoBrLayoutResult(text_with_br, current_font, n_actual, required_width, required_height)
+                return finish(NoBrLayoutResult(text_with_br, current_font, n_actual, required_width, required_height), "no_adjust/stable")
             current_segments = next_segments
             continue
 
@@ -1243,7 +1451,7 @@ def solve_no_br_layout(
         next_font = max(safe_min_font, min(int(current_font * fit_scale), safe_max_font))
 
         if next_font == current_font and next_segments == current_segments:
-            return NoBrLayoutResult(text_with_br, current_font, n_actual, required_width, required_height)
+            return finish(NoBrLayoutResult(text_with_br, current_font, n_actual, required_width, required_height), "fit/stable")
 
         current_font = next_font
         current_segments = next_segments
@@ -1256,6 +1464,7 @@ def solve_no_br_layout(
         target_lang,
         config,
         letter_spacing_multiplier=letter_spacing_multiplier,
+        max_line_budget=max_line_budget,
     )
     if force_no_wrap_single_region:
         final_text = clean_text
@@ -1275,4 +1484,4 @@ def solve_no_br_layout(
         config,
         letter_spacing_multiplier=letter_spacing_multiplier,
     )
-    return NoBrLayoutResult(final_text, current_font, n_final, required_width, required_height)
+    return finish(NoBrLayoutResult(final_text, current_font, n_final, required_width, required_height), "final")

@@ -1,25 +1,329 @@
+import logging
 import os
 import re
 import textwrap
 from functools import partial
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtWidgets import QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QVBoxLayout, QWidget
-from PyQt6.QtGui import QIcon
-from ui.widgets.wheel_filter import NoWheelComboBox as QComboBox
-from utils.resource_helper import resource_path
 from manga_translator.api_key_rotation import (
-    APIEndpoint,
+    MAX_ROTATION_SLOTS,
     ROTATION_STRATEGIES,
+    APIEndpoint,
+    clear_api_status,
+    get_api_status,
     get_indexed_env_key,
     get_rotation_slot_count,
     get_strategy_env_key,
+    is_endpoint_unavailable,
+    iter_api_candidates,
     make_endpoint_status_key,
     normalize_rotation_strategy,
     record_api_failure,
     record_api_success,
 )
-from manga_translator.utils.openai_compat import is_openai_api_key_optional
+from manga_translator.image_formats import (
+    IMAGE_FILE_DIALOG_FILTER,
+    IMAGE_FILE_DIALOG_PATTERNS,
+)
+from manga_translator.utils.openai_compat import resolve_openai_compatible_api_key
+from PyQt6.QtCore import QByteArray, QMimeData, QPoint, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QDrag, QIcon, QPainter, QPen
+from PyQt6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QGridLayout,
+    QHBoxLayout,
+    QVBoxLayout,
+    QWidget,
+)
+from qfluentwidgets import (
+    BodyLabel,
+    CaptionLabel,
+    HorizontalSeparator,
+    PushButton,
+    SimpleCardWidget,
+    StrongBodyLabel,
+    ToolButton,
+    isDarkTheme,
+)
+from qfluentwidgets import FluentIcon as FIF
+from qfluentwidgets import LineEdit as FluentLineEdit
+
+from ui.fluent_icon import themed_fluent_svg_icon
+from ui.widgets.wheel_filter import NoWheelComboBox as QComboBox
+
+API_ROTATION_UI_MAX_SLOTS = min(10, MAX_ROTATION_SLOTS)
+
+logger = logging.getLogger(__name__)
+
+_API_SLOT_MIME_TYPE = "application/x-manga-translator-api-slot"
+
+
+class _ApiSlotDragHandle(ToolButton):
+    drag_requested = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setIcon(FIF.MOVE)
+        self.setFixedSize(28, 28)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self._drag_start: QPoint | None = None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start = event.position().toPoint()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (
+            self._drag_start is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+            and (event.position().toPoint() - self._drag_start).manhattanLength()
+            >= QApplication.startDragDistance()
+        ):
+            self._drag_start = None
+            self.drag_requested.emit()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_start = None
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        super().mouseReleaseEvent(event)
+
+
+def _resolve_api_slot_drop_target(
+    source_index: int,
+    hovered_index: int,
+    *,
+    drop_after: bool,
+    slot_count: int,
+) -> int:
+    """Convert a before/after card drop into the moved slot's final 1-based index."""
+    slot_count = max(1, int(slot_count))
+    source_row = max(0, min(int(source_index) - 1, slot_count - 1))
+    hovered_row = max(0, min(int(hovered_index) - 1, slot_count - 1))
+    insertion_row = hovered_row + (1 if drop_after else 0)
+    target_row = insertion_row - 1 if source_row < insertion_row else insertion_row
+    return max(0, min(target_row, slot_count - 1)) + 1
+
+
+class _ApiRotationSlotCard(SimpleCardWidget):
+    reorder_requested = pyqtSignal(int, int)
+
+    def __init__(self, group_key: str, slot_index: int, slot_count: int, parent=None):
+        super().__init__(parent)
+        self._group_key = str(group_key)
+        self._slot_index = int(slot_index)
+        self._slot_count = int(slot_count)
+        self._drop_after: bool | None = None
+        self.setAcceptDrops(True)
+
+    def start_drag(self) -> None:
+        mime_data = QMimeData()
+        payload = f"{self._group_key}\0{self._slot_index}".encode("utf-8")
+        mime_data.setData(_API_SLOT_MIME_TYPE, QByteArray(payload))
+
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+        drag.exec(Qt.DropAction.MoveAction)
+
+    def _drag_source_index(self, mime_data) -> int | None:
+        if not mime_data.hasFormat(_API_SLOT_MIME_TYPE):
+            return None
+        try:
+            payload = bytes(mime_data.data(_API_SLOT_MIME_TYPE)).decode("utf-8")
+            group_key, index_text = payload.split("\0", 1)
+            if group_key != self._group_key:
+                return None
+            source_index = int(index_text)
+        except (UnicodeDecodeError, ValueError):
+            return None
+        if not 1 <= source_index <= self._slot_count:
+            return None
+        return source_index
+
+    def _set_drop_position(self, drop_after: bool | None) -> None:
+        if self._drop_after == drop_after:
+            return
+        self._drop_after = drop_after
+        self.update()
+
+    def dragEnterEvent(self, event):
+        if self._drag_source_index(event.mimeData()) is None:
+            event.ignore()
+            return
+        event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
+
+    def dragMoveEvent(self, event):
+        if self._drag_source_index(event.mimeData()) is None:
+            self._set_drop_position(None)
+            event.ignore()
+            return
+        self._set_drop_position(event.position().y() >= self.height() / 2)
+        event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
+
+    def dragLeaveEvent(self, event):
+        self._set_drop_position(None)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        source_index = self._drag_source_index(event.mimeData())
+        if source_index is None:
+            self._set_drop_position(None)
+            event.ignore()
+            return
+
+        target_index = _resolve_api_slot_drop_target(
+            source_index,
+            self._slot_index,
+            drop_after=bool(self._drop_after),
+            slot_count=self._slot_count,
+        )
+        self._set_drop_position(None)
+        event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
+        if target_index != source_index:
+            self.reorder_requested.emit(source_index, target_index)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._drop_after is None:
+            return
+        painter = QPainter(self)
+        pen = QPen(self.palette().highlight().color(), 3)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        y = self.height() - 2 if self._drop_after else 2
+        painter.drawLine(12, y, max(12, self.width() - 12), y)
+
+
+def _build_api_rotation_reorder_updates(
+    current_values: dict,
+    slot_keys: tuple[str, ...],
+    source_index: int,
+    target_index: int,
+    slot_count: int,
+) -> dict[str, str]:
+    """Build one atomic env update that moves a complete Key/Model/Base slot."""
+    slot_count = max(1, int(slot_count))
+    source_index = max(1, min(int(source_index), slot_count))
+    target_index = max(1, min(int(target_index), slot_count))
+    if source_index == target_index:
+        return {}
+
+    ordered_values = [
+        tuple(
+            str(current_values.get(get_indexed_env_key(base_key, index), "") or "")
+            for base_key in slot_keys
+        )
+        for index in range(1, slot_count + 1)
+    ]
+    moved_values = ordered_values.pop(source_index - 1)
+    ordered_values.insert(target_index - 1, moved_values)
+
+    updates: dict[str, str] = {}
+    for index, values in enumerate(ordered_values, start=1):
+        for base_key, value in zip(slot_keys, values):
+            env_key = get_indexed_env_key(base_key, index)
+            if env_key:
+                updates[env_key] = value
+    return updates
+
+
+# ---------------------------------------------------------------------------
+# AsyncService Future lifecycle management
+# ---------------------------------------------------------------------------
+
+def _is_managed_thread_running(self, kind: str) -> bool:
+    """Compatibility name: return whether an API Future of this kind is active."""
+    entry = getattr(self, "_active_api_tasks", {}).get(kind)
+    return entry is not None
+
+
+def _start_managed_api_task(self, kind: str, coro, progress, on_finished) -> bool:
+    from services import get_async_service
+
+    async_service = get_async_service()
+    if async_service is None:
+        coro.close()
+        progress.close()
+        on_finished(None, RuntimeError("AsyncService is unavailable"))
+        return False
+
+    future = async_service.submit_task(coro)
+    if future is None:
+        progress.close()
+        on_finished(None, RuntimeError("AsyncService rejected the task"))
+        return False
+
+    tasks = getattr(self, "_active_api_tasks", None)
+    if tasks is None:
+        tasks = {}
+        self._active_api_tasks = tasks
+    tasks[kind] = (future, progress, on_finished)
+    progress.rejected.connect(future.cancel)
+
+    def notify_gui(done_future, task_kind=kind):
+        try:
+            self.api_task_finished.emit(task_kind, done_future)
+        except RuntimeError:
+            pass
+
+    future.add_done_callback(notify_gui)
+    return True
+
+
+def on_api_task_future_finished(self, kind: str, future) -> None:
+    tasks = getattr(self, "_active_api_tasks", {})
+    entry = tasks.get(kind)
+    if entry is None or entry[0] is not future:
+        return
+    tasks.pop(kind, None)
+    _, progress, on_finished = entry
+    progress.close()
+    if future.cancelled() or progress.wasCanceled():
+        return
+    try:
+        result, error = future.result(), None
+    except Exception as exc:
+        result, error = None, exc
+    try:
+        on_finished(result, error)
+    except Exception:
+        logger.exception("处理 API 后台任务结果失败: %s", kind)
+
+
+def shutdown_background_threads(self, timeout_ms: int = 3000) -> None:
+    """Cancel only this page's API Futures; AsyncService owns the worker thread."""
+    _ = timeout_ms  # Retained for closeEvent compatibility.
+    tasks = getattr(self, "_active_api_tasks", {})
+    entries = list(tasks.values())
+    tasks.clear()
+    for future, progress, _on_finished in entries:
+        future.cancel()
+        progress.close()
+
+
+class QLineEdit(FluentLineEdit):
+    """Fluent LineEdit with the PyQt constructor forms used by env editors."""
+
+    def __init__(self, text: str | QWidget | None = "", parent: QWidget | None = None):
+        if isinstance(text, QWidget) and parent is None:
+            parent = text
+            text = ""
+        super().__init__(parent)
+        if text:
+            self.setText(str(text))
+
+    def addAction(self, action, position=FluentLineEdit.ActionPosition.TrailingPosition):
+        if isinstance(action, QIcon):
+            action = QAction(action, "", self)
+        super().addAction(action, position)
+        return action
 
 
 def _get_env_widget_value(widget) -> str:
@@ -69,8 +373,7 @@ def _is_secret_env_key(key: str) -> bool:
 
 def _make_secret_visibility_icon(hidden: bool):
     filename = "eye_off.svg" if hidden else "eye.svg"
-    icon_path = resource_path(os.path.join("desktop_qt_ui", "ui", "icons", filename))
-    return QIcon(icon_path)
+    return themed_fluent_svg_icon(filename)
 
 
 def _create_env_line_edit(self, key: str, value: str):
@@ -100,17 +403,13 @@ def _create_env_line_edit(self, key: str, value: str):
 
 
 def _add_env_action_button(self, layout, row: int, env_key: str, action_key: str) -> None:
-    from PyQt6.QtWidgets import QPushButton
-
     if _is_secret_env_key(action_key):
-        test_button = QPushButton(self._t("Test"))
-        test_button.setProperty("chipButton", True)
+        test_button = PushButton(self._t("Test"))
         test_button.setFixedWidth(60)
         test_button.clicked.connect(partial(self._on_test_api_clicked, env_key))
         layout.addWidget(test_button, row, 2)
     elif "MODEL" in action_key:
-        get_models_button = QPushButton(self._t("Get Models"))
-        get_models_button.setProperty("chipButton", True)
+        get_models_button = PushButton(self._t("Get Models"))
         get_models_button.setFixedWidth(100)
         get_models_button.clicked.connect(partial(self._on_get_models_clicked, env_key))
         layout.addWidget(get_models_button, row, 2)
@@ -126,7 +425,7 @@ def create_env_widgets(self, keys: list, current_values: dict):
         value = current_values.get(key, "")
 
         label_text = _display_env_label(self, key)
-        label = QLabel(f"{label_text}:")
+        label = BodyLabel(f"{label_text}:")
         widget, display_widget = _create_env_line_edit(self, key, value)
         widget.textChanged.connect(partial(self._debounced_save_env_var, key))
         widget.editingFinished.connect(partial(self._flush_env_var_immediately, key))
@@ -150,19 +449,22 @@ def create_api_rotation_widgets(
     current_values: dict,
 ):
     """Create a provider API rotation editor backed by .env keys."""
-    from PyQt6.QtWidgets import QPushButton
-
     if not hasattr(self, "env_layout"):
         return
 
     layout = self.env_layout
     slot_keys = (api_key_env, model_env, api_base_env)
-    slot_count = get_rotation_slot_count(current_values, slot_keys)
+    slot_count = get_rotation_slot_count(
+        current_values,
+        slot_keys,
+        default=1,
+        maximum=API_ROTATION_UI_MAX_SLOTS,
+    )
     strategy_key = get_strategy_env_key(api_key_env)
     row = layout.rowCount()
 
     if strategy_key:
-        strategy_label = QLabel(self._t("API rotation strategy:"))
+        strategy_label = BodyLabel(self._t("API rotation strategy:"))
         strategy_combo = QComboBox()
         for value in ROTATION_STRATEGIES:
             strategy_combo.addItem(self._t(f"api_rotation_strategy_{value}"), value)
@@ -184,38 +486,51 @@ def create_api_rotation_widgets(
     def add_slot(index: int):
         nonlocal row
 
-        slot_card = QFrame()
-        slot_card.setObjectName("api_slot_card")
-        slot_card.setFrameShape(QFrame.Shape.NoFrame)
+        slot_card = _ApiRotationSlotCard(api_key_env, index, slot_count)
 
         slot_card_layout = QVBoxLayout(slot_card)
         slot_card_layout.setContentsMargins(12, 10, 12, 12)
         slot_card_layout.setSpacing(10)
 
-        header_widget = QWidget()
-        header_widget.setObjectName("api_slot_header")
-        header_layout = QHBoxLayout(header_widget)
-        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout = QHBoxLayout()
         header_layout.setSpacing(8)
 
-        slot_badge = QLabel(f"{index:02d}")
-        slot_badge.setObjectName("api_slot_badge")
+        drag_handle = _ApiSlotDragHandle(slot_card)
+        drag_handle.setToolTip(self._t("Drag to reorder API slots"))
+        drag_handle.setAccessibleName(self._t("Drag to reorder API slots"))
+        drag_handle.drag_requested.connect(slot_card.start_drag)
+        slot_card.reorder_requested.connect(
+            lambda source_index, target_index, keys=slot_keys: _reorder_api_rotation_slot(
+                self,
+                keys,
+                source_index,
+                target_index,
+            )
+        )
+
+        slot_badge = CaptionLabel(f"{index:02d}")
         slot_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         slot_badge.setFixedSize(28, 22)
 
-        slot_label = QLabel(self._t("API slot {index}", index="").strip())
-        slot_label.setObjectName("api_slot_title")
-        slot_label.setProperty("rowLabel", True)
+        slot_label = StrongBodyLabel(self._t("API slot {index}", index="").strip())
+        delete_button = ToolButton()
+        delete_button.setIcon(FIF.REMOVE)
+        delete_button.setToolTip(self._t("Delete"))
+        delete_button.setFixedSize(32, 32)
+        delete_button.clicked.connect(
+            lambda _checked=False, slot_index=index: _delete_api_rotation_slot(
+                self,
+                slot_keys,
+                slot_index,
+            )
+        )
 
-        slot_line = QFrame()
-        slot_line.setObjectName("api_slot_divider")
-        slot_line.setFrameShape(QFrame.Shape.HLine)
-        slot_line.setFrameShadow(QFrame.Shadow.Plain)
-
+        header_layout.addWidget(drag_handle)
         header_layout.addWidget(slot_badge)
         header_layout.addWidget(slot_label)
-        header_layout.addWidget(slot_line, 1)
-        slot_card_layout.addWidget(header_widget)
+        header_layout.addWidget(HorizontalSeparator(), 1)
+        header_layout.addWidget(delete_button)
+        slot_card_layout.addLayout(header_layout)
 
         slot_grid = QGridLayout()
         slot_grid.setColumnStretch(1, 1)
@@ -232,8 +547,7 @@ def create_api_rotation_widgets(
             if not key:
                 continue
             value = current_values.get(key, "")
-            label = QLabel(f"{_display_env_label(self, base_key, index, include_index=False)}:")
-            label.setObjectName("api_slot_field_label")
+            label = BodyLabel(f"{_display_env_label(self, base_key, index, include_index=False)}:")
             widget, display_widget = _create_env_line_edit(self, base_key, value)
             widget.textChanged.connect(partial(self._debounced_save_env_var, key))
             widget.editingFinished.connect(partial(self._flush_env_var_immediately, key))
@@ -243,29 +557,228 @@ def create_api_rotation_widgets(
             self.env_widgets[key] = (label, widget)
             slot_row += 1
 
+        _add_api_slot_status_notice(
+            self,
+            slot_card_layout,
+            _build_slot_status_endpoint(self, api_key_env, index),
+        )
+
         layout.addWidget(slot_card, row, 0, 1, 3)
         row += 1
 
     for slot_index in range(1, slot_count + 1):
         add_slot(slot_index)
 
-    add_button = QPushButton(self._t("+ Add API slot"))
-    add_button.setObjectName("api_slot_add_button")
-    add_button.setProperty("chipButton", True)
+    add_button = PushButton(self._t("+ Add API slot"))
 
     def add_next_slot():
-        nonlocal row
-        layout.removeWidget(add_button)
-        row = max(0, row - 1)
-        existing_values = {key: _get_env_widget_value(pair[1]) for key, pair in self.env_widgets.items()}
-        next_index = get_rotation_slot_count(existing_values, slot_keys) + 1
-        add_slot(next_index)
+        next_index = slot_count + 1
+        if next_index > API_ROTATION_UI_MAX_SLOTS:
+            add_button.hide()
+            return
+
+        flush_all_pending_env_vars(self)
+        for base_key in slot_keys:
+            key = get_indexed_env_key(base_key, next_index)
+            if key:
+                self.controller.config_service.save_env_var(key, "")
+
+        self._env_api_groups_signature = None
+        self._refresh_env_api_groups(force=True)
+        self._refresh_api_feature_selectors()
+
+    if slot_count < API_ROTATION_UI_MAX_SLOTS:
+        add_button.clicked.connect(add_next_slot)
         layout.addWidget(add_button, row, 0, 1, 3, Qt.AlignmentFlag.AlignLeft)
         row += 1
 
-    add_button.clicked.connect(add_next_slot)
-    layout.addWidget(add_button, row, 0, 1, 3, Qt.AlignmentFlag.AlignLeft)
-    row += 1
+
+def _reorder_api_rotation_slot(
+    self,
+    slot_keys: tuple[str, str, str],
+    source_index: int,
+    target_index: int,
+):
+    """Persist a dragged card order by reindexing complete API slot values."""
+    flush_all_pending_env_vars(self)
+
+    config_service = self.controller.config_service
+    current_values = config_service.load_env_vars()
+    slot_count = get_rotation_slot_count(
+        current_values,
+        slot_keys,
+        default=1,
+        maximum=API_ROTATION_UI_MAX_SLOTS,
+    )
+    updates = _build_api_rotation_reorder_updates(
+        current_values,
+        slot_keys,
+        source_index,
+        target_index,
+        slot_count,
+    )
+    if not updates:
+        return
+    if not config_service.save_env_vars(updates):
+        logger.error(
+            "Failed to reorder API slots from %s to %s",
+            source_index,
+            target_index,
+        )
+        return
+
+    self._env_api_groups_signature = None
+    self._refresh_env_api_groups(force=True)
+    self._refresh_api_feature_selectors()
+
+
+def _delete_api_rotation_slot(self, slot_keys: tuple[str, str, str], slot_index: int):
+    """Delete an API slot and compact later slots so cards stay consecutive."""
+    flush_all_pending_env_vars(self)
+
+    config_service = self.controller.config_service
+    current_values = config_service.load_env_vars()
+    slot_count = get_rotation_slot_count(
+        current_values,
+        slot_keys,
+        default=1,
+        maximum=API_ROTATION_UI_MAX_SLOTS,
+    )
+    slot_index = max(1, min(int(slot_index), slot_count))
+
+    for index in range(slot_index, slot_count):
+        for base_key in slot_keys:
+            target_key = get_indexed_env_key(base_key, index)
+            source_key = get_indexed_env_key(base_key, index + 1)
+            if not target_key or not source_key:
+                continue
+            source_value = str(current_values.get(source_key, "") or "")
+            if source_value:
+                config_service.save_env_var(target_key, source_value)
+            else:
+                config_service.delete_env_vars([target_key])
+
+    delete_keys = [
+        key
+        for base_key in slot_keys
+        for key in [get_indexed_env_key(base_key, slot_count)]
+        if key
+    ]
+    if delete_keys:
+        config_service.delete_env_vars(delete_keys)
+
+    self._env_api_groups_signature = None
+    self._refresh_env_api_groups(force=True)
+    self._refresh_api_feature_selectors()
+
+
+def _build_slot_status_endpoint(self, api_key_env: str, slot_index: int) -> APIEndpoint | None:
+    env_key = get_indexed_env_key(api_key_env, slot_index)
+    if not env_key:
+        return None
+    translator_key = _get_current_translator_key(self)
+    test_target, api_key, api_base, model = _resolve_api_context(self, env_key, translator_key)
+    if not _is_test_item_configured(test_target, api_key, api_base):
+        return None
+    return _build_test_status_endpoint(self, env_key, test_target, api_key, api_base, model)
+
+
+def _restore_api_slot_status(self, endpoint: APIEndpoint) -> None:
+    clear_api_status(endpoint)
+    self._env_api_groups_signature = None
+    self._refresh_env_api_groups(force=True)
+
+
+def _refresh_api_groups_after_dialog(self) -> None:
+    self._env_api_groups_signature = None
+    QTimer.singleShot(0, lambda: self._refresh_env_api_groups(force=True))
+
+
+def refresh_api_slot_status_styles(self) -> None:
+    """主题切换后按各状态条自带的 state 重算样式（_api_slot_status_style 每次取当前主题色）。"""
+    alive = []
+    for widget in getattr(self, "_api_slot_status_widgets", []):
+        try:
+            state = str(widget.property("apiSlotState") or "")
+            widget.setStyleSheet(_api_slot_status_style(state))
+        except RuntimeError:
+            continue
+        alive.append(widget)
+    self._api_slot_status_widgets = alive
+
+
+def _api_slot_status_style(state: str) -> str:
+    dark = isDarkTheme()
+    if state == "cooldown":
+        bg = "rgba(245, 158, 11, 0.18)" if dark else "rgba(245, 158, 11, 0.12)"
+        border = "#f59e0b"
+        text = "#fde68a" if dark else "#92400e"
+        hover = "rgba(245, 158, 11, 0.28)" if dark else "rgba(245, 158, 11, 0.20)"
+    else:
+        bg = "rgba(239, 68, 68, 0.18)" if dark else "rgba(239, 68, 68, 0.10)"
+        border = "#ef4444"
+        text = "#fecaca" if dark else "#991b1b"
+        hover = "rgba(239, 68, 68, 0.28)" if dark else "rgba(239, 68, 68, 0.18)"
+    return f"""
+        #apiSlotStatusNotice {{
+            background-color: {bg};
+            border: 1px solid {border};
+            border-radius: 6px;
+        }}
+        #apiSlotStatusLabel {{
+            color: {text};
+            font-weight: 600;
+        }}
+        #apiSlotRestoreButton {{
+            color: {text};
+            background-color: transparent;
+            border: 1px solid {border};
+            border-radius: 6px;
+        }}
+        #apiSlotRestoreButton:hover {{
+            background-color: {hover};
+        }}
+    """
+
+
+def _add_api_slot_status_notice(self, slot_card_layout, endpoint: APIEndpoint | None) -> None:
+    if endpoint is None or not is_endpoint_unavailable(endpoint):
+        return
+
+    status = get_api_status(endpoint) or {}
+    state = str(status.get("state") or "").lower()
+    marker_key = "API slot cooldown marker" if state == "cooldown" else "API slot unavailable marker"
+
+    status_widget = QWidget()
+    status_widget.setObjectName("apiSlotStatusNotice")
+    status_widget.setProperty("apiSlotState", state)
+    status_widget.setStyleSheet(_api_slot_status_style(state))
+    if not hasattr(self, "_api_slot_status_widgets"):
+        self._api_slot_status_widgets = []
+    self._api_slot_status_widgets.append(status_widget)
+
+    status_layout = QHBoxLayout(status_widget)
+    status_layout.setContentsMargins(10, 6, 8, 6)
+    status_layout.setSpacing(8)
+
+    status_label = CaptionLabel(self._t(marker_key))
+    status_label.setObjectName("apiSlotStatusLabel")
+    status_label.setWordWrap(True)
+    restore_button = ToolButton()
+    restore_button.setObjectName("apiSlotRestoreButton")
+    restore_button.setIcon(FIF.SYNC)
+    restore_button.setToolTip(self._t("Restore API channel"))
+    restore_button.setFixedSize(30, 30)
+    restore_button.clicked.connect(
+        lambda _checked=False, api_endpoint=endpoint: _restore_api_slot_status(
+            self,
+            api_endpoint,
+        )
+    )
+
+    status_layout.addWidget(status_label, 1)
+    status_layout.addWidget(restore_button)
+    slot_card_layout.insertWidget(1, status_widget)
 
 
 def get_env_default_placeholder(self, key: str) -> str:
@@ -321,36 +834,28 @@ def get_env_default_placeholder(self, key: str) -> str:
 
 
 def debounced_save_env_var(self, key: str, text: str):
-    """防抖保存.env变量，支持多个 Key 同时暂存。"""
-    if not hasattr(self, '_pending_env_vars'):
-        self._pending_env_vars = {}
-    self._pending_env_vars[key] = text
-    self._env_debounce_timer.stop()
-    try:
-        self._env_debounce_timer.timeout.disconnect()
-    except TypeError:
-        pass
-    self._env_debounce_timer.timeout.connect(lambda: flush_all_pending_env_vars(self))
-    self._env_debounce_timer.start()
+    """立即更新内存；ConfigService 统一负责 250ms 合并落盘。"""
+    self.env_var_changed.emit(key, text)
 
 
 def flush_env_var_immediately(self, key: str):
-    """立即保存指定 Key（失去焦点/回车时调用）。"""
-    pending = getattr(self, '_pending_env_vars', {})
-    if key in pending:
-        value = pending.pop(key)
-        self.env_var_changed.emit(key, value)
+    """兼容既有 editingFinished 接线；值已在 textChanged 时提交内存。"""
 
 
-def flush_all_pending_env_vars(self):
-    """立即保存所有暂存的环境变量。"""
-    self._env_debounce_timer.stop()
-    pending = getattr(self, '_pending_env_vars', {})
-    if not pending:
-        return
-    for key, value in list(pending.items()):
-        self.env_var_changed.emit(key, value)
-    pending.clear()
+def flush_all_pending_env_vars(self, wait: bool = True):
+    """先提交当前控件值，再按需等待 ConfigService 原子落盘。"""
+    config_service = getattr(self.controller, "config_service", None)
+    save_many = getattr(config_service, "save_env_vars", None)
+    if callable(save_many):
+        visible_values = {
+            key: _get_env_widget_value(widget)
+            for key, (_label, widget) in getattr(self, "env_widgets", {}).items()
+        }
+        if visible_values:
+            save_many(visible_values)
+    flush = getattr(config_service, "flush_pending_writes", None)
+    if wait and callable(flush):
+        flush()
 
 
 API_FEATURE_SELECTOR_SPECS = [
@@ -388,35 +893,33 @@ def _populate_api_feature_selector(self, label, combo, label_key: str, setting_k
     display_map = self.controller.get_display_mapping(options_key) or {}
 
     combo.blockSignals(True)
-    combo.clear()
-    for option in options:
-        combo.addItem(display_map.get(option, option), option)
-    index = combo.findData(current_value)
-    if index >= 0:
-        combo.setCurrentIndex(index)
-    combo.blockSignals(False)
+    try:
+        combo.clear()
+        for option in options:
+            combo.addItem(display_map.get(option, option), option)
+        index = combo.findData(current_value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+    finally:
+        combo.blockSignals(False)
 
 
 def create_api_feature_selector_row(self, section_key: str):
     """Create the feature selector row inside an API Management tab form."""
-    from PyQt6.QtWidgets import QPushButton
-
     spec = API_FEATURE_SELECTOR_BY_SECTION.get(section_key)
     if not spec or not hasattr(self, "env_layout"):
         return
     label_attr, combo_attr, label_key, setting_key, options_key = spec
     row = self.env_layout.rowCount()
 
-    label = QLabel(f"{self._t(label_key)}:")
-    label.setObjectName("settings_form_label")
+    label = BodyLabel(f"{self._t(label_key)}:")
     combo = QComboBox()
     combo.setMinimumWidth(260)
-    combo.setProperty("apiFeatureSettingKey", setting_key)
-    combo.setProperty("apiFeatureOptionsKey", options_key)
+    combo._api_feature_setting_key = setting_key
+    combo._api_feature_options_key = options_key
     combo.currentIndexChanged.connect(lambda _idx, widget=combo: self._on_api_feature_combo_changed(widget))
 
-    test_button = QPushButton(self._t("Test Current Tab"))
-    test_button.setProperty("chipButton", True)
+    test_button = PushButton(self._t("Test Current Tab"))
     test_button.clicked.connect(lambda _checked=False, key=section_key: self._on_test_current_api_section_clicked(key))
 
     setattr(self, label_attr, label)
@@ -441,15 +944,29 @@ def on_api_feature_combo_changed(self, combo):
     """Handle feature selector changes inside API Management tabs."""
     if combo is None:
         return
-    setting_key = combo.property("apiFeatureSettingKey")
+    setting_key = getattr(combo, "_api_feature_setting_key", None)
     value = combo.currentData()
     if not setting_key or value is None:
         return
     self.setting_changed.emit(str(setting_key), str(value))
-    QTimer.singleShot(100, lambda: self._refresh_env_api_groups())
-    QTimer.singleShot(120, lambda: refresh_api_feature_selectors(self))
-    if hasattr(self, "_refresh_api_status_sidebar"):
-        QTimer.singleShot(150, self._refresh_api_status_sidebar)
+    _schedule_api_feature_refresh(self)
+
+
+def _schedule_api_feature_refresh(self) -> None:
+    """合并 API 分组 + 功能选择器刷新为一个可重启的去抖定时器。"""
+    timer = getattr(self, "_api_feature_refresh_timer", None)
+    if timer is None:
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.setInterval(120)
+
+        def _do_refresh():
+            self._refresh_env_api_groups()
+            refresh_api_feature_selectors(self)
+
+        timer.timeout.connect(_do_refresh)
+        self._api_feature_refresh_timer = timer
+    timer.start()
 
 
 def _detect_test_target(env_key: str, translator_key: str) -> str:
@@ -514,7 +1031,7 @@ def _wrap_error_text(message: str, width: int = 60) -> str:
     return "\n".join(wrapped_lines)
 
 
-def _format_test_connection_error(api_type: str, message: str) -> str:
+def _format_test_connection_error(self, api_type: str, message: str) -> str:
     raw_message = str(message or "").strip()
     analysis_message = raw_message
     for prefix in ("连接失败:", "连接失败：", "api connection failed:", "connection failed:"):
@@ -580,27 +1097,28 @@ def _format_test_connection_error(api_type: str, message: str) -> str:
     is_service_error = any(keyword in error_lower for keyword in service_keywords)
 
     if is_network_error:
-        friendly_message = (
-            "检测到连接错误、超时或 Host 解析错误。\n"
-            "请先检查模型、API 地址和 API 密钥是否正确；如果配置无误，再检查网络连接，并尝试开启 TUN（虚拟网卡模式）。"
-        )
+        friendly_message = self._t("api_test_error_network")
     elif is_service_error:
-        friendly_message = (
-            "请先检查模型、API 地址和 API 密钥是否正确。\n"
-            "如果配置无误，这也可能是 API 站点、中转渠道或服务端暂时异常，或当前网络链路不稳定；建议稍后重试，或更换 API 站点 / 渠道。"
-        )
+        friendly_message = self._t("api_test_error_service")
     else:
-        friendly_message = "请检查模型、API 地址和 API 密钥是否正确。"
+        friendly_message = self._t("api_test_error_config")
 
-    friendly_message += f"\n\nAPI 地址示例：{_get_api_address_example(api_type)}"
+    friendly_message += "\n\n" + self._t(
+        "api_test_error_address_example",
+        address=_get_api_address_example(api_type),
+    )
     if raw_message:
-        friendly_message += f"\n\n原始错误：\n{_wrap_error_text(raw_message)}"
+        friendly_message += "\n\n" + self._t(
+            "api_test_error_raw",
+            error=_wrap_error_text(raw_message),
+        )
 
     return friendly_message
 
 
 def _show_api_error_dialog(parent, title: str, heading: str, details: str) -> None:
     from PyQt6.QtWidgets import QMessageBox
+
     from ui.secondary_pages.themed_message_box import show_error_dialog
 
     show_error_dialog(parent, title, heading, details, icon=QMessageBox.Icon.Critical)
@@ -608,6 +1126,7 @@ def _show_api_error_dialog(parent, title: str, heading: str, details: str) -> No
 
 def _show_api_success_dialog(parent, title: str, heading: str, details: str) -> None:
     from PyQt6.QtWidgets import QMessageBox
+
     from ui.secondary_pages.themed_message_box import show_error_dialog
 
     show_error_dialog(parent, title, heading, details, icon=QMessageBox.Icon.Information)
@@ -656,9 +1175,12 @@ def _read_env_widget_value(self, env_key: str | None) -> str | None:
     if not env_key:
         return None
     pair = self.env_widgets.get(env_key)
-    if not pair:
+    if pair:
+        return _get_env_widget_value(pair[1]).strip() or None
+    try:
+        return str(self.controller.config_service.load_env_vars().get(env_key, "") or "").strip() or None
+    except Exception:
         return None
-    return _get_env_widget_value(pair[1]).strip() or None
 
 
 def _read_env_candidates(self, *env_keys: str | None) -> str | None:
@@ -758,19 +1280,22 @@ def _build_test_status_endpoint(
     _base_field, slot_index = _split_slot_field(field)
     base_url = (api_base or _get_api_address_example(test_target)).rstrip("/")
     model_name = (model or "").strip()
+    status_api_key = api_key
+    if "openai" in (test_target or "").strip().lower():
+        status_api_key = resolve_openai_compatible_api_key(api_key, base_url)
     status_key = make_endpoint_status_key(
         feature,
         provider,
         slot_index,
         base_url,
         model_name,
-        api_key=api_key,
+        api_key=status_api_key,
     )
     return APIEndpoint(
         feature=feature,
         provider=provider,
         slot=slot_index,
-        api_key=api_key,
+        api_key=status_api_key,
         base_url=base_url,
         model_name=model_name,
         status_key=status_key,
@@ -784,11 +1309,11 @@ def _is_test_item_configured(test_target: str, api_key: str | None, api_base: st
     normalized = (test_target or "").strip().lower()
     if "sakura" in normalized:
         return bool(str(api_base or "").strip())
-    return "openai" in normalized and is_openai_api_key_optional("", api_base or "")
+    return "openai" in normalized and bool(resolve_openai_compatible_api_key("", api_base or ""))
 
 
 def _get_current_translator_key(self) -> str:
-    combo = getattr(self, "env_translation_feature_combo", None) or self.findChild(QComboBox, "translator.translator")
+    combo = getattr(self, "env_translation_feature_combo", None) or getattr(self, "translator_combo", None)
     if combo is not None:
         data = combo.currentData() if hasattr(combo, "currentData") else None
         if data:
@@ -858,6 +1383,69 @@ def _collect_api_test_items(self, section_key: str) -> list[dict]:
     return items
 
 
+def _collect_required_api_candidate_groups(self, section_key: str) -> dict[tuple[str, str], str]:
+    section_scopes = {
+        "translation": "",
+        "ocr": "OCR_",
+        "color": "COLOR_",
+        "render": "RENDER_",
+    }
+    expected_scope = section_scopes.get(section_key)
+    translator_key = _get_current_translator_key(self)
+    groups: dict[tuple[str, str], str] = {}
+    for key in list(self.env_widgets.keys()):
+        scope, provider, field = _split_env_key(key)
+        base_field, slot_index = _split_slot_field(field)
+        if scope != expected_scope or base_field not in ("API_KEY", "AUTH_KEY", "TOKEN"):
+            continue
+        identity = _test_target_status_identity(_detect_test_target(key, translator_key))
+        if identity is None:
+            continue
+        label_key = _build_related_env_key(scope, provider, base_field) or key
+        groups[identity] = _display_env_label(self, label_key, include_index=False)
+    return groups
+
+
+def validate_api_candidate_availability(self) -> bool:
+    from PyQt6.QtWidgets import QMessageBox
+
+    flush_all_pending_env_vars(self)
+    if hasattr(self, "_refresh_env_api_groups"):
+        self._refresh_env_api_groups(force=True)
+
+    blocked: list[str] = []
+    for section_key in ("translation", "ocr", "color", "render"):
+        required_groups = _collect_required_api_candidate_groups(self, section_key)
+        if not required_groups:
+            continue
+
+        grouped_endpoints: dict[tuple[str, str], list[APIEndpoint]] = {}
+        for item in _collect_api_test_items(self, section_key):
+            endpoint = item.get("endpoint")
+            if endpoint is None:
+                continue
+            grouped_endpoints.setdefault((endpoint.feature, endpoint.provider), []).append(endpoint)
+
+        for group_key, label in required_groups.items():
+            endpoints = tuple(grouped_endpoints.get(group_key, []))
+            if not endpoints or not iter_api_candidates(endpoints, "failover"):
+                blocked.append(label)
+
+    if not blocked:
+        return True
+
+    details = "\n".join(f"- {label}" for label in dict.fromkeys(blocked))
+    log_message = details.replace("\n", "; ")
+    if hasattr(self.controller, "_ui_log"):
+        self.controller._ui_log(f"API 候选池无可用候选，已阻止开始翻译: {log_message}", "WARNING")
+    QMessageBox.warning(
+        self._dialog_parent(),
+        self._t("API candidate availability failed"),
+        self._t("API candidate availability failed details", details=details),
+    )
+    return False
+
+
 def _format_api_batch_result_text(self, results: list[dict]) -> str:
     lines = []
     for item in results:
@@ -874,6 +1462,7 @@ def _format_api_batch_result_text(self, results: list[dict]) -> str:
 
 def _show_api_batch_test_results(self, results: list[dict]) -> None:
     from PyQt6.QtWidgets import QMessageBox
+
     from ui.secondary_pages.themed_message_box import show_error_dialog
 
     available = sum(1 for item in results if item.get("success"))
@@ -885,7 +1474,7 @@ def _show_api_batch_test_results(self, results: list[dict]) -> None:
         unavailable=unavailable,
     )
     show_error_dialog(
-        self,
+        self._dialog_parent(),
         self._t("API Batch Test Results"),
         heading,
         _format_api_batch_result_text(self, results),
@@ -896,20 +1485,22 @@ def _show_api_batch_test_results(self, results: list[dict]) -> None:
 def _run_api_batch_test(self, items: list[dict]):
     import asyncio
 
-    from PyQt6.QtCore import QThread
-    from utils.asyncio_cleanup import shutdown_event_loop
-    from ui.secondary_pages.themed_progress_dialog import create_progress_dialog
     from ui.secondary_pages.themed_message_box import themed_information
+    from ui.secondary_pages.themed_progress_dialog import create_progress_dialog
 
     if not items:
-        themed_information(self, self._t("API Batch Test"), self._t("No API channels to test"))
+        themed_information(self._dialog_parent(), self._t("API Batch Test"), self._t("No API channels to test"))
+        return
+
+    if _is_managed_thread_running(self, "api_batch_test"):
         return
 
     concurrency = 3
     progress = create_progress_dialog(
-        self,
+        self._dialog_parent(),
         self._t("API Batch Test"),
         self._t("Testing API channels", count=len(items), concurrency=concurrency),
+        self._t("Cancel"),
     )
     progress.show()
 
@@ -942,39 +1533,24 @@ def _run_api_batch_test(self, items: list[dict]):
 
         return await asyncio.gather(*(run_one(item) for item in items))
 
-    def run_test_thread():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(run_all_tests())
-        finally:
-            shutdown_event_loop(loop, label="API batch test loop")
-
-    class BatchTestThread(QThread):
-        finished_signal = pyqtSignal(list)
-
-        def run(self):
-            try:
-                self.finished_signal.emit(run_test_thread())
-            except Exception as exc:
-                fallback_results = []
-                for item in items:
-                    result = dict(item)
-                    result["success"] = False
-                    result["message"] = str(exc)
-                    fallback_results.append(result)
-                self.finished_signal.emit(fallback_results)
-
-    def on_finished(results):
-        progress.close()
-        if hasattr(self, "_refresh_api_status_sidebar"):
-            self._refresh_api_status_sidebar()
+    def on_finished(results, error):
+        if error is not None:
+            results = []
+            for item in items:
+                result = dict(item)
+                result["success"] = False
+                result["message"] = str(error)
+                results.append(result)
         _show_api_batch_test_results(self, results)
+        _refresh_api_groups_after_dialog(self)
 
-    thread = BatchTestThread()
-    thread.finished_signal.connect(on_finished)
-    thread.start()
-    self._api_batch_test_thread = thread
+    _start_managed_api_task(
+        self,
+        "api_batch_test",
+        run_all_tests(),
+        progress,
+        on_finished,
+    )
 
 
 def on_test_current_api_section_clicked(self, section_key: str):
@@ -994,30 +1570,32 @@ def on_open_custom_api_params_file(self):
     except Exception as e:
         from PyQt6.QtWidgets import QMessageBox
 
-        QMessageBox.warning(self, self._t("Error"), f"创建配置文件失败: {e}")
+        QMessageBox.warning(self._dialog_parent(), self._t("Error"), f"创建配置文件失败: {e}")
         return
 
     try:
-        from ui.secondary_pages.custom_api_params_editor import CustomApiParamsEditorDialog
+        from ui.secondary_pages.custom_api_params_editor import (
+            CustomApiParamsEditorDialog,
+        )
 
-        dialog = CustomApiParamsEditorDialog(config_path, t_func=self._t, parent=self)
+        dialog = CustomApiParamsEditorDialog(config_path, t_func=self._t, parent=self._dialog_parent())
         dialog.exec()
     except Exception as e:
         from PyQt6.QtWidgets import QMessageBox
 
-        QMessageBox.warning(self, self._t("Error"), f"打开编辑器失败: {e}")
+        QMessageBox.warning(self._dialog_parent(), self._t("Error"), f"打开编辑器失败: {e}")
 
 
 def on_test_api_clicked(self, key: str):
     """测试API连接。"""
     flush_all_pending_env_vars(self)
-    import asyncio
 
-    from PyQt6.QtCore import QThread
-    from utils.asyncio_cleanup import shutdown_event_loop
     from ui.secondary_pages.themed_progress_dialog import create_progress_dialog
 
     if key not in self.env_widgets:
+        return
+
+    if _is_managed_thread_running(self, "api_test"):
         return
 
     translator_key = _get_current_translator_key(self)
@@ -1025,115 +1603,85 @@ def on_test_api_clicked(self, key: str):
     status_endpoint = _build_test_status_endpoint(self, key, test_target, api_key, api_base, model)
 
     progress = create_progress_dialog(
-        self,
+        self._dialog_parent(),
         self._t("Testing"),
         self._t("Testing API connection, please wait..."),
+        self._t("Cancel"),
     )
     progress.show()
 
-    def run_test():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(
-                self.controller.test_api_connection_async(test_target, api_key, api_base, model)
-            )
-        finally:
-            shutdown_event_loop(loop, label="API test loop")
-
-    class TestThread(QThread):
-        finished_signal = pyqtSignal(bool, str)
-
-        def run(self):
-            try:
-                success, message = run_test()
-                self.finished_signal.emit(success, message)
-            except Exception as e:
-                self.finished_signal.emit(False, str(e))
-
-    def on_test_finished(success, message):
-        progress.close()
+    def on_test_finished(result, error):
+        if error is not None:
+            success, message = False, str(error)
+        else:
+            success, message = result
         if status_endpoint is not None:
             if success:
                 record_api_success(status_endpoint)
             else:
                 record_api_failure(status_endpoint, Exception(str(message or "")))
-            if hasattr(self, "_refresh_api_status_sidebar"):
-                self._refresh_api_status_sidebar()
         if success:
             success_details = _wrap_error_text(message) if message else self._t("API connection test successful!")
             _show_api_success_dialog(
-                self,
+                self._dialog_parent(),
                 self._t("Success"),
                 self._t("API connection test successful!"),
                 success_details,
             )
         else:
-            friendly_message = _format_test_connection_error(test_target, message)
+            friendly_message = _format_test_connection_error(self, test_target, message)
             _show_api_error_dialog(
-                self,
+                self._dialog_parent(),
                 self._t("Error"),
                 self._t("API connection test failed"),
                 friendly_message,
             )
+        if status_endpoint is not None:
+            _refresh_api_groups_after_dialog(self)
 
-    test_thread = TestThread()
-    test_thread.finished_signal.connect(on_test_finished)
-    test_thread.start()
-    self._test_thread = test_thread
+    _start_managed_api_task(
+        self,
+        "api_test",
+        self.controller.test_api_connection_async(test_target, api_key, api_base, model),
+        progress,
+        on_test_finished,
+    )
 
 
 def on_get_models_clicked(self, key: str):
     """获取可用模型列表。"""
     flush_all_pending_env_vars(self)
-    import asyncio
-
-    from PyQt6.QtCore import QThread
     from PyQt6.QtWidgets import QMessageBox
-    from utils.asyncio_cleanup import shutdown_event_loop
-    from ui.secondary_pages.themed_progress_dialog import create_progress_dialog
 
     from ui.secondary_pages.model_selector_dialog import ModelSelectorDialog
+    from ui.secondary_pages.themed_progress_dialog import create_progress_dialog
+
+    if _is_managed_thread_running(self, "get_models"):
+        return
 
     translator_key = _get_current_translator_key(self)
     model_api_type, api_key, api_base, _ = _resolve_api_context(self, key, translator_key)
 
     progress = create_progress_dialog(
-        self,
+        self._dialog_parent(),
         self._t("Get Models"),
         self._t("Fetching models, please wait..."),
+        self._t("Cancel"),
     )
     progress.show()
 
-    def run_get_models():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(
-                self.controller.get_available_models_async(model_api_type, api_key, api_base)
-            )
-        finally:
-            shutdown_event_loop(loop, label="model fetch loop")
-
-    class GetModelsThread(QThread):
-        finished_signal = pyqtSignal(bool, list, str)
-
-        def run(self):
-            try:
-                success, models, message = run_get_models()
-                self.finished_signal.emit(success, models, message)
-            except Exception as e:
-                self.finished_signal.emit(False, [], str(e))
-
-    def on_get_models_finished(success, models, message):
-        progress.close()
+    def on_get_models_finished(result, error):
+        if error is not None:
+            success, models, message = False, [], str(error)
+        else:
+            success, models, message = result
         if success:
             if models:
                 selected_model, ok = ModelSelectorDialog.get_model(
                     models,
                     self._t("Select Model"),
                     self._t("Available models:"),
-                    parent=self,
+                    parent=self._dialog_parent(),
                     t_func=self._t,
                 )
                 if ok and selected_model and key in self.env_widgets:
@@ -1141,20 +1689,23 @@ def on_get_models_clicked(self, key: str):
                     widget.setText(selected_model)
                     self.env_var_changed.emit(key, selected_model)
             else:
-                QMessageBox.warning(self, self._t("Warning"), self._t("No models available"))
+                QMessageBox.warning(self._dialog_parent(), self._t("Warning"), self._t("No models available"))
         else:
-            friendly_message = _format_test_connection_error(model_api_type, message)
+            friendly_message = _format_test_connection_error(self, model_api_type, message)
             _show_api_error_dialog(
-                self,
+                self._dialog_parent(),
                 self._t("Error"),
                 self._t("Failed to get models"),
                 friendly_message,
             )
 
-    get_models_thread = GetModelsThread()
-    get_models_thread.finished_signal.connect(on_get_models_finished)
-    get_models_thread.start()
-    self._get_models_thread = get_models_thread
+    _start_managed_api_task(
+        self,
+        "get_models",
+        self.controller.get_available_models_async(model_api_type, api_key, api_base),
+        progress,
+        on_get_models_finished,
+    )
 
 
 def refresh_preset_list(self):
@@ -1165,38 +1716,45 @@ def refresh_preset_list(self):
     current_text = self.preset_combo.currentText()
     current_index = self.preset_combo.currentIndex()
 
+    pending_preset_change = None
     self.preset_combo.blockSignals(True)
-    self.preset_combo.clear()
+    try:
+        self.preset_combo.clear()
 
-    presets = self.controller.get_presets_list()
-    if not presets:
-        self.controller.save_preset("默认", copy_current=False)
         presets = self.controller.get_presets_list()
+        if not presets:
+            self.controller.save_preset("默认", copy_current=False)
+            presets = self.controller.get_presets_list()
 
-    if presets:
-        self.preset_combo.addItems(presets)
+        if presets:
+            self.preset_combo.addItems(presets)
 
-        if current_text and current_text in presets:
-            self.preset_combo.setCurrentText(current_text)
-            self.preset_combo.blockSignals(False)
-        else:
-            new_index = min(current_index, len(presets) - 1)
-            self.preset_combo.setCurrentIndex(new_index)
-            new_preset = self.preset_combo.currentText()
-            self.preset_combo.blockSignals(False)
-            self._on_preset_changed(new_preset)
-            return
+            if current_text and current_text in presets:
+                self.preset_combo.setCurrentText(current_text)
+            else:
+                new_index = min(current_index, len(presets) - 1)
+                self.preset_combo.setCurrentIndex(new_index)
+                pending_preset_change = self.preset_combo.currentText()
+    finally:
+        self.preset_combo.blockSignals(False)
+    if hasattr(self, "delete_preset_button"):
+        self.delete_preset_button.setEnabled(
+            self.preset_combo.currentText() not in ("", "默认")
+        )
 
-    self.preset_combo.blockSignals(False)
+
+    if pending_preset_change is not None:
+        self._on_preset_changed(pending_preset_change)
 
 
 def on_add_preset_clicked(self):
     """添加新预设。"""
     from PyQt6.QtWidgets import QMessageBox
+
     from ui.secondary_pages.themed_text_input_dialog import themed_get_text
 
     preset_name, ok = themed_get_text(
-        self,
+        self._dialog_parent(),
         title=self._t("Add Preset"),
         label=self._t("Enter preset name:"),
         ok_text=self._t("OK"),
@@ -1206,13 +1764,13 @@ def on_add_preset_clicked(self):
     if ok and preset_name:
         preset_name = preset_name.strip()
         if not preset_name:
-            QMessageBox.warning(self, self._t("Warning"), self._t("Preset name cannot be empty"))
+            QMessageBox.warning(self._dialog_parent(), self._t("Warning"), self._t("Preset name cannot be empty"))
             return
 
         existing_presets = self.controller.get_presets_list()
         if preset_name in existing_presets:
             reply = QMessageBox.question(
-                self,
+                self._dialog_parent(),
                 self._t("Confirm"),
                 self._t("Preset '{name}' already exists. Overwrite?", name=preset_name),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -1225,7 +1783,7 @@ def on_add_preset_clicked(self):
             self._refresh_preset_list()
             self.preset_combo.setCurrentText(preset_name)
         else:
-            QMessageBox.critical(self, self._t("Error"), self._t("Failed to create preset"))
+            QMessageBox.critical(self._dialog_parent(), self._t("Error"), self._t("Failed to create preset"))
 
 
 def on_delete_preset_clicked(self):
@@ -1234,11 +1792,14 @@ def on_delete_preset_clicked(self):
 
     preset_name = self.preset_combo.currentText()
     if not preset_name:
-        QMessageBox.warning(self, self._t("Warning"), self._t("Please select a preset to delete"))
+        QMessageBox.warning(self._dialog_parent(), self._t("Warning"), self._t("Please select a preset to delete"))
+        return
+    if preset_name == "默认":
         return
 
+
     reply = QMessageBox.question(
-        self,
+        self._dialog_parent(),
         self._t("Confirm"),
         self._t("Are you sure you want to delete preset '{name}'?", name=preset_name),
         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -1248,9 +1809,9 @@ def on_delete_preset_clicked(self):
         success = self.controller.delete_preset(preset_name)
         if success:
             self._refresh_preset_list()
-            QMessageBox.information(self, self._t("Success"), self._t("Preset deleted successfully"))
+            QMessageBox.information(self._dialog_parent(), self._t("Success"), self._t("Preset deleted successfully"))
         else:
-            QMessageBox.critical(self, self._t("Error"), self._t("Failed to delete preset"))
+            QMessageBox.critical(self._dialog_parent(), self._t("Error"), self._t("Failed to delete preset"))
 
 
 def on_preset_changed(self, new_preset_name: str):
@@ -1262,12 +1823,6 @@ def on_preset_changed(self, new_preset_name: str):
     old_preset_name = getattr(self, "_current_preset_name", "")
     if old_preset_name == new_preset_name:
         return
-
-    if self._env_debounce_timer.isActive():
-        self._env_debounce_timer.stop()
-        for key, (label, widget) in self.env_widgets.items():
-            current_value = _get_env_widget_value(widget)
-            self.controller.save_env_var(key, current_value)
 
     if old_preset_name:
         existing_presets = self.controller.get_presets_list()
@@ -1283,14 +1838,14 @@ def on_preset_changed(self, new_preset_name: str):
         for key, (label, widget) in self.env_widgets.items():
             new_value = current_env_values.get(key, "")
             widget.blockSignals(True)
-            _set_env_widget_value(widget, str(new_value) if new_value else "")
-            if hasattr(widget, "setPlaceholderText"):
-                widget.setPlaceholderText(self._get_env_default_placeholder(key))
-            widget.blockSignals(False)
+            try:
+                _set_env_widget_value(widget, str(new_value) if new_value else "")
+                if hasattr(widget, "setPlaceholderText"):
+                    widget.setPlaceholderText(self._get_env_default_placeholder(key))
+            finally:
+                widget.blockSignals(False)
         self._refresh_env_api_groups()
         self._refresh_api_feature_selectors()
-        if hasattr(self, "_refresh_api_status_sidebar"):
-            self._refresh_api_status_sidebar()
 
 
 def update_output_path_display(self, path: str):
@@ -1301,12 +1856,13 @@ def update_output_path_display(self, path: str):
 def trigger_add_files(self):
     """触发添加文件对话框。"""
     last_dir = self.controller.get_last_open_dir()
+    archive_patterns = "*.pdf *.epub *.cbz *.cbr *.zip"
     file_paths, _ = QFileDialog.getOpenFileNames(
-        self,
+        self._dialog_parent(),
         self._t("Add Files"),
         last_dir,
-        "All Supported Files (*.png *.jpg *.jpeg *.bmp *.webp *.avif *.heic *.heif *.pdf *.epub *.cbz *.cbr *.zip);;"
-        "Image Files (*.png *.jpg *.jpeg *.bmp *.webp *.avif *.heic *.heif);;"
+        f"All Supported Files ({IMAGE_FILE_DIALOG_PATTERNS} {archive_patterns});;"
+        f"{IMAGE_FILE_DIALOG_FILTER};;"
         "PDF Files (*.pdf);;"
         "EPUB Files (*.epub);;"
         "Comic Book Archives (*.cbz *.cbr *.zip)",

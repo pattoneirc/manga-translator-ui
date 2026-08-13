@@ -16,7 +16,7 @@ import numpy as np
 import py3langid as langid
 import regex as re
 import torch
-from PIL import Image
+from PIL import Image, ImageFile
 
 from .config import Colorizer, Config, Inpainter, Renderer, Translator
 from .server_paths import normalize_server_resource_path
@@ -25,6 +25,8 @@ from .utils import (
     Context,
     ModelWrapper,
     TextBlock,
+    build_bubble_mask_from_mangalens_result,
+    build_det_rearrange_plan,
     detect_bubbles_with_mangalens,
     dump_image,
     imwrite_unicode,
@@ -36,10 +38,9 @@ from .utils import (
     visualize_textblocks,
 )
 from .utils.onnx_runtime import set_onnx_gpu_disabled
-from .utils.text_filter import ensure_filter_list_exists, match_filter
+from .utils.text_filter import match_filter
 
 matplotlib.use('Agg')  # 使用非GUI后端
-from matplotlib import cm
 
 from .colorization import dispatch as dispatch_colorization
 from .colorization import prepare as prepare_colorization
@@ -54,11 +55,17 @@ from .detection import unload as unload_detection
 from .inpainting import dispatch as dispatch_inpainting
 from .inpainting import prepare as prepare_inpainting
 from .inpainting import unload as unload_inpainting
+from .inpainting.ballon_fill import (
+    MODEL_BUBBLE_SHRINK_RATIO,
+    inpaint_regions_per_block,
+    solid_fill_pure_bubbles,
+)
 from .mask_refinement import dispatch as dispatch_mask_refinement
 from .ocr import dispatch as dispatch_ocr
 from .ocr import prepare as prepare_ocr
 from .ocr import unload as unload_ocr
 from .rendering import dispatch as dispatch_rendering
+from .rendering.rich_text import has_content, plain_text_of
 from .textline_merge import dispatch as dispatch_textline_merge
 from .translators import (
     dispatch as dispatch_translation,
@@ -86,6 +93,15 @@ from .utils.translation_text import remove_trailing_period_if_needed
 
 # Will be overwritten by __main__.py if module is being run directly (with python -m)
 logger = logging.getLogger('manga_translator')
+
+
+def _translation_plain_text(value) -> str:
+    # 薄委托：富文本→纯文本的唯一实现在 rendering.rich_text.plain_text_of
+    return plain_text_of(value)
+
+
+def _has_translation_text(value) -> bool:
+    return has_content(value)
 
 ARCHIVE_EXTRACT_IMAGE_DIRNAME = 'original_images'
 ARCHIVE_EXTRACT_META_FILENAME = '.extract_meta.json'
@@ -318,7 +334,7 @@ class MangaTranslator:
     def __init__(self, params: dict = {}):
         self.pre_dict = params.get('pre_dict', None)
         self.post_dict = params.get('post_dict', None)
-        self.font_path = None
+        self.font_family = None
         self.kernel_size = None
         self.device = None
         self.text_output_file = params.get('save_text_file', None)
@@ -339,6 +355,8 @@ class MangaTranslator:
         
         self._batch_contexts = []  # 存储批量处理的上下文
         self._batch_configs = []   # 存储批量处理的配置
+        # 内存直通载荷：image_name -> load_text 数据 dict（编辑器导出等场景跳过磁盘往返）
+        self._preloaded_load_text_payloads = {}
         # batch_concurrent 四并发模式（默认关闭，可通过配置开启）
         self.batch_concurrent = params.get('batch_concurrent', False)
         
@@ -374,18 +392,14 @@ class MangaTranslator:
         
         # 确保过滤列表文件存在
         try:
-            ensure_filter_list_exists()
-            from .rendering.text_replacements import ensure_text_replacements_exists
-            ensure_text_replacements_exists()
-            from .utils.translation_template import ensure_translation_template_exists
-            ensure_translation_template_exists()
+            from .runtime_files import ensure_runtime_files
+            ensure_runtime_files()
         except Exception:
             pass
 
     def parse_init_params(self, params: dict):
         self.verbose = params.get('verbose', False)
-        # font_path 优先从配置文件读取，如果没有则使用命令行参数
-        self.font_path = params.get('font_path', None)
+        self.font_family = params.get('font_family', None)
         self.models_ttl = params.get('models_ttl', 0)
         self.batch_size = params.get('batch_size', 3)  # 批量大小（翻译批次）
         disable_onnx_gpu = params.get('disable_onnx_gpu', False)
@@ -675,10 +689,11 @@ class MangaTranslator:
                     from .utils.photoshop_export import (
                         get_psd_output_path,
                         photoshop_export,
+                        resolve_photoshop_font,
                     )
                     psd_path = get_psd_output_path(ctx.image_name)
                     cli_cfg = getattr(config, 'cli', None)
-                    default_font = getattr(cli_cfg, 'psd_font', None)
+                    default_font = resolve_photoshop_font(config)
                     line_spacing = getattr(config.render, 'line_spacing', None) if hasattr(config, 'render') else None
                     script_only = getattr(cli_cfg, 'psd_script_only', False)
                     photoshop_export(psd_path, ctx, default_font, ctx.image_name, self.verbose, self._result_path, line_spacing, script_only)
@@ -708,50 +723,16 @@ class MangaTranslator:
         # Prepare data for JSON serialization
         regions_data = [region.to_dict() for region in ctx.text_regions]
 
-        def normalize_font_path_for_save(font_path: str) -> str:
-            """Normalize font path to portable relative form when possible."""
-            if not font_path:
-                return ''
+        global_font_family = ''
+        if config and hasattr(config, 'render'):
+            global_font_family = getattr(config.render, 'font_family', None) or ''
+        if not global_font_family:
+            global_font_family = self.font_family or ''
 
-            if os.path.isabs(font_path):
-                norm_path = os.path.normpath(font_path)
-                base_path = os.path.normpath(BASE_PATH)
-                fonts_dir = os.path.normpath(os.path.join(base_path, 'fonts'))
-                try:
-                    if os.path.commonpath([norm_path, fonts_dir]) == fonts_dir:
-                        return os.path.relpath(norm_path, base_path).replace('\\', '/')
-                    if os.path.commonpath([norm_path, base_path]) == base_path:
-                        return os.path.relpath(norm_path, base_path).replace('\\', '/')
-                except ValueError:
-                    return norm_path
-                return norm_path
-
-            normalized = font_path.replace('\\', '/')
-            if normalized.lower().startswith('fonts/'):
-                return normalized
-            if '/' in normalized:
-                return normalized
-            return f"fonts/{normalized}"
-
-        # 补全每个区域的 font_path：若区域没有特定字体，填入当前全局字体
-        # 这样后端渲染时完全依靠区域字体，不再依赖运行时全局字体状态
-        global_font = ''
-        if config and hasattr(config, 'render') and getattr(config.render, 'font_path', None):
-            global_font = config.render.font_path
-        if not global_font:
-            global_font = self.font_path or ''
-        global_font = normalize_font_path_for_save(global_font)
-
-        # 统一 region.font_path 保存格式（优先相对路径）
         for region in regions_data:
-            region_font_path = region.get('font_path')
-            if region_font_path:
-                region['font_path'] = normalize_font_path_for_save(region_font_path)
-
-        if global_font:
-            for region in regions_data:
-                if not region.get('font_path'):
-                    region['font_path'] = global_font
+            if not region.get('font_family') and global_font_family:
+                region['font_family'] = global_font_family
+            region.pop('font_path', None)
 
         # 强制使用Config中的排版方向和对齐方式覆盖（如果存在）
         # 这是为了确保即使 textline_merge 检测过程使用了 auto，
@@ -782,19 +763,6 @@ class MangaTranslator:
 
             except Exception as e:
                 logger.warning(f"Failed to override region settings from config: {e}")
-
-
-        # 对竖排区域的 translation 应用 auto_add_horizontal_tags
-        # 确保竖排内横排标记 <H> 写入 JSON
-        if config and hasattr(config, 'render') and getattr(config.render, 'auto_rotate_symbols', False):
-            from .rendering.text_render import auto_add_horizontal_tags
-            for region in regions_data:
-                direction = region.get('direction', '')
-                is_vertical = direction in ('v', 'vertical')
-                if 'horizontal' in region:
-                    is_vertical = not region['horizontal']
-                if is_vertical and region.get('translation'):
-                    region['translation'] = auto_add_horizontal_tags(region['translation'])
 
         # 获取图片尺寸（优先使用保存的尺寸，兼容并发模式）
         if hasattr(ctx, 'original_size') and ctx.original_size:
@@ -835,6 +803,13 @@ class MangaTranslator:
             data_to_save['skip_font_scaling'] = True
         elif preserved_skip_font_scaling is not None:
             data_to_save['skip_font_scaling'] = bool(preserved_skip_font_scaling)
+
+        # 渲染过的 ctx，region.translation 已被 prepare_text_replacements_for_layout
+        # 就地替换为终稿（translation_raw 保留替换前文本）；标记后 load_text 重渲染
+        # 不再二次替换。未渲染的导出（translate_json_only / 导出原文）译文仍是原始的，
+        # 保持缺省 False，导入渲染时才应用替换规则。
+        if getattr(ctx, 'img_rendered', None) is not None:
+            data_to_save['skip_text_replacements'] = True
         
         # 添加超分和上色配置信息
         if config:
@@ -877,6 +852,21 @@ class MangaTranslator:
                 data_to_save['mask_is_refined'] = mask_is_refined
             except Exception as e:
                 logger.error(f"Failed to encode mask to base64: {e}")
+
+        # 保留编辑器写入的画笔/印章图层（后端回写不生产这两个键，避免覆盖丢失）
+        if os.path.exists(text_output_file):
+            try:
+                with open(text_output_file, 'r', encoding='utf-8') as f:
+                    existing_data = json.load(f)
+                if existing_data and len(existing_data.values()) > 0:
+                    existing_image_data = next(iter(existing_data.values()))
+                    if isinstance(existing_image_data, dict):
+                        for overlay_key in ('paint_overlay', 'stamp_overlay'):
+                            overlay_value = existing_image_data.get(overlay_key)
+                            if isinstance(overlay_value, str) and overlay_value:
+                                data_to_save[overlay_key] = overlay_value
+            except Exception as e:
+                logger.debug(f"Failed to preserve overlay layers from existing JSON {text_output_file}: {e}")
 
         # 记录本次主翻译流程的输出目录，编辑器再次导出时回写到原目录
         final_output_dir = getattr(ctx, 'final_output_dir', None)
@@ -1236,19 +1226,9 @@ class MangaTranslator:
     def _get_default_template_path(self) -> Optional[str]:
         """获取默认模板文件路径"""
         try:
-            # 尝试多个可能的路径
-            possible_paths = [
-                os.path.join(os.path.dirname(__file__), '..', 'examples', 'translation_template.json'),
-                os.path.join(os.getcwd(), 'examples', 'translation_template.json'),
-            ]
-            
-            # 如果是打包环境
-            if getattr(sys, 'frozen', False):
-                if hasattr(sys, '_MEIPASS'):
-                    possible_paths.insert(0, os.path.join(sys._MEIPASS, 'examples', 'translation_template.json'))
-                else:
-                    exe_dir = os.path.dirname(sys.executable)
-                    possible_paths.insert(0, os.path.join(exe_dir, 'examples', 'translation_template.json'))
+            from manga_translator.runtime_paths import get_config_path
+
+            possible_paths = [get_config_path('translation_template.json')]
             
             for path in possible_paths:
                 abs_path = os.path.abspath(path)
@@ -1275,43 +1255,117 @@ class MangaTranslator:
             logger.warning(f"Failed to get/create default template: {e}")
             return None
     
+    def set_preloaded_load_text_payload(self, image_name: str, payload: Optional[dict]) -> None:
+        """注册内存直通的 load_text 载荷（编辑器导出通道）。
+
+        注册了载荷即视为编辑器导出（ctx.editor_export=True）：内容与布局是
+        编辑器授权的最终稿，后端只做纯渲染——跳过文本替换、跳过工程 JSON
+        回写；skip_font_scaling 默认 True（center_box 锚点，气泡蒙版不参与摆放）。
+
+        payload 结构与 _translations.json 中单图数据一致（regions 等），
+        额外约定：mask_raw 可直接传 np.ndarray（跳过 base64+PNG 编解码）；
+        inpainted_rgb 传编辑器当前修复图（RGB ndarray，跳过修复图落盘/重读）。
+        载荷会被解析过程原地消费，每次 translate 前需重新注册。
+        """
+        if not image_name:
+            return
+        if payload is None:
+            self._preloaded_load_text_payloads.pop(image_name, None)
+        else:
+            self._preloaded_load_text_payloads[image_name] = payload
+
+    def _extract_render_overlays(self, image_data: dict):
+        """从 JSON/内存载荷提取画笔层与印章层（RGBA），按合成顺序返回列表。
+
+        兼容两种形态：内存直通的 ndarray、JSON 里的 base64 PNG 字符串。
+        """
+        import base64
+
+        overlays = []
+        for key in ('paint_overlay', 'stamp_overlay'):
+            value = image_data.get(key)
+            arr = None
+            if isinstance(value, np.ndarray):
+                arr = value
+            elif isinstance(value, str) and value:
+                try:
+                    buf = np.frombuffer(base64.b64decode(value), dtype=np.uint8)
+                    bgra = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
+                    if bgra is not None and bgra.ndim == 3 and bgra.shape[2] == 4:
+                        arr = cv2.cvtColor(bgra, cv2.COLOR_BGRA2RGBA)
+                except Exception as e:
+                    logger.warning(f"Failed to decode {key} from JSON: {e}")
+            if arr is not None and arr.ndim == 3 and arr.shape[2] == 4 and np.any(arr[..., 3]):
+                overlays.append(arr.astype(np.uint8, copy=False))
+        return overlays or None
+
+    def _compose_render_overlays_on_inpainted(self, ctx):
+        """把加载到的画笔/印章层按顺序 alpha 合成到 ctx.img_inpainted 上（渲染前调用）。"""
+        overlays = getattr(self, '_loaded_render_overlays', None)
+        if not overlays:
+            return
+        base = getattr(ctx, 'img_inpainted', None)
+        if base is None:
+            return
+        base_arr = np.asarray(base)
+        if base_arr.ndim != 3 or base_arr.shape[2] < 3:
+            return
+        h, w = base_arr.shape[:2]
+        composed = base_arr[..., :3].astype(np.float32)
+        for overlay in overlays:
+            if overlay.shape[:2] != (h, w):
+                overlay = cv2.resize(overlay, (w, h), interpolation=cv2.INTER_NEAREST)
+            alpha = overlay[..., 3:4].astype(np.float32) / 255.0
+            composed = composed * (1.0 - alpha) + overlay[..., :3].astype(np.float32) * alpha
+        result = base_arr.copy()
+        result[..., :3] = np.clip(composed, 0, 255).astype(np.uint8)
+        ctx.img_inpainted = result
+        logger.info(f"Composited {len(overlays)} paint/stamp overlay layer(s) onto inpainted image")
+
     def _load_text_and_regions_from_file(self, image_path: str, config: Config):
         """加载翻译数据，支持新的目录结构和向后兼容"""
+        self._loaded_render_overlays = None
         if not image_path:
-            return None, None, False, True, False
+            return None, None, False, True, False, 0
 
-        # 使用path_manager查找JSON文件（新位置优先）
-        text_file_path = find_json_path(image_path)
+        preloaded = self._preloaded_load_text_payloads.get(image_path)
+        if preloaded is not None:
+            # 内存直通：编辑器导出直接注入数据，跳过 JSON 文件查找与解析
+            text_file_path = f"<preloaded:{os.path.basename(image_path)}>"
+            image_data = preloaded
+        else:
+            # 使用path_manager查找JSON文件（新位置优先）
+            text_file_path = find_json_path(image_path)
 
-        if not text_file_path:
-            # 检查旧的TXT格式
-            base_path, _ = os.path.splitext(image_path)
-            text_file_path_txt = base_path + '_translations.txt'
-            if os.path.exists(text_file_path_txt):
-                # If the old format is found, load from it
-                regions = self._load_text_and_regions_from_txt_file(image_path)
-                # Since old format doesn't have mask, we return None for mask and refined status
-                return regions, None, False, True, False
-            else:
-                logger.info(f"Translation file not found for: {image_path}")
-                return None, None, False, True, False
+            if not text_file_path:
+                # 检查旧的TXT格式
+                base_path, _ = os.path.splitext(image_path)
+                text_file_path_txt = base_path + '_translations.txt'
+                if os.path.exists(text_file_path_txt):
+                    # If the old format is found, load from it
+                    regions = self._load_text_and_regions_from_txt_file(image_path)
+                    # Since old format doesn't have mask, we return None for mask and refined status
+                    return regions, None, False, True, False, 0
+                else:
+                    logger.info(f"Translation file not found for: {image_path}")
+                    return None, None, False, True, False, 0
 
-        try:
-            # Force UTF-8 encoding to handle potential file encoding issues
-            with open(text_file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except Exception as e:
-            logger.error(f"Failed to read or parse translation file {text_file_path}: {e}")
-            return None, None, False, True, False
+            try:
+                # Force UTF-8 encoding to handle potential file encoding issues
+                with open(text_file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except Exception as e:
+                logger.error(f"Failed to read or parse translation file {text_file_path}: {e}")
+                return None, None, False, True, False, 0
 
-        # Don't check the image key. Assume the user knows what they are doing
-        # and that the first entry in the JSON is the one they want to load.
-        if not data or len(data.values()) == 0:
-            logger.warning(f"JSON file {text_file_path} is empty or invalid.")
-            return None, None, False, True, False
+            # Don't check the image key. Assume the user knows what they are doing
+            # and that the first entry in the JSON is the one they want to load.
+            if not data or len(data.values()) == 0:
+                logger.warning(f"JSON file {text_file_path} is empty or invalid.")
+                return None, None, False, True, False, 0
 
-        # Get the first value from the dictionary, regardless of the key.
-        image_data = next(iter(data.values()))
+            # Get the first value from the dictionary, regardless of the key.
+            image_data = next(iter(data.values()))
         mask_is_refined = False
         skip_font_scaling = True
         skip_text_replacements = False
@@ -1334,11 +1388,17 @@ class MangaTranslator:
                 image_data.get('skip_text_replacements', False),
                 default=False,
             )
+            self._loaded_render_overlays = self._extract_render_overlays(image_data)
         else:
             logger.warning(f"Invalid data format in JSON file {text_file_path}.")
-            return None, None, False, True, False
+            return None, None, False, True, False, 0
+
+        if preloaded is not None:
+            # 编辑器导出：文本替换在编辑阶段已生效，恒跳过
+            skip_text_replacements = True
 
         regions = []
+        parse_failure_count = 0
         for region_data in regions_data:
             try:
                 # Convert literal '\\n' to newline characters for the rendering engine
@@ -1408,19 +1468,38 @@ class MangaTranslator:
                         lines_arr = lines_arr.reshape(1, 4, 2)
                     elif lines_arr.ndim != 3 or lines_arr.shape[1] != 4 or lines_arr.shape[2] != 2:
                         logger.warning(f"[加载JSON] 无效的lines形状: {lines_arr.shape}, 跳过此区域")
+                        parse_failure_count += 1
                         continue
                     region_data['lines'] = lines_arr
-                
+
                 # 导入翻译模式：颜色已由用户确认，不需要自动调整描边颜色
                 region_data['adjust_bg_color'] = False
-                region = TextBlock(**region_data)
+                try:
+                    region = TextBlock(**region_data)
+                except Exception as construct_err:
+                    # 保险丝：解析失败不应吞掉整个区域（否则回写 JSON 时该区域连同
+                    # 原文、坐标一起永久丢失）。先剥掉 translation_rich 降级重试一次
+                    # ——丢样式可以，丢区域不行；仍失败才计数跳过。
+                    if isinstance(region_data, dict) and 'translation_rich' in region_data:
+                        degraded_data = {k: v for k, v in region_data.items() if k != 'translation_rich'}
+                        region = TextBlock(**degraded_data)
+                        logger.warning(
+                            f"Region in {text_file_path} failed to load with translation_rich, "
+                            f"discarded rich styling and kept the region: {construct_err}"
+                        )
+                    else:
+                        raise
                 regions.append(region)
             except Exception as e:
+                parse_failure_count += 1
                 logger.error(f"Failed to parse a region in {text_file_path}: {e}")
                 continue
         
         mask_raw = None
-        if isinstance(mask_raw_data, str):
+        if isinstance(mask_raw_data, np.ndarray):
+            # 内存直通载荷直接携带 ndarray 蒙版，跳过 base64/PNG 编解码
+            mask_raw = mask_raw_data.astype(np.uint8, copy=False)
+        elif isinstance(mask_raw_data, str):
             try:
                 import base64
 
@@ -1434,10 +1513,15 @@ class MangaTranslator:
             mask_raw = np.array(mask_raw_data, dtype=np.uint8)
         
         logger.info(f"Loaded {len(regions)} regions from {text_file_path}")
+        if parse_failure_count:
+            logger.error(
+                f"{parse_failure_count} region(s) in {text_file_path} could not be parsed and were skipped; "
+                "JSON write-back will be disabled for this image to protect the project file"
+            )
         if mask_raw is not None:
             logger.info(f"Loaded mask_raw from {text_file_path}")
 
-        return regions, mask_raw, mask_is_refined, skip_font_scaling, skip_text_replacements
+        return regions, mask_raw, mask_is_refined, skip_font_scaling, skip_text_replacements, parse_failure_count
 
     def _load_text_and_regions_from_txt_file(self, image_path: str) -> Optional[List[TextBlock]]:
         """
@@ -1592,14 +1676,10 @@ class MangaTranslator:
             **upscaler_kwargs
         ))[0]
         
-        # 如果 models_ttl > 0，则由清理任务自动卸载；否则立即卸载以释放显存
         if self.models_ttl > 0:
             logger.info(f"Upscaling model {config.upscale.upscaler} will be unloaded after {self.models_ttl}s of inactivity")
         else:
-            # models_ttl == 0 表示永久保留，但 upscaling 模型占用显存较大，仍然立即卸载
-            logger.info(f"Unloading upscaling model {config.upscale.upscaler} immediately to free VRAM")
-            await self._unload_model('upscaling', config.upscale.upscaler, **upscaler_kwargs)
-            del self._model_usage_timestamps[("upscaling", config.upscale.upscaler)]
+            logger.debug(f"Keeping upscaling model {config.upscale.upscaler} loaded because models_ttl=0")
         
         return result
 
@@ -1662,6 +1742,9 @@ class MangaTranslator:
                 config.detector.yolo_obb_overlap_threshold,
                 config.detector.min_box_area_ratio,
                 self._result_path,
+                config.detector.det_rearrange_min_effective_short_side,
+                use_sfx_filter=bool(getattr(config.detector, 'use_sfx_filter', False)),
+                sfx_filter_include_bubble_text=bool(getattr(config.detector, 'sfx_filter_include_bubble_text', False)),
             )
         
             # 处理bbox调试图（如果检测器返回了）
@@ -1911,6 +1994,12 @@ class MangaTranslator:
         
         logger.info(f"模型 {tool}/{model} 已卸载，内存已清理")
 
+    # gc.collect() 的耗时取决于进程内对象总数（torch 进程约百毫秒级），与待释放内存无关；
+    # 大数组由引用计数即时回收，Python 自动分代 GC 兜底循环引用，
+    # 显式全堆扫描按时间限流（覆盖交互式导出的常见间隔）
+    _GC_MIN_INTERVAL_S = 60.0
+    _last_gc_collect_ts = 0.0
+
     def _cleanup_gpu_memory(self, aggressive: bool = False):
         """清理 GPU 显存的辅助方法。
 
@@ -1918,8 +2007,11 @@ class MangaTranslator:
             aggressive: 是否执行激进清理（empty_cache/ipc_collect）。
                         批次边界与模型卸载后建议 True。
         """
-        import gc
-        gc.collect()
+        now = time.monotonic()
+        if now - MangaTranslator._last_gc_collect_ts >= MangaTranslator._GC_MIN_INTERVAL_S:
+            import gc
+            gc.collect()
+            MangaTranslator._last_gc_collect_ts = now
 
         # 仅在 CUDA 设备下执行显存清理；MPS 目前无等价 empty_cache。
         device_str = str(getattr(self, 'device', ''))
@@ -2017,6 +2109,44 @@ class MangaTranslator:
         # 强制垃圾回收和GPU显存清理
         self._cleanup_gpu_memory()
         logger.debug('[MEMORY] Context cleanup completed')
+
+    @staticmethod
+    def _detach_context_result(ctx):
+        """Make ctx.result independent from input images and lazy file handles."""
+        result = getattr(ctx, 'result', None)
+        if result is None:
+            return
+        aliased = (
+            result is getattr(ctx, 'input', None)
+            or result is getattr(ctx, 'upscaled', None)
+            or result is getattr(ctx, 'img_colorized', None)
+        )
+        # dump_image 产物是全新的内存图像；只有输入别名或仍持文件句柄的图才需要复制
+        file_backed = isinstance(result, ImageFile.ImageFile) or getattr(result, 'fp', None) is not None
+        if not aliased and not file_backed:
+            return
+        result.load()
+        ctx.result = result.copy()
+
+    @staticmethod
+    def _align_preloaded_inpainted(inpainted, img_rgb):
+        """将内存直通载荷里的修复图规整为与工作图同尺寸的 RGB uint8 数组。"""
+        if inpainted is None or img_rgb is None:
+            return None
+        arr = np.asarray(inpainted)
+        if arr.ndim == 2:
+            arr = np.repeat(arr[:, :, None], 3, axis=2)
+        elif arr.ndim == 3 and arr.shape[2] > 3:
+            arr = arr[:, :, :3]
+        elif arr.ndim != 3:
+            logger.warning(f"[load_text] preloaded inpainted shape invalid: {arr.shape}, ignored")
+            return None
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        target_h, target_w = img_rgb.shape[:2]
+        if arr.shape[0] != target_h or arr.shape[1] != target_w:
+            arr = cv2.resize(arr, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+        return np.ascontiguousarray(arr)
 
     
     def _cleanup_batch_memory(self, current_batch_images=None, preprocessed_contexts=None, translated_contexts=None, keep_results=True):
@@ -2204,6 +2334,66 @@ class MangaTranslator:
                     del self._model_usage_timestamps[(tool, model)]
             await asyncio.sleep(1)
 
+    def _resolve_ocr_prob_threshold(self, config: Config) -> float:
+        return config.ocr.prob if config.ocr.prob is not None else 0.1
+
+    @staticmethod
+    def _get_textline_text(textline) -> str:
+        return str(getattr(textline, 'text', '') or '')
+
+    @staticmethod
+    def _get_textline_prob(textline) -> float:
+        try:
+            return float(getattr(textline, 'prob', 1.0))
+        except (TypeError, ValueError):
+            return 1.0
+
+    def _textline_needs_secondary_ocr(self, textline, prob_threshold: float) -> bool:
+        return (
+            not self._get_textline_text(textline).strip()
+            or self._get_textline_prob(textline) < prob_threshold
+        )
+
+    def _filter_ocr_textlines(self, config: Config, textlines, prob_threshold: float):
+        filtered_textlines = []
+        filter_list_count = 0
+        low_confidence_count = 0
+
+        for textline in textlines:
+            text = self._get_textline_text(textline)
+            if not text.strip():
+                continue
+
+            textline_prob = self._get_textline_prob(textline)
+            if textline_prob < prob_threshold:
+                low_confidence_count += 1
+                logger.info(
+                    f'OCR过滤低置信度文本行: prob={textline_prob:.4f} < '
+                    f'threshold={prob_threshold:.4f}, text="{text}"'
+                )
+                continue
+
+            if self.filter_text_enabled:
+                match_result = match_filter(text)
+                if match_result:
+                    matched_word, match_type = match_result
+                    filter_list_count += 1
+                    logger.info(f'OCR过滤文本行 ({match_type}匹配): "{text}" -> 匹配: "{matched_word}"')
+                    continue
+
+            if config.render.font_color_fg:
+                textline.fg_r, textline.fg_g, textline.fg_b = config.render.font_color_fg
+            if config.render.font_color_bg:
+                textline.bg_r, textline.bg_g, textline.bg_b = config.render.font_color_bg
+            filtered_textlines.append(textline)
+
+        if filter_list_count > 0:
+            logger.info(f'OCR过滤列表: 过滤了 {filter_list_count} 个文本行')
+        if low_confidence_count > 0:
+            logger.info(f'OCR置信度过滤: 过滤了 {low_confidence_count} 个文本行')
+
+        return filtered_textlines
+
     async def _run_ocr(self, config: Config, ctx: Context):
         # ✅ 检查停止标志
         await asyncio.sleep(0)
@@ -2233,6 +2423,8 @@ class MangaTranslator:
         if ocr_result_dir:
             os.environ['MANGA_OCR_RESULT_DIR'] = ocr_result_dir
         
+        ocr_prob_threshold = self._resolve_ocr_prob_threshold(config)
+
         try:
             # --- Primary OCR run ---
             primary_ocr_engine = config.ocr.ocr
@@ -2252,16 +2444,15 @@ class MangaTranslator:
             if config.ocr.use_hybrid_ocr:
                 # Identify textlines that failed recognition or have low confidence
                 # 判断失败条件：文本为空 或 置信度低于阈值
-                prob_threshold = config.ocr.prob if config.ocr.prob is not None else 0.1
                 failed_indices = [
                     i for i, tl in enumerate(textlines) 
-                    if not tl.text.strip() or tl.prob < prob_threshold
+                    if self._textline_needs_secondary_ocr(tl, ocr_prob_threshold)
                 ]
                 
                 if failed_indices:
                     # Use textlines[i] instead of ctx.textlines[i] because OCR may have changed the order
                     failed_textlines = [textlines[i] for i in failed_indices]
-                    logger.info(f"{len(failed_textlines)} textlines failed or have low confidence (< {prob_threshold}) with primary OCR. Trying secondary OCR...")
+                    logger.info(f"{len(failed_textlines)} textlines failed or have low confidence (< {ocr_prob_threshold}) with primary OCR. Trying secondary OCR...")
                     
                     secondary_ocr_engine = config.ocr.secondary_ocr
                     # We can reuse the same config object, just switching the engine
@@ -2303,30 +2494,7 @@ class MangaTranslator:
             elif 'MANGA_OCR_RESULT_DIR' in os.environ:
                 del os.environ['MANGA_OCR_RESULT_DIR']
 
-        new_textlines = []
-        filtered_count = 0
-        for textline in textlines:
-            text = str(getattr(textline, 'text', '') or '')
-            if not text.strip():
-                continue
-
-            if self.filter_text_enabled:
-                match_result = match_filter(text)
-                if match_result:
-                    matched_word, match_type = match_result
-                    filtered_count += 1
-                    logger.info(f'OCR过滤文本行 ({match_type}匹配): "{text}" -> 匹配: "{matched_word}"')
-                    continue
-
-            if config.render.font_color_fg:
-                textline.fg_r, textline.fg_g, textline.fg_b = config.render.font_color_fg
-            if config.render.font_color_bg:
-                textline.bg_r, textline.bg_g, textline.bg_b = config.render.font_color_bg
-            new_textlines.append(textline)
-
-        if filtered_count > 0:
-            logger.info(f'OCR过滤列表: 过滤了 {filtered_count} 个文本行')
-        return new_textlines
+        return self._filter_ocr_textlines(config, textlines, ocr_prob_threshold)
 
     async def _run_textline_merge(self, config: Config, ctx: Context):
         current_time = time.time()
@@ -2386,33 +2554,27 @@ class MangaTranslator:
             img_h, img_w = ctx.img_rgb.shape[:2]
             img_total_pixels = img_h * img_w
             
-            # 模拟检测器的切割逻辑，判断是否需要切割
-            h, w = img_h, img_w
-            if h < w:
-                h, w = w, h
+            rearrange_plan = build_det_rearrange_plan(
+                ctx.img_rgb,
+                tgt_size=config.detector.detection_size,
+                min_effective_short_side=config.detector.det_rearrange_min_effective_short_side,
+            )
+            require_rearrange = rearrange_plan is not None
             
-            asp_ratio = h / w
-            tgt_size = config.detector.detection_size
-            down_scale_ratio = h / tgt_size
-            require_rearrange = down_scale_ratio > 2.5 and asp_ratio > 3
-            
-            # 如果需要切割，计算切割块的大小
             if require_rearrange:
-                pw_num = max(int(np.floor(2 * tgt_size / w)), 2)
-                patch_size = pw_num * w
+                h = int(rearrange_plan['h'])
+                w = int(rearrange_plan['w'])
+                patch_size = int(rearrange_plan['patch_size'])
+                asp_ratio = h / w
                 
-                # 限制切割后块的最大长宽比（不超过 3:1）
-                # 注意：ph = pw_num * w，所以 ph/w = pw_num
+                # 限制面积过滤参考块的最大长宽比（不超过 3:1）。
+                # 检测切片可以更高以占满模型长边，但过滤阈值不能因此过度放大。
                 max_patch_aspect_ratio = 3.0
-                if pw_num > max_patch_aspect_ratio:
-                    # pw_num 太大，说明切割块太高，需要减小
-                    # 但是不能直接减小 pw_num，因为这是检测器的逻辑
-                    # 我们只是用来计算面积过滤的参考值
-                    # 所以这里使用限制后的 pw_num 来计算 tile_pixels
-                    adjusted_pw_num = max_patch_aspect_ratio
-                    adjusted_ph = adjusted_pw_num * w
+                patch_aspect_ratio = patch_size / w
+                if patch_aspect_ratio > max_patch_aspect_ratio:
+                    adjusted_ph = max_patch_aspect_ratio * w
                     tile_pixels = adjusted_ph * w
-                    logger.info(f'检测到极端长宽比图片 (长宽比={asp_ratio:.2f}), 限制面积过滤参考块长宽比: 原始切割块={patch_size}x{w} (长宽比={pw_num:.2f}), 过滤参考块={adjusted_ph:.0f}x{w} (长宽比={adjusted_pw_num:.2f}), 面积={tile_pixels:.0f}像素')
+                    logger.info(f'检测到极端长宽比图片 (长宽比={asp_ratio:.2f}), 限制面积过滤参考块长宽比: 实际切割块={patch_size}x{w} (长宽比={patch_aspect_ratio:.2f}), 过滤参考块={adjusted_ph:.0f}x{w} (长宽比={max_patch_aspect_ratio:.2f}), 面积={tile_pixels:.0f}像素')
                 else:
                     tile_pixels = patch_size * w
                     logger.info(f'检测到极端长宽比图片 (长宽比={asp_ratio:.2f}), 使用切割块面积 ({patch_size}x{w}={tile_pixels}像素) 进行过滤')
@@ -2871,11 +3033,6 @@ class MangaTranslator:
             f"inpainting_size={config.inpainter.inpainting_size}, "
             f"image_shape={img_shape}, mask_shape={mask_shape}"
         )
-        self._log_cuda_memory_snapshot("inpainting/before_cleanup")
-
-        # 修复前先执行一次激进显存清理，降低并发/长批次下的显存碎片与OOM概率。
-        self._cleanup_gpu_memory(aggressive=True)
-        self._log_cuda_memory_snapshot("inpainting/after_cleanup")
         snapshot = self._get_cuda_memory_snapshot()
         if snapshot is not None:
             try:
@@ -2884,13 +3041,78 @@ class MangaTranslator:
                 pass
             self._log_cuda_memory_snapshot("inpainting/before_dispatch", include_peak=False)
         
+        # BT 式修复，两个独立开关：
+        # solid_fill_pure_bubbles - 纯色气泡直接填背景色跳过模型
+        # per_block_inpainting - 按优化蒙版孤立连通块逐块裁窗修复；补方后不会进入长图切片流程
+        img_for_inpaint = ctx.img_rgb
+        mask_for_inpaint = ctx.mask
+        solid_fill = getattr(config.inpainter, 'solid_fill_pure_bubbles', False)
+        per_block = getattr(config.inpainter, 'per_block_inpainting', False)
+        text_regions = getattr(ctx, 'text_regions', None) or []
+        if (solid_fill and text_regions) or per_block:
+            try:
+                filled_img = ctx.img_rgb
+                remaining_mask = ctx.mask
+                if solid_fill and text_regions:
+                    # 膨胀后的 raw 蒙版从模型气泡中扣除文字；逐块模型仍使用优化后的 ctx.mask。
+                    mask_tight = getattr(ctx, 'mask_raw', None)
+                    if mask_tight is not None:
+                        if mask_tight.shape[:2] != ctx.mask.shape[:2]:
+                            mask_tight = cv2.resize(mask_tight, ctx.mask.shape[:2][::-1],
+                                                    interpolation=cv2.INTER_LINEAR)
+                        # BT REFINEMASK_INPAINT 等效：笔画掩码外扩 2px，
+                        # 盖住文字边缘抗锯齿像素，否则背景纯度采样会被灰边顶爆
+                        mask_tight = cv2.dilate(
+                            np.where(mask_tight >= 127, 255, 0).astype(np.uint8), None, iterations=2)
+                        try:
+                            bubble_mask = build_bubble_mask_from_mangalens_result(
+                                detect_bubbles_with_mangalens(
+                                    ctx.img_rgb, return_annotated=False, verbose=False),
+                                ctx.img_rgb.shape[:2],
+                                erode_ratio=MODEL_BUBBLE_SHRINK_RATIO,
+                            )
+                        except Exception as bubble_exc:
+                            logger.warning(f"[修复] 气泡模型检测失败，跳过纯色填充: {bubble_exc}")
+                            bubble_mask = np.zeros(ctx.img_rgb.shape[:2], dtype=np.uint8)
+                        filled_img, remaining_mask, filled_count = solid_fill_pure_bubbles(
+                            ctx.img_rgb, ctx.mask, text_regions, mask_tight, bubble_mask,
+                            config.ocr.model_bubble_overlap_threshold)
+                        logger.info(
+                            f"[修复] 纯色气泡直接填色: "
+                            f"{filled_count}/{len(text_regions)} 个文本区域跳过修复模型")
+
+                if per_block:
+                    if remaining_mask is ctx.mask:
+                        remaining_mask = ctx.mask.copy()
+
+                    async def _inpaint_block(crop, msk):
+                        self._check_cancelled()
+                        return await dispatch_inpainting(
+                            config.inpainter.inpainter, crop, msk, config.inpainter,
+                            config.inpainter.inpainting_size, self.device, self.verbose)
+
+                    result, block_count = await inpaint_regions_per_block(
+                        filled_img, remaining_mask, _inpaint_block)
+                    logger.info(f"[修复] 逐块修复完成: {block_count} 个孤立蒙版")
+                    return result
+
+                img_for_inpaint, mask_for_inpaint = filled_img, remaining_mask
+                if not np.any(mask_for_inpaint):
+                    logger.info("[修复] 剩余掩码为空，跳过修复模型")
+                    return img_for_inpaint
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"BT 式修复失败，回退到整页修复: {e}")
+                img_for_inpaint, mask_for_inpaint = ctx.img_rgb, ctx.mask
+
         current_time = time.time()
         self._model_usage_timestamps[("inpainting", config.inpainter.inpainter)] = current_time
         try:
             result = await dispatch_inpainting(
                 config.inpainter.inpainter,
-                ctx.img_rgb,
-                ctx.mask,
+                img_for_inpaint,
+                mask_for_inpaint,
                 config.inpainter,
                 config.inpainter.inpainting_size,
                 self.device,
@@ -2920,12 +3142,11 @@ class MangaTranslator:
         current_time = time.time()
         self._model_usage_timestamps[("rendering", config.render.renderer)] = current_time
 
-        # 全局字体只作为“补全区域字体”的来源，后端渲染实际只读 region.font_path
-        fallback_font_path = config.render.font_path or self.font_path or ''
+        fallback_font_family = config.render.font_family or self.font_family or ''
         if ctx.text_regions:
             for region in ctx.text_regions:
-                if not getattr(region, 'font_path', ''):
-                    region.font_path = fallback_font_path
+                if not getattr(region, 'font_family', ''):
+                    region.font_family = fallback_font_family
 
         render_base_img = ctx.img_rgb if self._should_skip_inpainting_for_ai_renderer(config) else ctx.img_inpainted
 
@@ -2961,6 +3182,20 @@ class MangaTranslator:
                         logger.info(f"📸 Balloon fill debug image saved: {debug_path}")
                     except Exception as e:
                         logger.error(f"Failed to save balloon_fill debug image: {e}")
+                semantic_records = getattr(config, '_chinese_linebreak_debug_records', None)
+                if isinstance(semantic_records, list) and semantic_records:
+                    try:
+                        semantic_debug_path = self._result_path('chinese_linebreak_debug.json')
+                        semantic_debug_data = {
+                            "version": 1,
+                            "type": "chinese_linebreak_debug",
+                            "records": semantic_records,
+                        }
+                        with open(semantic_debug_path, 'w', encoding='utf-8') as f:
+                            json.dump(semantic_debug_data, f, ensure_ascii=False, indent=2)
+                        logger.info(f"Chinese linebreak debug JSON saved: {semantic_debug_path}")
+                    except Exception as e:
+                        logger.error(f"Failed to save Chinese linebreak debug JSON: {e}")
             else:
                 output = result
 
@@ -3013,7 +3248,7 @@ class MangaTranslator:
             mask_normalized = np.clip((mask_normalized - vmin) / (vmax - vmin), 0, 1)
         
         # 应用颜色映射（使用jet colormap）
-        colormap = cm.get_cmap('jet')
+        colormap = matplotlib.colormaps['jet']
         colored_mask = colormap(mask_normalized)
         
         # 转换为BGR格式 (matplotlib返回RGBA)
@@ -3220,15 +3455,14 @@ class MangaTranslator:
                 if is_hq_translator and is_import_export_mode:
                     logger.warning("检测到导入/导出翻译模式，高质量翻译流程将被跳过，将使用标准流程进行渲染。")
         
-        # === 步骤3: 检查是否需要使用顺序处理模式 ===
-        # 注意：不要在这里调用 translate()，因为 translate() 会调用 translate_batch()，造成无限循环
-        # 相反，我们直接使用批量处理逻辑，但 batch_size 设置为 1
+        # === 步骤3: 规范单项批次 ===
+        # 始终留在 translate_batch() 内；导出原文需要逐张落盘，因此使用 batch_size=1。
         is_template_save_mode = self.template and self.save_text
         if is_template_save_mode:
-            logger.info("Template+SaveText mode detected. Forcing sequential processing to save files one by one.")
+            logger.info("Template+SaveText mode detected. Using one-item backend batches.")
             batch_size = 1  # 强制使用 batch_size=1
         elif batch_size <= 1 and not self.batch_concurrent:
-            logger.debug('Batch size <= 1, using sequential processing')
+            logger.debug('Batch size <= 1, using one-item backend batches')
             batch_size = 1
         
         # === 步骤3: 检查是否使用并发流水线模式 ===
@@ -3316,7 +3550,7 @@ class MangaTranslator:
 
             return contexts
         
-        # === 步骤4: 批量处理模式（顺序处理） ===
+        # === 步骤4: 标准非并发批量处理 ===
         logger.info(f'Starting batch translation: {len(images_with_configs)} images, batch size: {batch_size}')
         logger.info('[阶段] 批量翻译任务启动')
         
@@ -3328,7 +3562,7 @@ class MangaTranslator:
         total_images = len(images_with_configs)
 
         async def report_completed_image_progress():
-            """顺序批处理按单张图片完成推进整体进度，避免整批处理期间长时间停滞。"""
+            """非并发批处理按单张图片完成推进整体进度，避免整批处理期间长时间停滞。"""
             if display_total <= 0:
                 return
             completed = min(global_offset + len(results), display_total)
@@ -3385,24 +3619,37 @@ class MangaTranslator:
                             ctx.verbose = self.verbose
                             ctx.save_quality = self.save_quality
                             ctx.config = config
+                            ctx.inpainted_regenerated = False
+
+                            # 统一标志：注册过内存载荷 == 编辑器导出。
+                            # 后端视为授权终稿，只做纯渲染（不回写 JSON、不做文本替换、
+                            # 蒙版已精炼、修复图直接复用）。
+                            preloaded_payload = self._preloaded_load_text_payloads.get(image_name) if image_name else None
+                            ctx.editor_export = preloaded_payload is not None
                             
                             # 加载翻译数据
-                            loaded_regions, loaded_mask, mask_is_refined, skip_font_scaling, skip_text_replacements = self._load_text_and_regions_from_file(image_name, config)
+                            loaded_regions, loaded_mask, mask_is_refined, skip_font_scaling, skip_text_replacements, region_parse_failures = self._load_text_and_regions_from_file(image_name, config)
                             if loaded_regions is None:
                                 json_path = os.path.splitext(image_name)[0] + '_translations.json' if image_name else 'unknown'
                                 raise FileNotFoundError(f"Translation file not found or invalid: {json_path}")
-                            
+
                             # 如果regions是空列表，记录日志但继续处理（渲染原图）
                             if not loaded_regions:
                                 logger.info(f"No text regions found in JSON for {os.path.basename(image_name)}, will render original image")
-                            
+
                             self._prepare_loaded_regions(loaded_regions, use_text_as_translation=True)
-                            
+
                             ctx.text_regions = loaded_regions
                             ctx.skip_font_scaling = skip_font_scaling
                             ctx.skip_text_replacements = skip_text_replacements
+                            # 有区域解析失败时禁止回写 JSON，避免把丢失的区域覆盖进工程文件
+                            ctx.load_text_parse_failures = region_parse_failures
                             
-                            existing_inpainted_path = find_inpainted_path(image_name) if image_name else None
+                            preloaded_inpainted_raw = preloaded_payload.get('inpainted_rgb') if preloaded_payload else None
+                            # 内存里已有编辑器修复图时，无需再扫描磁盘上的历史修复图
+                            existing_inpainted_path = None
+                            if preloaded_inpainted_raw is None and image_name:
+                                existing_inpainted_path = find_inpainted_path(image_name)
 
                             # load_text 始终基于原图处理，不走上色/超分，也不把已有修复图塞进 img_colorized/upscaled
                             ctx.img_colorized = ctx.input
@@ -3421,11 +3668,25 @@ class MangaTranslator:
 
                             import_yolo_labels = bool(getattr(config.detector, 'import_yolo_labels', False))
                             if loaded_mask is not None or not import_yolo_labels:
-                                # load_text 跳过文本检测阶段；如果当前配置依赖气泡缓存
-                                # （例如 balloon_fill / 气泡内居中 / 模型气泡过滤），这里补做一次预热。
-                                # 导入 YOLO 框且需要重新跑检测生成 mask 的场景，后续 _run_detection 会自行预热，
-                                # 这里避免重复调用。
-                                self._prime_bubble_detection_cache(config, ctx.img_rgb)
+                                # load_text 不跑 OCR；skip_font_scaling（编辑器授权布局）恒用
+                                # center_box 锚点，气泡蒙版不参与摆放，渲染侧也不消费气泡缓存。
+                                # 只有自动布局（balloon_fill/气泡内居中）或仍需蒙版精炼且开启
+                                # "膨胀限制在气泡内"时才预热。
+                                # 导入 YOLO 框且需要重新跑检测生成 mask 的场景，后续 _run_detection 会自行预热。
+                                mask_refinement_will_run = not (loaded_mask is not None and mask_is_refined)
+                                render_needs_bubble_cache = (
+                                    not skip_font_scaling
+                                    and (
+                                        getattr(config.render, 'layout_mode', None) == 'balloon_fill'
+                                        or bool(getattr(config.render, 'center_text_in_bubble', False))
+                                    )
+                                )
+                                needs_bubble_cache = render_needs_bubble_cache or (
+                                    bool(getattr(config.ocr, 'limit_mask_dilation_to_bubble_mask', False))
+                                    and mask_refinement_will_run
+                                )
+                                if needs_bubble_cache:
+                                    self._prime_bubble_detection_cache(config, ctx.img_rgb)
 
                             # 处理 mask
                             if loaded_mask is not None:
@@ -3497,7 +3758,10 @@ class MangaTranslator:
                                     mask_arr = mask_arr.astype(np.uint8, copy=False)
 
                                 setattr(ctx, mask_attr, mask_arr)
-                            
+
+                            # 编辑器修复图对齐到工作图尺寸，供后续分支直接复用
+                            preloaded_inpainted = self._align_preloaded_inpainted(preloaded_inpainted_raw, ctx.img_rgb)
+
                             # load_text 支持“仅修复”模式：即使没有文字区域，只要 JSON 里有可用蒙版，也执行修复。
                             if not ctx.text_regions:
                                 mask_for_inpainting = ctx.mask if ctx.mask is not None else ctx.mask_raw
@@ -3521,7 +3785,10 @@ class MangaTranslator:
                                         ctx.mask = np.asarray(mask_for_inpainting, dtype=np.uint8)
 
                                     generated_inpainted_in_load_text = False
-                                    if existing_inpainted_path and loaded_mask is not None:
+                                    if preloaded_inpainted is not None:
+                                        ctx.img_inpainted = preloaded_inpainted
+                                        logger.info("Load text mode: using editor-provided inpainted image for mask-only import.")
+                                    elif existing_inpainted_path and loaded_mask is not None:
                                         try:
                                             existing_inpainted_image = open_pil_image(existing_inpainted_path, eager=False)
                                             existing_inpainted_rgb, _ = load_image(existing_inpainted_image)
@@ -3540,6 +3807,7 @@ class MangaTranslator:
                                         ctx.img_inpainted = await self._run_inpainting(config, ctx)
                                         generated_inpainted_in_load_text = True
 
+                                    ctx.inpainted_regenerated = generated_inpainted_in_load_text
                                     if (
                                         generated_inpainted_in_load_text
                                         and image_name
@@ -3547,6 +3815,9 @@ class MangaTranslator:
                                         and self.save_text
                                     ):
                                         self._save_inpainted_image(image_name, ctx.img_inpainted)
+
+                                    # 画笔/印章层合成（放在保存 inpainted 之后，避免涂层被烤进修复图文件）
+                                    self._compose_render_overlays_on_inpainted(ctx)
 
                                     await self._report_progress('finished', True)
                                     ctx.result = dump_image(ctx.input, ctx.img_inpainted, ctx.img_alpha, mask=ctx.mask)
@@ -3572,6 +3843,9 @@ class MangaTranslator:
                                 if self._should_skip_inpainting_for_ai_renderer(config):
                                     logger.info("AI renderer selected: skipping inpainting and using original work image as render base.")
                                     ctx.img_inpainted = ctx.img_rgb
+                                elif preloaded_inpainted is not None:
+                                    ctx.img_inpainted = preloaded_inpainted
+                                    logger.info("Load text mode: using editor-provided inpainted image, skipping inpainting.")
                                 elif existing_inpainted_path and loaded_mask is not None:
                                     try:
                                         existing_inpainted_image = open_pil_image(existing_inpainted_path, eager=False)
@@ -3590,6 +3864,7 @@ class MangaTranslator:
                                     ctx.img_inpainted = await self._run_inpainting(config, ctx)
                                     generated_inpainted_in_load_text = True
 
+                                ctx.inpainted_regenerated = generated_inpainted_in_load_text
                                 if (
                                     generated_inpainted_in_load_text
                                     and image_name
@@ -3597,7 +3872,10 @@ class MangaTranslator:
                                     and self.save_text
                                 ):
                                     self._save_inpainted_image(image_name, ctx.img_inpainted)
-                                
+
+                                # 画笔/印章层合成（放在保存 inpainted 之后，避免涂层被烤进修复图文件）
+                                self._compose_render_overlays_on_inpainted(ctx)
+
                                 # Rendering - load_text按JSON中的skip_font_scaling控制：True=跳过字体缩放，False=执行字体缩放
                                 await self._report_progress('rendering')
                                 ctx.img_rendered = await self._run_text_rendering(
@@ -3618,14 +3896,35 @@ class MangaTranslator:
                                 ctx = await self._revert_upscale(config, ctx)
 
                             # load_text模式：渲染后回写JSON（同步最新regions，包含translation/font_size等字段）
-                            if hasattr(ctx, 'text_regions') and ctx.text_regions is not None and hasattr(ctx, 'image_name') and ctx.image_name:
-                                try:
-                                    self._save_text_to_file(ctx.image_name, ctx, config)
-                                except Exception as save_json_err:
-                                    logger.error(f"Error updating JSON in load_text mode for {os.path.basename(ctx.image_name)}: {save_json_err}")
+                            # 编辑器导出（编辑器已自行持久化工程 JSON）时跳过回写
+                            if (
+                                hasattr(ctx, 'text_regions') and ctx.text_regions is not None
+                                and hasattr(ctx, 'image_name') and ctx.image_name
+                                and not getattr(ctx, 'editor_export', False)
+                            ):
+                                parse_failures = getattr(ctx, 'load_text_parse_failures', 0)
+                                if parse_failures:
+                                    # 保险丝：有区域解析失败时跳过覆盖回写，否则这些区域会
+                                    # 连同原文、坐标从工程 JSON 中永久消失（无备份）。
+                                    logger.error(
+                                        f"{parse_failures} region(s) failed to parse for "
+                                        f"{os.path.basename(ctx.image_name)}; skipped JSON write-back to protect the project file"
+                                    )
+                                else:
+                                    try:
+                                        self._save_text_to_file(ctx.image_name, ctx, config)
+                                    except Exception as save_json_err:
+                                        logger.error(f"Error updating JSON in load_text mode for {os.path.basename(ctx.image_name)}: {save_json_err}")
                             
                             preprocessed_contexts.append((ctx, config))
-                            
+
+                            # load_text 的结果有时会复用输入图片（例如无文本区域时
+                            # ctx.result = ctx.upscaled），或仍持有输入文件的惰性句柄。
+                            # 后续内存清理会关闭输入图片，因此必须先生成完全独立的结果，
+                            # 否则调用方在 translate() 返回后 copy/save 会报：
+                            # ValueError: Operation on closed image
+                            self._detach_context_result(ctx)
+
                             # ✅ 每处理完一张图片后立即清理内存（保留result）
                             self._cleanup_context_memory(ctx, keep_result=True)
                             
@@ -3703,7 +4002,7 @@ class MangaTranslator:
                             ctx.config = config
                             ctx.from_lang = 'auto'
 
-                            loaded_regions, loaded_mask, mask_is_refined, skip_font_scaling, _skip_text_replacements = self._load_text_and_regions_from_file(image_name, config)
+                            loaded_regions, loaded_mask, mask_is_refined, skip_font_scaling, _skip_text_replacements, region_parse_failures = self._load_text_and_regions_from_file(image_name, config)
                             if loaded_regions is None:
                                 json_path = find_json_path(image_name) if image_name else None
                                 if not json_path and image_name:
@@ -3713,6 +4012,8 @@ class MangaTranslator:
                             self._prepare_loaded_regions(loaded_regions, use_text_as_translation=False)
                             ctx.text_regions = loaded_regions
                             ctx.skip_font_scaling = skip_font_scaling
+                            # 有区域解析失败时禁止回写 JSON，避免把丢失的区域覆盖进工程文件
+                            ctx.load_text_parse_failures = region_parse_failures
 
                             if loaded_mask is not None:
                                 if mask_is_refined:
@@ -3746,6 +4047,14 @@ class MangaTranslator:
                             continue
 
                         try:
+                            parse_failures = getattr(ctx, 'load_text_parse_failures', 0)
+                            if parse_failures:
+                                # 保险丝：回写会以当前 regions 全量重建 JSON，解析失败的
+                                # 区域会被永久删除，这里改为显式失败并保留原文件。
+                                raise IOError(
+                                    f"{parse_failures} region(s) failed to parse from JSON; "
+                                    "skipped saving to protect the project file"
+                                )
                             save_success = self._save_text_to_file(ctx.image_name, ctx, config)
                             if not save_success:
                                 raise IOError(f"Failed to save JSON for {os.path.basename(ctx.image_name)}")
@@ -3901,12 +4210,8 @@ class MangaTranslator:
                         await report_completed_image_progress()
 
                         # ✅ 渲染完一张立即清理这张图片的中间数据（不等整个批次完成）
+                        # （内部 gc 已按时间限流，无需再周期性强制回收）
                         self._cleanup_context_memory(ctx, keep_result=True)
-
-                        # 每渲染3张图片就强制垃圾回收一次
-                        if (idx + 1) % 3 == 0:
-                            import gc
-                            gc.collect()
 
                     except Exception as e:
                         logger.error(f"Error rendering image in batch: {e}", exc_info=True)
@@ -4575,12 +4880,13 @@ class MangaTranslator:
                         for region in ctx.text_regions:
                             should_filter = False
                             filter_reason = ""
+                            translation_text = _translation_plain_text(region.translation)
 
-                            if not region.translation.strip():
+                            if not translation_text.strip():
                                 should_filter = True
                                 filter_reason = "Translation contain blank areas"
                             elif config.translator.translator != Translator.none:
-                                if region.translation.isnumeric():
+                                if translation_text.isnumeric():
                                     should_filter = True
                                     filter_reason = "Numeric translation"
                                 elif not config.translator.translator == Translator.original:
@@ -4589,8 +4895,8 @@ class MangaTranslator:
                                         filter_reason = "Translation identical to original"
 
                             if should_filter:
-                                if region.translation.strip():
-                                    logger.info(f'Filtered out: {region.translation}')
+                                if translation_text.strip():
+                                    logger.info(f'Filtered out: {translation_text}')
                                     logger.info(f'Reason: {filter_reason}')
                             else:
                                 new_text_regions.append(region)
@@ -4734,7 +5040,7 @@ class MangaTranslator:
         """Keep identical text when no_text_lang_skip is enabled."""
         if getattr(config.translator, 'no_text_lang_skip', False):
             return False
-        return region.text.lower().strip() == region.translation.lower().strip()
+        return str(region.text or '').lower().strip() == _translation_plain_text(region.translation).lower().strip()
             
     async def _apply_post_translation_processing(self, ctx: Context, config: Config) -> List:
         """
@@ -4771,6 +5077,7 @@ class MangaTranslator:
         # 统一渲染：不在翻译后阶段强制替换引号/括号，交由渲染层处理。
 
         for region in ctx.text_regions:
+            # translation property 恒返 str，无需 isinstance 防御
             if region.text and region.translation:
                 # 引号处理逻辑
                 if '『' in region.text and '』' in region.text:
@@ -4837,8 +5144,8 @@ class MangaTranslator:
         # 应用后字典
         post_dict = load_dictionary(self.post_dict)
         post_replacements = []  
-        for region in ctx.text_regions:  
-            original = region.translation  
+        for region in ctx.text_regions:
+            original = region.translation
             region.translation = apply_dictionary(region.translation, post_dict)
             if original != region.translation:  
                 post_replacements.append(f"{original} => {region.translation}")  
@@ -4850,8 +5157,7 @@ class MangaTranslator:
         else:
             logger.info("No post-translation replacements made.")
 
-        # 注:文本替换规则(text_replacements.yaml) 已挪到 rendering 函数 dispatch() 内执行,
-        # 在 [BR]/<H> 标记加完之后、画字之前 — 这样 raw 含完整标记,渲染图也用替换后字符。
+        # 注:文本替换规则(text_replacements.yaml) 已挪到 rendering 函数 dispatch() 内执行。
 
         # 单个region幻觉检测
         failed_regions = []
@@ -4860,10 +5166,10 @@ class MangaTranslator:
             
             # 单个region级别的幻觉检测
             for region in ctx.text_regions:
-                if region.translation and region.translation.strip():
+                if _has_translation_text(region.translation):
                     # 只检查重复内容幻觉
                     if await self._check_repetition_hallucination(
-                        region.translation, 
+                        _translation_plain_text(region.translation),
                         config.translator.post_check_repetition_threshold,
                         silent=False
                     ):
@@ -5088,8 +5394,8 @@ class MangaTranslator:
         # 合并所有翻译文本
         all_translations = []
         for region in text_regions:
-            translation = getattr(region, 'translation', '')
-            if translation and translation.strip():
+            translation = _translation_plain_text(getattr(region, 'translation', ''))
+            if translation.strip():
                 all_translations.append(translation.strip())
         
         if not all_translations:
@@ -5135,7 +5441,8 @@ class MangaTranslator:
         if not config.translator.enable_post_translation_check:
             return True
             
-        if not translation or not translation.strip():
+        translation = _translation_plain_text(translation)
+        if not translation.strip():
             return True
         
         # 1. 目标语言比例检查（页面级别）

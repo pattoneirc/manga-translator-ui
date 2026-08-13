@@ -1,8 +1,10 @@
-from ui.theme import get_current_theme, get_theme_colors
+from PyQt6.QtCore import QMargins, QPointF, QRectF, Qt
+from PyQt6.QtGui import QPainter, QPalette, QPixmap, QTransform
+from PyQt6.QtWidgets import QFrame, QGraphicsPixmapItem, QGraphicsScene, QGraphicsView
+
 from editor.image_utils import build_display_image_frame
-from PyQt6.QtCore import QPointF, QRectF, Qt
-from PyQt6.QtGui import QColor, QPainter, QPixmap, QTransform
-from PyQt6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView
+
+from .graphics_view import canvas_background_color
 
 
 class OriginalCompareView(QGraphicsView):
@@ -34,13 +36,19 @@ class OriginalCompareView(QGraphicsView):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.setFrameShape(QFrame.Shape.NoFrame)
         self.apply_theme()
 
     def apply_theme(self, theme: str | None = None):
-        colors = get_theme_colors(theme or get_current_theme())
-        canvas_color = QColor(colors["bg_canvas"])
+        canvas_color = canvas_background_color(theme)
         self.scene.setBackgroundBrush(canvas_color)
         self.setBackgroundBrush(canvas_color)
+        self.setAutoFillBackground(True)
+        palette = self.viewport().palette()
+        palette.setColor(QPalette.ColorRole.Base, canvas_color)
+        palette.setColor(QPalette.ColorRole.Window, canvas_color)
+        self.viewport().setPalette(palette)
+        self.viewport().setAutoFillBackground(True)
         self.scene.update()
         self.viewport().update()
 
@@ -102,6 +110,7 @@ class OriginalCompareView(QGraphicsView):
         self._last_transform = QTransform(transform)
         self._last_center_scene = QPointF(center_scene)
         self._last_scene_rect = self._resolve_source_scene_rect()
+        self._sync_source_viewport_geometry()
 
         if self._image_item is None:
             return
@@ -114,11 +123,33 @@ class OriginalCompareView(QGraphicsView):
         self.viewport().update()
 
     def _resolve_source_scene_rect(self) -> QRectF | None:
+        # 主画布显式维护了不受临时 item 影响的 sceneRect，并在图片四周留出
+        # 平移余量。双栏必须复用同一范围，否则靠近边缘时 centerOn 会在左栏
+        # 提前被图片边界钳制，造成两栏错位。
         if self._source_view is None:
             return None
-        return self._source_view.get_content_scene_rect()
+        getter = getattr(self._source_view, "get_view_scene_rect", None)
+        if getter is None:
+            return None
+        return getter()
+
+    def _sync_source_viewport_geometry(self) -> None:
+        """让只读栏的有效视口与可能显示滚动条的主画布完全等大。"""
+        if self._source_view is None:
+            return
+        source_viewport = self._source_view.viewport()
+        content_rect = self.contentsRect()
+        margins = QMargins(
+            0,
+            0,
+            max(0, content_rect.width() - source_viewport.width()),
+            max(0, content_rect.height() - source_viewport.height()),
+        )
+        if self.viewportMargins() != margins:
+            self.setViewportMargins(margins)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._sync_source_viewport_geometry()
         if self._image_item is not None and self._last_center_scene is not None:
             self.centerOn(self._last_center_scene)

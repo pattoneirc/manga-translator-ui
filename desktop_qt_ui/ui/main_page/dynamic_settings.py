@@ -1,24 +1,42 @@
 import json
 import os
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSlot
-from PyQt6.QtGui import QColor
+from PyQt6.QtCore import QSignalBlocker, Qt, QTimer, pyqtSlot
 from PyQt6.QtWidgets import (
-    QFormLayout,
-    QFrame,
     QGridLayout,
     QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QPushButton,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
-from utils.resource_helper import resource_path
-from ui.widgets.wheel_filter import NoWheelComboBox as QComboBox
+from qfluentwidgets import (
+    BodyLabel,
+    CaptionLabel,
+    HorizontalSeparator,
+    SimpleCardWidget,
+    StrongBodyLabel,
+    themeColor,
+)
+from qfluentwidgets import LineEdit as FluentLineEdit
+from qfluentwidgets import PushButton as QPushButton
+
 from ui.widgets.hover_hint import set_hover_hint
 from ui.widgets.toggle_switch import ToggleSwitch
+from ui.widgets.wheel_filter import NoWheelComboBox as QComboBox
+from ui.widgets.widget_cleanup import clear_layout
+from utils.font_list import FontComboBox, set_system_fonts_enabled
+
+
+class QLineEdit(FluentLineEdit):
+    """Fluent LineEdit with the PyQt constructor forms used by existing settings code."""
+
+    def __init__(self, text: str | QWidget | None = "", parent: QWidget | None = None):
+        if isinstance(text, QWidget) and parent is None:
+            parent = text
+            text = ""
+        super().__init__(parent)
+        if text:
+            self.setText(str(text))
 
 
 API_GROUP_SPECS = {
@@ -35,7 +53,6 @@ API_GROUP_SPECS = {
 SIMPLE_API_GROUP_SPECS = {
     "translator_sakura": ("SAKURA_API_BASE", "SAKURA_DICT_PATH"),
 }
-
 
 def _normalize_selected_value(value) -> str:
     raw = getattr(value, "value", value)
@@ -85,9 +102,7 @@ def _selected_api_group_keys(config) -> dict[str, list[str]]:
 
 
 def _add_empty_api_hint(self, layout, row: int, translation_key: str) -> int:
-    notice = QFrame()
-    notice.setObjectName("api_empty_state")
-    notice.setFrameShape(QFrame.Shape.NoFrame)
+    notice = SimpleCardWidget()
     notice.setMinimumHeight(120)
     notice.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
@@ -96,8 +111,7 @@ def _add_empty_api_hint(self, layout, row: int, translation_key: str) -> int:
     notice_layout.setSpacing(0)
     notice_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-    text = QLabel(self._t(translation_key))
-    text.setObjectName("api_empty_state_text")
+    text = BodyLabel(self._t(translation_key))
     text.setAlignment(Qt.AlignmentFlag.AlignCenter)
     text.setWordWrap(True)
     text.setMinimumHeight(56)
@@ -117,10 +131,16 @@ def _add_api_section_panel(
     current_env_values: dict,
     empty_hint_key: str,
 ):
-    env_input_widget = QWidget()
-    if not group_keys:
-        env_input_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-    self.env_layout = QGridLayout(env_input_widget)
+    section_card = SimpleCardWidget()
+    section_card.setSizePolicy(
+        QSizePolicy.Policy.Expanding,
+        QSizePolicy.Policy.Expanding if not group_keys else QSizePolicy.Policy.Preferred,
+    )
+    section_card_layout = QVBoxLayout(section_card)
+    section_card_layout.setContentsMargins(16, 14, 16, 16)
+    section_card_layout.setSpacing(12)
+
+    self.env_layout = QGridLayout()
     self.env_layout.setColumnStretch(1, 1)
     self.env_layout.setColumnStretch(2, 0)
     self.env_layout.setHorizontalSpacing(12)
@@ -147,17 +167,114 @@ def _add_api_section_panel(
     else:
         _add_empty_api_hint(self, self.env_layout, self.env_layout.rowCount(), empty_hint_key)
 
-    container_layout.addWidget(env_input_widget, 1 if not group_keys else 0)
+    section_card_layout.addLayout(self.env_layout, 1 if not group_keys else 0)
+    container_layout.addWidget(section_card, 1 if not group_keys else 0)
 
 
-def _clear_layout_widgets(layout):
-    while layout.count():
-        child = layout.takeAt(0)
-        if child.widget():
-            child.widget().deleteLater()
+_CACHED_SETTINGS_WIDGET_ATTRS = (
+    "translator_combo",
+    "upscale_ratio_combo",
+)
+
+_FIXED_PROMPT_KEYS = frozenset({
+    "ocr.ai_ocr_prompt_path",
+    "colorizer.ai_colorizer_prompt_path",
+    "render.ai_renderer_prompt_path",
+})
+
+_SKIPPED_SETTING_KEYS = frozenset({
+    "cli.load_text",
+    "cli.translate_json_only",
+    "cli.template",
+    "cli.generate_and_export",
+    "cli.colorize_only",
+    "cli.upscale_only",
+    "cli.inpaint_only",
+    "cli.replace_translation",
+    "cli.replace_translation_mode",
+    "upscale.realcugan_model",
+    "render.gimp_font",
+    "translator.high_quality_prompt_path",
+    "app.last_open_dir",
+    "app.last_output_path",
+    "app.favorite_folders",
+    "app.folder_dialog_sort",
+    "app.current_preset",
+})
+
+_OPTIONAL_INPUT_KEYS = frozenset({
+    "tile_size",
+    "line_spacing",
+    "letter_spacing",
+    "font_size",
+    "ocr_vl_custom_prompt",
+    "ai_ocr_custom_prompt",
+})
+
+_LEGACY_SETTING_SECTIONS = (
+    "translator",
+    "cli",
+    "detector",
+    "inpainter",
+    "render",
+    "upscale",
+    "colorizer",
+    "ocr",
+    "app",
+)
 
 
-def _refresh_env_api_groups(self):
+def _drop_cached_settings_widget_refs(view):
+    """丢弃随设置页重建而销毁的控件缓存引用，避免重建窗口期悬空访问。"""
+    for attr in _CACHED_SETTINGS_WIDGET_ATTRS:
+        if hasattr(view, attr):
+            delattr(view, attr)
+    view._highlighted_rows = []
+
+
+def _clear_layout_widgets(layout, *, restore_stretch: bool = False):
+    """递归隐藏并延迟删除布局内容；可补回设置页末尾 stretch。"""
+    clear_layout(layout, restore_stretch=restore_stretch)
+
+
+def _env_group_structure_signature(active_api_groups: dict, current_env_values: dict) -> str:
+    from manga_translator.api_key_rotation import get_rotation_slot_count
+
+    from ui.main_page.env_management import API_ROTATION_UI_MAX_SLOTS
+
+    slot_counts = {}
+    for group_keys in active_api_groups.values():
+        for group_key in group_keys:
+            slot_keys = API_GROUP_SPECS.get(group_key)
+            if slot_keys:
+                slot_counts[group_key] = get_rotation_slot_count(
+                    current_env_values,
+                    slot_keys,
+                    default=1,
+                    maximum=API_ROTATION_UI_MAX_SLOTS,
+                )
+    return json.dumps(
+        {"groups": active_api_groups, "slot_counts": slot_counts},
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+def _sync_env_widget_values(self, current_env_values: dict) -> None:
+    from ui.main_page.env_management import _set_env_widget_value
+
+    for key, (_label, widget) in list(self.env_widgets.items()):
+        blocker = QSignalBlocker(widget)
+        try:
+            _set_env_widget_value(widget, current_env_values.get(key, ""))
+            if hasattr(widget, "setPlaceholderText"):
+                widget.setPlaceholderText(self._get_env_default_placeholder(key))
+        finally:
+            del blocker
+
+
+def _refresh_env_api_groups(self, *, force: bool = False):
     if not all(
         hasattr(self, attr)
         for attr in (
@@ -169,7 +286,30 @@ def _refresh_env_api_groups(self):
     ):
         return
 
+    active_api_groups = _selected_api_group_keys(self.controller.config_service.get_config())
+    current_env_values = self.controller.config_service.load_env_vars()
+    structure_signature = _env_group_structure_signature(active_api_groups, current_env_values)
+    value_signature = json.dumps(
+        {
+            "env": current_env_values,
+            "preset": self.controller.config_service.get_current_preset(),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
+    )
+    if not force and getattr(self, "_env_api_groups_structure_signature", None) == structure_signature:
+        self._refresh_api_feature_selectors()
+        if getattr(self, "_env_api_groups_signature", None) == value_signature:
+            return
+        _sync_env_widget_values(self, current_env_values)
+        self._env_api_groups_signature = value_signature
+        return
+
+    self._env_api_groups_structure_signature = structure_signature
+    self._env_api_groups_signature = value_signature
     self.env_widgets.clear()
+    self._api_slot_status_widgets = []
     for layout in [
         self.env_group_container_layout,
         self.ocr_container_layout,
@@ -177,9 +317,6 @@ def _refresh_env_api_groups(self):
         self.render_container_layout,
     ]:
         _clear_layout_widgets(layout)
-
-    active_api_groups = _selected_api_group_keys(self.controller.config_service.get_config())
-    current_env_values = self.controller.config_service.load_env_vars()
 
     _add_api_section_panel(
         self,
@@ -233,6 +370,19 @@ def _get_setting_description(view, full_key: str) -> str:
     return ""
 
 
+def _append_settings_row(parent_layout, row: QWidget):
+    insert_at = parent_layout.count()
+    if insert_at:
+        last_item = parent_layout.itemAt(insert_at - 1)
+        if last_item and last_item.spacerItem():
+            insert_at -= 1
+    parent_layout.insertWidget(insert_at, row)
+
+
+def _insert_settings_row(parent_layout, index: int, row: QWidget):
+    parent_layout.insertWidget(index, row)
+
+
 
 def _open_filter_list(self):
     """打开过滤列表编辑器"""
@@ -241,7 +391,7 @@ def _open_filter_list(self):
     filter_path = ensure_filter_list_exists()
     from ui.secondary_pages.filter_list_editor import FilterListEditorDialog
 
-    dialog = FilterListEditorDialog(filter_path, t_func=self._t, parent=self)
+    dialog = FilterListEditorDialog(filter_path, t_func=self._t, parent=self._dialog_parent())
     dialog.exec()
 
 
@@ -332,7 +482,7 @@ def _open_fixed_prompt_editor(self, full_key: str):
             AIColorizerPromptEditorDialog,
         )
 
-        dialog = AIColorizerPromptEditorDialog(abs_path, t_func=self._t, parent=self)
+        dialog = AIColorizerPromptEditorDialog(abs_path, t_func=self._t, parent=self._dialog_parent())
         dialog.exec()
         return
 
@@ -348,7 +498,7 @@ def _open_fixed_prompt_editor(self, full_key: str):
         load_prompt_func=spec["load_func"],
         save_prompt_func=spec["save_func"],
         t_func=self._t,
-        parent=self,
+        parent=self._dialog_parent(),
     )
     dialog.exec()
 
@@ -359,13 +509,6 @@ def _create_fixed_prompt_editor_row(self, parent_layout, full_key: str):
         return False
 
     label_text = spec["label"]
-    label = QLabel(f"{label_text}:")
-    label.setObjectName("settings_form_label")
-    label.setMinimumWidth(120)
-
-    container = QWidget()
-    hbox = QHBoxLayout(container)
-    hbox.setContentsMargins(0, 0, 0, 0)
 
     edit_button = QPushButton(self._t("Edit"))
     edit_button.setFixedWidth(120)
@@ -376,22 +519,144 @@ def _create_fixed_prompt_editor_row(self, parent_layout, full_key: str):
     elif full_key == "render.ai_renderer_prompt_path":
         edit_button.clicked.connect(self._open_ai_renderer_prompt_editor)
 
-    hbox.addWidget(edit_button)
-    hbox.addStretch(1)
-
-    row = _ClickableRow(self, full_key, label, container)
-    parent_layout.addRow(row)
+    row = _ClickableRow(self, full_key, label_text, [edit_button])
+    _append_settings_row(parent_layout, row)
     return True
+
+
+def _iter_rendered_setting_values(self, config: dict):
+    if getattr(self, "_settings_tabs_use_reclassify", False):
+        seen = set()
+        for tab in getattr(self, "settings_tab_layout", []) or []:
+            for item in tab.get("items", []):
+                if isinstance(item, dict):
+                    continue
+                full_key = str(item or "").strip()
+                if not full_key or full_key in seen:
+                    continue
+                seen.add(full_key)
+                exists, value = _resolve_config_value(config, full_key)
+                if exists:
+                    yield full_key, full_key.rsplit(".", 1)[-1], value
+        return
+
+    for section in _LEGACY_SETTING_SECTIONS:
+        values = config.get(section)
+        if not isinstance(values, dict):
+            continue
+        for key, value in values.items():
+            yield f"{section}.{key}", str(key), value
+    for key, value in config.items():
+        if key not in _LEGACY_SETTING_SECTIONS:
+            yield str(key), str(key), value
+
+
+def _setting_control_kind(full_key: str, key: str, value, options, display_map) -> str | None:
+    if full_key in _SKIPPED_SETTING_KEYS:
+        return None
+    if full_key in _FIXED_PROMPT_KEYS:
+        return "prompt-button"
+    if full_key == "upscale.upscale_ratio":
+        return "combo"
+    if full_key == "filter_text_enabled":
+        return "toggle-action"
+    if full_key == "render.font_family":
+        return "font-action"
+    if isinstance(value, bool):
+        return "toggle-action" if full_key == "use_custom_api_params" else "toggle"
+    if isinstance(value, float):
+        return "float-input"
+    if isinstance(value, int):
+        return "int-input"
+    if value is None and key in _OPTIONAL_INPUT_KEYS:
+        return "optional-input"
+    if (isinstance(value, str) or value is None) and (options or display_map):
+        return "combo"
+    if isinstance(value, str):
+        return "text-input"
+    return None
+
+
+def _settings_structure_signature(self, config: dict) -> str | None:
+    try:
+        rows = []
+        for full_key, key, value in _iter_rendered_setting_values(self, config):
+            options = self.controller.get_options_for_key(key) or []
+            display_map = self.controller.get_display_mapping(key) or {}
+            kind = _setting_control_kind(full_key, key, value, options, display_map)
+            if kind is not None:
+                rows.append((full_key, kind, list(options), dict(display_map)))
+        rows.sort(key=lambda row: row[0])
+        return json.dumps(
+            {
+                "rows": rows,
+                "tab_layout": getattr(self, "settings_tab_layout", None),
+                "reclassify": bool(getattr(self, "_settings_tabs_use_reclassify", False)),
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        )
+    except Exception:
+        return None
+
+
+def _sync_setting_widget_values(self, config: dict) -> bool:
+    bindings = getattr(self, "_settings_value_bindings", {})
+    try:
+        for full_key, (widget, display_map) in list(bindings.items()):
+            exists, value = _resolve_config_value(config, full_key)
+            if not exists:
+                return False
+
+            blocker = QSignalBlocker(widget)
+            try:
+                if isinstance(widget, ToggleSwitch):
+                    widget.setChecked(bool(value))
+                elif isinstance(widget, FontComboBox):
+                    widget.setCurrentFamily(str(value or ""))
+                elif isinstance(widget, QComboBox):
+                    if full_key == "upscale.upscale_ratio":
+                        continue
+                    target = display_map.get(value, value) if display_map else value
+                    if full_key == "translator.high_quality_prompt_path":
+                        target = os.path.basename(value) if value else ""
+                    if target is None and widget.count():
+                        widget.setCurrentIndex(0)
+                    else:
+                        widget.setCurrentText(str(target or ""))
+                elif hasattr(widget, "setText"):
+                    widget.setText("" if value is None else str(value))
+            finally:
+                del blocker
+
+        upscale_binding = bindings.get("upscale.upscale_ratio")
+        exists, upscaler = _resolve_config_value(config, "upscale.upscaler")
+        if upscale_binding is not None and exists:
+            widget = upscale_binding[0]
+            blocker = QSignalBlocker(widget)
+            try:
+                _repopulate_upscale_ratio_options(self, widget, upscaler)
+            finally:
+                del blocker
+        return True
+    except (AttributeError, RuntimeError):
+        return False
+
 
 @pyqtSlot(dict)
 def set_parameters(self, config: dict):
     """
     Receives a config dictionary and starts the incremental creation of setting widgets.
     """
+    render_config = config.get("render", {}) if isinstance(config, dict) else {}
+    set_system_fonts_enabled(not bool(render_config.get("disable_system_fonts", False)))
     try:
         config_signature = json.dumps(config, sort_keys=True, ensure_ascii=False, default=str)
     except Exception:
         config_signature = None
+
+    structure_signature = _settings_structure_signature(self, config)
 
     if (
         config_signature is not None
@@ -400,20 +665,37 @@ def set_parameters(self, config: dict):
     ):
         return
 
+    if (
+        structure_signature is not None
+        and getattr(self, "_settings_ui_ready", False)
+        and getattr(self, "_settings_rendered_structure_signature", None) == structure_signature
+        and _sync_setting_widget_values(self, config)
+    ):
+        self._settings_pending_signature = config_signature
+        self._settings_rendered_signature = config_signature
+        _refresh_env_api_groups(self)
+        self._refresh_api_feature_selectors()
+        self._refresh_prompt_manager()
+        return
+
     self._settings_ui_ready = False
     self._settings_pending_signature = config_signature
+    self._settings_pending_structure_signature = structure_signature
+    self._settings_value_bindings = {}
 
-    # Clear existing widgets immediately
+    # 构建代号：每次重建自增，链中每步校验，过期构建链自行终止，
+    # 避免二次 config_loaded 并发开出第二条构建链导致控件重复。
+    self._settings_build_seq = getattr(self, "_settings_build_seq", 0) + 1
+    build_seq = self._settings_build_seq
+
+    # Clear existing widgets immediately（补回底部 stretch，保持 spacer 约定）
     for panel in self.tab_frames.values():
-        layout = panel.layout()
-        while layout.count():
-            child = layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
+        _clear_layout_widgets(panel.layout(), restore_stretch=True)
+    _drop_cached_settings_widget_refs(self)
 
     if getattr(self, "_settings_tabs_use_reclassify", False):
         _populate_settings_by_reclassify_layout(self, config)
-        self._finalize_settings_ui()
+        self._finalize_settings_ui(build_seq)
         return
 
     # Store config and sections to process
@@ -424,7 +706,7 @@ def set_parameters(self, config: dict):
     ]
 
     # Schedule the first chunk of work
-    QTimer.singleShot(0, self._process_next_setting_chunk)
+    QTimer.singleShot(0, lambda: self._process_next_setting_chunk(build_seq))
 
 
 def _resolve_config_value(config: dict, full_key: str):
@@ -439,65 +721,43 @@ def _resolve_config_value(config: dict, full_key: str):
 
 def _add_settings_divider(self, parent_layout, title: str, is_sub: bool = False):
     row = QWidget()
-    row.setObjectName("settings_divider_sub" if is_sub else "settings_divider_primary")
     row_layout = QHBoxLayout(row)
 
     if is_sub:
-        row_layout.setContentsMargins(24, 10, 0, 4)
+        row_layout.setContentsMargins(16, 8, 8, 4)
         row_layout.setSpacing(8)
 
-        dot_label = QLabel("◆")
-        dot_label.setObjectName("settings_divider_dot")
+        dot_label = CaptionLabel("◆")
         dot_label.setFixedWidth(14)
 
-        title_label = QLabel(title)
-        title_label.setObjectName("settings_divider_sub_title")
-
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setObjectName("settings_divider_sub_line")
+        title_label = BodyLabel(title)
 
         row_layout.addWidget(dot_label)
         row_layout.addWidget(title_label)
-        row_layout.addWidget(line, 1)
+        row_layout.addWidget(HorizontalSeparator(), 1)
     else:
-        row_layout.setContentsMargins(0, 18, 0, 6)
+        row_layout.setContentsMargins(4, 18, 4, 6)
         row_layout.setSpacing(10)
 
-        title_label = QLabel(title.upper())
-        title_label.setObjectName("settings_divider_title")
-
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setObjectName("settings_divider_line")
-
+        title_label = StrongBodyLabel(title.upper())
         row_layout.addWidget(title_label)
-        row_layout.addWidget(line, 1)
+        row_layout.addWidget(HorizontalSeparator(), 1)
 
-    parent_layout.addRow(row)
+    _append_settings_row(parent_layout, row)
 
 
 def _create_widget_from_full_key(self, config: dict, full_key: str, parent_layout):
-    if full_key in {
-        "ocr.ai_ocr_prompt_path",
-        "colorizer.ai_colorizer_prompt_path",
-        "render.ai_renderer_prompt_path",
-    }:
+    if full_key in _FIXED_PROMPT_KEYS:
         return _create_fixed_prompt_editor_row(self, parent_layout, full_key)
 
     exists, value = _resolve_config_value(config, full_key)
     if not exists:
         return False
 
-    before = parent_layout.rowCount() if isinstance(parent_layout, QFormLayout) else -1
     if "." in full_key:
         section, key = full_key.split(".", 1)
-        self._create_param_widgets({key: value}, parent_layout, section)
-    else:
-        self._create_param_widgets({full_key: value}, parent_layout, "")
-    if isinstance(parent_layout, QFormLayout):
-        return parent_layout.rowCount() > before
-    return True
+        return bool(self._create_param_widgets({key: value}, parent_layout, section))
+    return bool(self._create_param_widgets({full_key: value}, parent_layout, ""))
 
 
 def _populate_settings_by_reclassify_layout(self, config: dict):
@@ -509,7 +769,7 @@ def _populate_settings_by_reclassify_layout(self, config: dict):
             continue
 
         panel_layout = panel.layout()
-        if panel_layout is None or not isinstance(panel_layout, QFormLayout):
+        if panel_layout is None:
             continue
 
         has_primary_divider = False
@@ -531,12 +791,15 @@ def _populate_settings_by_reclassify_layout(self, config: dict):
     return rendered_rows
 
 
-def _process_next_setting_chunk(self):
+def _process_next_setting_chunk(self, build_seq: int):
     """
     Processes one section of the settings UI and schedules the next one.
+    build_seq 与当前构建代号不一致时说明本链已过期，直接终止。
     """
+    if build_seq != getattr(self, "_settings_build_seq", None):
+        return
     if not self._sections_to_process:
-        self._finalize_settings_ui()
+        self._finalize_settings_ui(build_seq)
         return
 
     section = self._sections_to_process.pop(0)
@@ -566,30 +829,31 @@ def _process_next_setting_chunk(self):
         self._create_param_widgets(config[section], panel.layout(), section)
 
     # Schedule the next chunk
-    QTimer.singleShot(0, self._process_next_setting_chunk)
+    QTimer.singleShot(0, lambda: self._process_next_setting_chunk(build_seq))
 
-def _finalize_settings_ui(self):
+def _finalize_settings_ui(self, build_seq: int | None = None):
     """
     Called after all incremental updates are done. Sets up dependent UI like .env section.
     """
+    if build_seq is not None and build_seq != getattr(self, "_settings_build_seq", None):
+        return
     # 在 CLI 配置区域最上面添加"翻译完成后卸载模型"复选框
     cli_panel = self.tab_frames.get("Basic Settings")
     if cli_panel and not getattr(self, "_settings_tabs_use_reclassify", False):
         cli_layout = cli_panel.layout()
-        if cli_layout is not None and isinstance(cli_layout, QFormLayout):
+        if cli_layout is not None:
             # 创建滑块开关
             unload_models_checkbox = ToggleSwitch()
-            unload_models_checkbox.setObjectName("app.unload_models_after_translation")
             
             # 从配置中读取初始状态
             config = self.config_service.get_config()
-            unload_models_checkbox.setCheckedNoSignal(config.app.unload_models_after_translation)
+            unload_models_checkbox.setCheckedSilently(config.app.unload_models_after_translation)
             
             # 连接信号
-            unload_models_checkbox.stateChanged.connect(
-                lambda state: self.controller.update_single_config(
+            unload_models_checkbox.checkedChanged.connect(
+                lambda checked: self.controller.update_single_config(
                     'app.unload_models_after_translation', 
-                    bool(state)
+                    bool(checked)
                 )
             )
             
@@ -597,25 +861,27 @@ def _finalize_settings_ui(self):
             label_text = self._t("label_unload_models_after_translation")
             if not label_text or label_text == "label_unload_models_after_translation":
                 label_text = "Unload Models After Translation"
-            unload_models_label = QLabel(f"{label_text}:")
+            row = _ClickableRow(
+                self,
+                "app.unload_models_after_translation",
+                label_text,
+                unload_models_checkbox,
+            )
             
             # 插入到最上面（索引0）
-            cli_layout.insertRow(0, unload_models_label, unload_models_checkbox)
+            _insert_settings_row(cli_layout, 0, row)
     
     if hasattr(self, "env_tab_widget"):
         # Update tab text matching locale dynamically if needed
-        self.env_tab_widget.setTabText(0, self._t("Translation"))
-        self.env_tab_widget.setTabText(1, self._t("OCR"))
-        self.env_tab_widget.setTabText(2, self._t("Colorization"))
-        self.env_tab_widget.setTabText(3, self._t("Render"))
+        for route_key, title_key in getattr(self, "env_tab_title_keys", {}).items():
+            self.env_tab_widget.setItemText(route_key, self._t(title_key))
 
     # Clear containers
     for layout in [self.env_preset_layout, self.env_group_container_layout, self.ocr_container_layout, self.color_container_layout, self.render_container_layout]:
         _clear_layout_widgets(layout)
                 
     # --- 全局 API Preset Toolbar ---
-    preset_label = QLabel(self._t("Preset:"))
-    preset_label.setObjectName("row_label")
+    preset_label = BodyLabel(self._t("Preset:"))
     self.preset_combo = QComboBox()
     self.preset_combo.setMinimumWidth(180)
     self.preset_combo.setEditable(False)
@@ -628,13 +894,11 @@ def _finalize_settings_ui(self):
 
     self.add_preset_button = QPushButton("+")
     self.add_preset_button.setFixedWidth(36)
-    self.add_preset_button.setProperty("chipButton", True)
     set_hover_hint(self.add_preset_button, self._t("Add new preset"))
 
     self.delete_preset_button = QPushButton(self._t("Delete"))
-    self.delete_preset_button.setProperty("chipButton", True)
-    self.delete_preset_button.setProperty("variant", "danger")
     set_hover_hint(self.delete_preset_button, self._t("Delete selected preset"))
+    self.delete_preset_button.setEnabled(self.preset_combo.currentText() not in ("", "默认"))
 
     self.env_preset_layout.addWidget(preset_label)
     self.env_preset_layout.addWidget(self.preset_combo)
@@ -647,13 +911,24 @@ def _finalize_settings_ui(self):
     self.add_preset_button.clicked.connect(self._on_add_preset_clicked)
     self.delete_preset_button.clicked.connect(self._on_delete_preset_clicked)
     self.preset_combo.currentTextChanged.connect(self._on_preset_changed)
+    delete_preset_button = self.delete_preset_button
+    self.preset_combo.currentTextChanged.connect(
+        lambda preset_name, button=delete_preset_button: button.setEnabled(
+            preset_name not in ("", "默认")
+        )
+    )
+
     
-    _refresh_env_api_groups(self)
+    _refresh_env_api_groups(self, force=True)
     self._refresh_api_feature_selectors()
 
     self._refresh_prompt_manager()
-    self._refresh_font_manager()
     self._settings_rendered_signature = getattr(self, "_settings_pending_signature", None)
+    self._settings_rendered_structure_signature = getattr(
+        self,
+        "_settings_pending_structure_signature",
+        None,
+    )
     self._settings_ui_ready = True
 
 def _create_dynamic_settings(self):
@@ -663,6 +938,7 @@ def _create_dynamic_settings(self):
         self.set_parameters(config)
     except Exception as e:
         print(f"Error creating dynamic settings: {e}")
+
 
 def _on_setting_changed(self, value, full_key, display_map=None):
     """A slot to handle when any setting widget is changed by the user."""
@@ -675,6 +951,9 @@ def _on_setting_changed(self, value, full_key, display_map=None):
     # 特殊处理：当 upscaler 变化时，更新 upscale_ratio 动态下拉框
     if full_key == "upscale.upscaler":
         self._update_upscale_ratio_options(final_value)
+
+    if full_key == "render.disable_system_fonts":
+        set_system_fonts_enabled(not bool(final_value))
     
     self.setting_changed.emit(full_key, final_value)
     if full_key in {
@@ -751,17 +1030,22 @@ def _on_numeric_input_changed(self, text, full_key, value_type):
 
 def _update_upscale_ratio_options(self, upscaler):
     """当 upscaler 变化时，更新 upscale_ratio 下拉框的选项"""
-    # 查找 upscale_ratio_dynamic widget
-    upscale_ratio_widget = self.findChild(QComboBox, "upscale_ratio_dynamic")
+    upscale_ratio_widget = getattr(self, "upscale_ratio_combo", None)
     if not upscale_ratio_widget:
         return
     
-    # 阻止信号触发
+    # 阻止信号触发（try/finally 保证异常路径也恢复）
     upscale_ratio_widget.blockSignals(True)
-    
-    # 清空并重新填充
+    try:
+        _repopulate_upscale_ratio_options(self, upscale_ratio_widget, upscaler)
+    finally:
+        upscale_ratio_widget.blockSignals(False)
+
+
+def _repopulate_upscale_ratio_options(self, upscale_ratio_widget, upscaler):
+    """清空并按当前 upscaler 重新填充 upscale_ratio 下拉框（调用方负责 blockSignals）。"""
     upscale_ratio_widget.clear()
-    
+
     if upscaler == "realcugan":
         # 显示 Real-CUGAN 模型列表（使用中文显示）
         realcugan_models = self.controller.get_options_for_key("realcugan_model")
@@ -820,122 +1104,57 @@ def _update_upscale_ratio_options(self, upscaler):
             upscale_ratio_widget.setCurrentText(self._t("upscale_ratio_not_use"))
         else:
             upscale_ratio_widget.setCurrentText(str(config.upscale.upscale_ratio))
-    
-    # 恢复信号
-    upscale_ratio_widget.blockSignals(False)
 
 def _create_param_widgets(self, data, parent_layout, prefix=""):
     if not isinstance(data, dict):
-        return
+        return 0
 
+    added_rows = 0
     for key, value in data.items():
         full_key = f"{prefix}.{key}" if prefix else key
 
         # 跳过这些选项，因为已经用下拉框替代或不需要在UI中显示
         # realcugan_model 将通过 upscale_ratio 动态下拉框处理
-        # gimp_font 已废弃，使用 font_path 代替
+        # gimp_font 已废弃；字体统一使用 font_family。
         # replace_translation 和 replace_translation_mode 通过工作流模式下拉框控制
-        # app 配置组的字段：last_open_dir, last_output_path, favorite_folders, current_preset 是内部状态，不显示在UI中
-        if full_key in ["cli.load_text", "cli.translate_json_only", "cli.template", "cli.generate_and_export", "cli.colorize_only", "cli.upscale_only", "cli.inpaint_only", "cli.replace_translation", "cli.replace_translation_mode", "upscale.realcugan_model", "render.gimp_font", "render.font_path", "translator.high_quality_prompt_path", "app.last_open_dir", "app.last_output_path", "app.favorite_folders", "app.current_preset"]:
+        # app 路径、收藏、文件夹排序和当前预设属于内部状态，不显示在 UI 中。
+        if full_key in _SKIPPED_SETTING_KEYS:
             continue
 
         label_text = key
-        if full_key == "app.theme":
-            label_text = self._t("Theme:").rstrip(":：")
-        elif full_key == "app.ui_language":
-            label_text = self._t("Language:").rstrip(":：")
-        elif full_key == "app.unload_models_after_translation":
+        if full_key == "app.unload_models_after_translation":
             translated = self._t("label_unload_models_after_translation")
             label_text = translated if translated != "label_unload_models_after_translation" else "Unload Models After Translation"
         if self.controller.get_display_mapping('labels') and self.controller.get_display_mapping('labels').get(key):
             label_text = self.controller.get_display_mapping('labels').get(key)
-        label = QLabel(f"{label_text}:")
-        label.setObjectName("settings_form_label")
-        label.setMinimumWidth(120)
         widget = None
 
         options = self.controller.get_options_for_key(key)
         display_map = self.controller.get_display_mapping(key)
 
-        if full_key == "app.theme":
-            widget = QComboBox()
-            self.theme_label = label
-            self.theme_combo = widget
-            widget.currentIndexChanged.connect(self._on_theme_combo_changed)
-            self._populate_theme_combo()
-
-        elif full_key == "app.ui_language":
-            widget = QComboBox()
-            self.language_label = label
-            self.language_combo = widget
-            widget.currentIndexChanged.connect(self._on_language_combo_changed)
-            self._populate_language_combo()
-
-        elif full_key == "filter_text_enabled":
+        if full_key == "filter_text_enabled":
             # 特殊处理：过滤列表开关 + 编辑过滤列表按钮
-            container = QWidget()
-            hbox = QHBoxLayout(container)
-            hbox.setContentsMargins(0, 0, 0, 0)
-            
             checkbox = ToggleSwitch(checked=value)
-            checkbox.stateChanged.connect(lambda state, k=full_key: self._on_setting_changed(bool(state), k, None))
+            checkbox.checkedChanged.connect(lambda checked, k=full_key: self._on_setting_changed(bool(checked), k, None))
             
             open_btn = QPushButton(self._t("btn_open_filter_list"))
             open_btn.clicked.connect(self._open_filter_list)
-            
-            hbox.addWidget(checkbox)
-            hbox.addWidget(open_btn)
-            hbox.addStretch()
-            widget = container
+            widget = [checkbox, open_btn]
 
-        elif full_key == "render.font_path":
-            container = QWidget()
-            hbox = QHBoxLayout(container)
-            hbox.setContentsMargins(0, 0, 0, 0)
-            
-            # 创建自定义ComboBox,在下拉时刷新字体列表
-            class RefreshableComboBox(QComboBox):
-                def showPopup(self):
-                    current_text = self.currentText()
-                    self.clear()
-                    try:
-                        fonts_dir = resource_path('fonts')
-                        if os.path.isdir(fonts_dir):
-                            font_files = sorted([f for f in os.listdir(fonts_dir) if f.lower().endswith(('.ttf', '.otf', '.ttc'))])
-                            self.addItems(font_files)
-                    except Exception as e:
-                        print(f"Error scanning fonts directory: {e}")
-                    # 恢复之前选择的值
-                    if current_text:
-                        index = self.findText(current_text)
-                        if index >= 0:
-                            self.setCurrentIndex(index)
-                        else:
-                            self.setCurrentText(current_text)
-                    super().showPopup()
-            
-            combo = RefreshableComboBox()
+        elif full_key == "render.font_family":
+            locale_getter = self.i18n.get_current_locale if self.i18n else None
+            combo = FontComboBox(locale_getter=locale_getter)
             combo.setMinimumWidth(260)
-            try:
-                fonts_dir = resource_path('fonts')
-                if os.path.isdir(fonts_dir):
-                    font_files = sorted([f for f in os.listdir(fonts_dir) if f.lower().endswith(('.ttf', '.otf', '.ttc'))])
-                    combo.addItems(font_files)
-            except Exception as e:
-                print(f"Error scanning fonts directory: {e}")
-            combo.setCurrentText(str(value) if value else "")
-            combo.currentTextChanged.connect(lambda text, k=full_key: self._on_setting_changed(text, k, None))
+            if value:
+                combo.setCurrentFamily(str(value))
+            combo.currentFontChanged.connect(
+                lambda _font, k=full_key, c=combo: self._on_setting_changed(c.currentFamily(), k, None)
+            )
             button = QPushButton(self._t("Open Directory"))
-            button.clicked.connect(self.controller.open_font_directory)
-            hbox.addWidget(combo)
-            hbox.addWidget(button)
-            widget = container
+            button.clicked.connect(self.controller.open_fonts_directory)
+            widget = [combo, button]
 
         elif full_key == "translator.high_quality_prompt_path":
-            container = QWidget()
-            hbox = QHBoxLayout(container)
-            hbox.setContentsMargins(0, 0, 0, 0)
-            
             # 创建自定义ComboBox,在下拉时刷新提示词列表
             class RefreshablePromptComboBox(QComboBox):
                 def __init__(self, controller_ref, parent=None):
@@ -967,37 +1186,26 @@ def _create_param_widgets(self, data, parent_layout, prefix=""):
             combo.currentTextChanged.connect(lambda text, k=full_key: self._on_setting_changed(os.path.join('dict', text).replace('\\', '/') if text else None, k, None))
             button = QPushButton(self._t("Open Directory"))
             button.clicked.connect(self.controller.open_dict_directory)
-            hbox.addWidget(combo)
-            hbox.addWidget(button)
-            widget = container
+            widget = [combo, button]
 
         elif isinstance(value, bool):
             # 特殊处理：use_custom_api_params 需要添加"打开文件"按钮
             if full_key == "use_custom_api_params":
-                container = QWidget()
-                container_layout = QHBoxLayout(container)
-                container_layout.setContentsMargins(0, 0, 0, 0)
-                
                 checkbox = ToggleSwitch(checked=value)
-                checkbox.stateChanged.connect(lambda state, k=full_key: self._on_setting_changed(bool(state), k, None))
+                checkbox.checkedChanged.connect(lambda checked, k=full_key: self._on_setting_changed(bool(checked), k, None))
                 
                 open_file_button = QPushButton(self._t("Edit"))
                 open_file_button.setFixedWidth(100)
                 open_file_button.clicked.connect(self._on_open_custom_api_params_file)
-                
-                container_layout.addWidget(checkbox)
-                container_layout.addWidget(open_file_button)
-                container_layout.addStretch()
-                
-                widget = container
+                widget = [checkbox, open_file_button]
             else:
                 widget = ToggleSwitch(checked=value)
-                widget.stateChanged.connect(lambda state, k=full_key: self._on_setting_changed(bool(state), k, None))
+                widget.checkedChanged.connect(lambda checked, k=full_key: self._on_setting_changed(bool(checked), k, None))
 
         # 特殊处理：upscale_ratio 动态下拉框（必须在 int/float 判断之前）
         elif full_key == "upscale.upscale_ratio":
             widget = QComboBox()
-            widget.setObjectName("upscale_ratio_dynamic")
+            self.upscale_ratio_combo = widget
             widget.setMinimumWidth(100)  # 设置最小宽度，让选项显示更完整
             
             # 获取当前的 upscaler 值来决定显示什么选项
@@ -1062,7 +1270,7 @@ def _create_param_widgets(self, data, parent_layout, prefix=""):
             widget = QLineEdit(str(value))
             widget.editingFinished.connect(lambda k=full_key, w=widget: self._on_numeric_input_changed(w.text(), k, float if isinstance(value, float) else int))
 
-        elif value is None and key in ['tile_size', 'line_spacing', 'letter_spacing', 'font_size', 'psd_font', 'ocr_vl_custom_prompt', 'ai_ocr_custom_prompt']:
+        elif value is None and key in _OPTIONAL_INPUT_KEYS:
             # 处理值为 None 的可选参数（数值/字符串）
             widget = QLineEdit("")
             # 根据参数名设置提示文本
@@ -1078,9 +1286,6 @@ def _create_param_widgets(self, data, parent_layout, prefix=""):
             elif key == 'font_size':
                 widget.setPlaceholderText(self._t("Auto"))
                 widget.editingFinished.connect(lambda k=full_key, w=widget: self._on_numeric_input_changed(w.text(), k, int))
-            elif key == 'psd_font':
-                widget.setPlaceholderText(self._t("Photoshop Font Name (e.g. AdobeHeitiStd-Regular)"))
-                widget.editingFinished.connect(lambda k=full_key, w=widget: self._on_setting_changed(w.text(), k, None))
             elif key == 'ocr_vl_custom_prompt':
                 widget.setMinimumWidth(320)
                 widget.setPlaceholderText("OCR: Extract all Arabic text.")
@@ -1093,7 +1298,7 @@ def _create_param_widgets(self, data, parent_layout, prefix=""):
         elif (isinstance(value, str) or value is None) and (options or display_map):
             widget = QComboBox()
             if key == "translator":
-                widget.setObjectName("translator.translator")
+                self.translator_combo = widget
                 widget.setMinimumWidth(180)  # 设置翻译器下拉框最小宽度
             elif full_key == "ocr.ocr_vl_language_hint":
                 widget.setMinimumWidth(260)  # OCR语言全称较长，避免被截断
@@ -1125,49 +1330,68 @@ def _create_param_widgets(self, data, parent_layout, prefix=""):
                 else:
                     widget.setPlaceholderText("Read the text and return only the recognized text.")
             widget.editingFinished.connect(lambda k=full_key, w=widget: self._on_setting_changed(w.text(), k, None))
-        
         if widget is not None:
-            # 使用 ClickableRow 包装 label + widget，整行可点击、可高亮
-            row = _ClickableRow(self, full_key, label, widget)
-            parent_layout.addRow(row)
+            row = _ClickableRow(self, full_key, label_text, widget)
+            value_widget = widget[0] if isinstance(widget, (list, tuple)) else widget
+            self._settings_value_bindings[full_key] = (value_widget, dict(display_map or {}))
+            _append_settings_row(parent_layout, row)
+            added_rows += 1
+
+    return added_rows
 
 
-class _ClickableRow(QWidget):
-    """整行可点击、可高亮的设置行，包含 label 和控件。"""
+class _ClickableRow(SimpleCardWidget):
+    """Fluent setting row that keeps the existing description-panel behavior."""
 
-    def __init__(self, view, full_key: str, label: QLabel, widget: QWidget):
+    def __init__(self, view, full_key: str, title: str, widget: QWidget | list[QWidget] | tuple[QWidget, ...]):
         super().__init__()
         self._view = view
         self._full_key = full_key
-        self._label = label
+        self._title = str(title or "").rstrip(":：")
+        self._widgets = list(widget) if isinstance(widget, (list, tuple)) else [widget]
         self._selected = False
+        self._event_filter_targets: list[QWidget] = []
 
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
         row_layout = QHBoxLayout(self)
-        row_layout.setContentsMargins(8, 4, 8, 4)
-        row_layout.setSpacing(12)
+        row_layout.setContentsMargins(12, 8, 12, 8)
+        row_layout.setSpacing(14)
 
-        label.setMinimumWidth(120)
-        row_layout.addWidget(label)
+        self._title_label = BodyLabel(f"{self._title}:")
+        self._title_label.setMinimumWidth(120)
+        row_layout.addWidget(self._title_label)
 
-        if isinstance(widget, ToggleSwitch):
-            row_layout.addWidget(widget)
+        for index, control in enumerate(self._widgets):
+            if not isinstance(control, ToggleSwitch):
+                control.setSizePolicy(QSizePolicy.Policy.Expanding if index == 0 else QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            row_layout.addWidget(control, 1 if len(self._widgets) == 1 or index == 0 else 0)
+
+        if len(self._widgets) > 1 or any(isinstance(control, ToggleSwitch) for control in self._widgets):
             row_layout.addStretch(1)
-        elif isinstance(widget, QWidget):
-            row_layout.addWidget(widget, 1)
 
-        # 给所有子控件安装事件过滤器，点击子控件时也触发行高亮
-        self._install_child_event_filter(widget)
-        label.installEventFilter(self)
+        for control in self._widgets:
+            self._install_child_event_filter(control)
+        self._install_row_event_filter(self._title_label)
 
     def _install_child_event_filter(self, widget):
-        """递归给所有子控件安装事件过滤器"""
-        widget.installEventFilter(self)
+        self._install_row_event_filter(widget)
         for child in widget.findChildren(QWidget):
-            child.installEventFilter(self)
+            self._install_row_event_filter(child)
+
+    def _install_row_event_filter(self, widget: QWidget):
+        widget.installEventFilter(self)
+        self._event_filter_targets.append(widget)
+
+    def _cleanup_event_filters(self):
+        targets = list(getattr(self, "_event_filter_targets", []))
+        self._event_filter_targets = []
+        for widget in targets:
+            try:
+                widget.removeEventFilter(self)
+            except RuntimeError:
+                pass
 
     def eventFilter(self, obj, event):
         from PyQt6.QtCore import QEvent
@@ -1176,38 +1400,42 @@ class _ClickableRow(QWidget):
         return False  # 不消费事件，让子控件正常工作
 
     def _activate(self):
-        """激活此行：更新描述面板 + 高亮"""
+        """激活此行：更新描述面板和当前行标记。"""
         desc = _get_setting_description(self._view, self._full_key)
-        label_text = self._label.text().rstrip(':：')
         if hasattr(self._view, '_show_setting_description'):
-            self._view._show_setting_description(self._full_key, label_text, desc)
+            self._view._show_setting_description(self._full_key, self._title, desc)
 
-        # 取消之前高亮的行
-        for old in getattr(self._view, '_highlighted_rows', []):
+        for old in getattr(self._view, "_highlighted_rows", []):
             try:
                 old._set_selected(False)
-            except (RuntimeError, AttributeError):
+            except (AttributeError, RuntimeError):
                 pass
         self._set_selected(True)
         self._view._highlighted_rows = [self]
+
+    def setText(self, text: str):
+        self._title = str(text or "").rstrip(":：")
+        self._title_label.setText(f"{self._title}:")
+
+    def _set_selected(self, selected: bool):
+        self._selected = selected
+        self.update()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._activate()
         super().mouseReleaseEvent(event)
 
-    def _set_selected(self, selected: bool):
-        self._selected = selected
-        self.update()
-
     def paintEvent(self, event):
-        if self._selected:
-            from PyQt6.QtCore import QRectF
-            from PyQt6.QtGui import QPainter, QPainterPath
-            p = QPainter(self)
-            p.setRenderHint(QPainter.RenderHint.Antialiasing)
-            path = QPainterPath()
-            path.addRoundedRect(QRectF(0, 0, self.width(), self.height()), 6, 6)
-            p.fillPath(path, QColor(50, 90, 140, 64))
-            p.end()
         super().paintEvent(event)
+        if not self._selected:
+            return
+
+        from PyQt6.QtGui import QPainter
+
+        accent = themeColor().toRgb()
+        accent.setAlpha(220)
+
+        painter = QPainter(self)
+        painter.fillRect(0, 7, 3, max(1, self.height() - 14), accent)
+        painter.end()

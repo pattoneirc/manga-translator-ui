@@ -257,16 +257,7 @@ class PermissionEditor {
             if (value === '不指定') return this.t('format_not_specified', '不指定');
             return value;
         }
-        // 字体路径 - 区分用户字体和服务器字体
-        if (key === 'font_path') {
-            if (value && value.startsWith('user:')) {
-                // 用户字体: user:{username}/{filename} -> [我的] filename
-                const parts = value.split('/');
-                const filename = parts[parts.length - 1];
-                return `[我的] ${filename}`;
-            }
-            return value;
-        }
+        if (key === 'font_family') return value;
         return value;
     }
     
@@ -459,11 +450,13 @@ class PermissionEditor {
                 <h3>${this.t('label_detector', '文本检测器')}</h3>
                 ${this.createFormRow(this.t('label_detector', '文本检测器'), this.createSelect('detector', 'detector', opts.detector), '', 'detector', 'detector')}
                 ${this.createFormRow(this.t('label_detection_size', '检测大小'), this.createInput('detector', 'detection_size', 'number'), '', 'detector', 'detection_size')}
+                ${this.createFormRow(this.t('label_det_rearrange_min_effective_short_side', '长图重排最低有效短边'), this.createInput('detector', 'det_rearrange_min_effective_short_side', 'number'), '默认341，值越高文字越清晰但检测越慢', 'detector', 'det_rearrange_min_effective_short_side')}
                 ${this.createFormRow(this.t('label_text_threshold', '文本阈值'), this.createInput('detector', 'text_threshold', 'number'), '', 'detector', 'text_threshold')}
                 ${this.createFormRow(this.t('label_box_threshold', '边界框生成阈值'), this.createInput('detector', 'box_threshold', 'number'), '边界框生成阈值，默认0.5', 'detector', 'box_threshold')}
                 ${this.createFormRow(this.t('label_unclip_ratio', 'Unclip比例'), this.createInput('detector', 'unclip_ratio', 'number'), '文本骨架扩展比例，默认2.5', 'detector', 'unclip_ratio')}
                 ${this.createFormRow(this.t('label_min_box_area_ratio', '最小检测框面积占比'), this.createInput('detector', 'min_box_area_ratio', 'number'), '相对图片总像素，默认0.0009(0.09%)', 'detector', 'min_box_area_ratio')}
                 ${this.createFormRow(this.t('label_use_yolo_obb', '启用YOLO辅助检测'), this.createCheckbox('detector', 'use_yolo_obb'), '启用YOLO旋转边界框辅助检测', 'detector', 'use_yolo_obb')}
+                ${this.createFormRow(this.t('label_use_sfx_filter', '拟声词过滤'), this.createCheckbox('detector', 'use_sfx_filter'), '过滤既未被YOLO other框包裹、也未与YOLO文本框达到重叠阈值的主检测框', 'detector', 'use_sfx_filter')}
                 ${this.createFormRow(this.t('label_yolo_obb_conf', 'YOLO置信度阈值'), this.createInput('detector', 'yolo_obb_conf', 'number'), '默认0.4', 'detector', 'yolo_obb_conf')}
                 ${this.createFormRow(this.t('label_yolo_obb_overlap_threshold', 'YOLO辅助检测重叠率删除阈值'), this.createInput('detector', 'yolo_obb_overlap_threshold', 'number'), '重叠比例阈值(0.0-1.0)，默认0.1', 'detector', 'yolo_obb_overlap_threshold')}
             </div>
@@ -473,13 +466,13 @@ class PermissionEditor {
     // CLI/输出选项标签页
     renderCliTab() {
         const opts = this.configOptions;
-        const formatOptions = ['不指定', 'png', 'jpg', 'webp'];
+        const formatOptions = opts.format || ['不指定'];
         return `
             <p class="param-ctrl-hint">✓ 启用 | 🚫 禁用（用户不可见）</p>
             <div class="form-section">
                 <h3>${this.t('Output Settings', '输出设置')}</h3>
                 ${this.createFormRow(this.t('label_format', '输出格式'), this.createSelect('cli', 'format', formatOptions), '', 'cli', 'format')}
-                ${this.createFormRow(this.t('label_save_quality', '保存质量'), this.createInput('cli', 'save_quality', 'number'), '1-100，仅对JPG/WEBP有效', 'cli', 'save_quality')}
+                ${this.createFormRow(this.t('label_save_quality', '保存质量'), this.createInput('cli', 'save_quality', 'number'), '1-100，仅对JPG/JPEG/JFIF/WEBP/AVIF/HEIC有效', 'cli', 'save_quality')}
                 ${this.createFormRow(this.t('label_overwrite', '覆盖已有文件'), this.createCheckbox('cli', 'overwrite'), '', 'cli', 'overwrite')}
                 ${this.createFormRow(this.t('label_skip_no_text', '跳过无文本图片'), this.createCheckbox('cli', 'skip_no_text'), '', 'cli', 'skip_no_text')}
                 ${this.createFormRow(this.t('label_save_text', '保存文本'), this.createCheckbox('cli', 'save_text'), '', 'cli', 'save_text')}
@@ -510,6 +503,8 @@ class PermissionEditor {
                 ${this.createFormRow(this.t('label_inpainting_size', '修复大小'), this.createInput('inpainter', 'inpainting_size', 'number'), '太大会导致OOM', 'inpainter', 'inpainting_size')}
                 ${this.createFormRow(this.t('label_inpainting_precision', '修复精度'), this.createSelect('inpainter', 'inpainting_precision', opts.inpainting_precision), '', 'inpainter', 'inpainting_precision')}
                 ${this.createFormRow(this.t('label_force_use_torch_inpainting', '强制使用PyTorch修复'), this.createCheckbox('inpainter', 'force_use_torch_inpainting'), '不使用ONNX，在ONNX内存问题时有用', 'inpainter', 'force_use_torch_inpainting')}
+                ${this.createFormRow(this.t('label_solid_fill_pure_bubbles', '纯色气泡直接填色'), this.createCheckbox('inpainter', 'solid_fill_pure_bubbles'), '纯色背景气泡跳过修复模型，直接用背景色填充', 'inpainter', 'solid_fill_pure_bubbles')}
+                ${this.createFormRow(this.t('label_per_block_inpainting', '逐块修复'), this.createCheckbox('inpainter', 'per_block_inpainting'), '使用优化蒙版逐块裁窗并补成正方形，不走长图切片流程', 'inpainter', 'per_block_inpainting')}
             </div>
             <div class="form-section">
                 <h3>${this.t('label_upscaler', '放大设置')}</h3>
@@ -545,8 +540,9 @@ class PermissionEditor {
                 ${this.createFormRow(this.t('label_layout_mode', '排版模式'), this.createSelect('render', 'layout_mode', opts.layout_mode), '', 'render', 'layout_mode')}
             </div>
             <div class="form-section">
-                <h3>${this.t('label_font_path', '字体设置')}</h3>
-                ${this.createFormRow(this.t('label_font_path', '字体路径'), this.createSelect('render', 'font_path', opts.font_path), '', 'render', 'font_path')}
+                <h3>${this.t('label_font_family', '字体设置')}</h3>
+                ${this.createFormRow(this.t('label_font_family', '字体'), this.createSelect('render', 'font_family', opts.font_family), '', 'render', 'font_family')}
+                ${this.createFormRow(this.t('label_disable_system_fonts', '禁止使用系统字体库'), this.createCheckbox('render', 'disable_system_fonts'), '', 'render', 'disable_system_fonts')}
                 ${this.createFormRow(this.t('label_font_size', '字体大小'), this.createInput('render', 'font_size', 'number'), '', 'render', 'font_size')}
                 ${this.createFormRow(this.t('label_font_size_offset', '字体大小偏移量'), this.createInput('render', 'font_size_offset', 'number'), '', 'render', 'font_size_offset')}
                 ${this.createFormRow(this.t('label_font_size_minimum', '最小字体大小'), this.createInput('render', 'font_size_minimum', 'number'), '', 'render', 'font_size_minimum')}
@@ -566,7 +562,6 @@ class PermissionEditor {
                 ${this.createFormRow(this.t('label_rtl', '从右到左'), this.createCheckbox('render', 'rtl'), '', 'render', 'rtl')}
                 ${this.createFormRow(this.t('label_no_hyphenation', '禁用连字符'), this.createCheckbox('render', 'no_hyphenation'), '', 'render', 'no_hyphenation')}
                 ${this.createFormRow(this.t('label_bubble_layout_english', '根据气泡排版(强制横排)'), this.createCheckbox('render', 'bubble_layout_english'), '英文默认已启用此排版，开启后韩文/中文等其他语言也使用气泡形状排版并强制横排', 'render', 'bubble_layout_english')}
-                ${this.createFormRow(this.t('label_auto_rotate_symbols', '竖排内横排'), this.createCheckbox('render', 'auto_rotate_symbols'), '自动旋转垂直文本中的符号', 'render', 'auto_rotate_symbols')}
                 ${this.createFormRow(this.t('label_center_text_in_bubble', '垂直居中'), this.createCheckbox('render', 'center_text_in_bubble'), '气泡内文本垂直居中', 'render', 'center_text_in_bubble')}
                 ${this.createFormRow(this.t('label_optimize_line_breaks', 'AI断句自动扩大文字'), this.createCheckbox('render', 'optimize_line_breaks'), '自动优化换行以找到最佳字体大小', 'render', 'optimize_line_breaks')}
                 ${this.createFormRow(this.t('label_check_br_and_retry', 'AI断句检查'), this.createCheckbox('render', 'check_br_and_retry'), '检查翻译是否包含换行标记并重试', 'render', 'check_br_and_retry')}
@@ -1346,4 +1341,3 @@ class PermissionEditor {
 }
 
 window.PermissionEditor = PermissionEditor;
-

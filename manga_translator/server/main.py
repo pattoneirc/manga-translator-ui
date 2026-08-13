@@ -5,9 +5,17 @@ import shutil
 import signal
 import subprocess
 import sys
+import warnings
 from argparse import Namespace
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
+# 隐藏第三方库的警告；必须在导入 torch 前设置，才能拦截 torch.cuda 的 pynvml 提示。
+warnings.filterwarnings('ignore', message='.*Triton.*')
+warnings.filterwarnings('ignore', message='.*triton.*')
+warnings.filterwarnings('ignore', message='.*pkg_resources.*')
+warnings.filterwarnings('ignore', message='.*pynvml package is deprecated.*', category=FutureWarning)
+warnings.filterwarnings('ignore', category=DeprecationWarning, module='ctranslate2')
 
 # 在 PyQt6 之前加载 PyTorch，避免 PyQt6 的 Qt DLL 路径干扰 c10.dll 的加载
 # 渲染模块 (text_render.py) 依赖 PyQt6，会触发 DLL 冲突
@@ -40,31 +48,10 @@ ensure_server_data_layout()
 
 
 def _ensure_web_startup_files() -> None:
-    """Create the same template files that the Qt app prepares on startup."""
-    from manga_translator.colorization.prompt_loader import ensure_ai_colorizer_prompt_file
-    from manga_translator.custom_api_params import ensure_custom_api_params_file
-    from manga_translator.ocr.prompt_loader import ensure_ai_ocr_prompt_file
-    from manga_translator.rendering.prompt_loader import ensure_ai_renderer_prompt_file
-    from manga_translator.rendering.text_replacements import ensure_text_replacements_exists
-    from manga_translator.utils.translation_template import ensure_translation_template_exists
-    from manga_translator.utils.text_filter import ensure_filter_list_exists
+    """Create the same runtime tables used by CLI and desktop startup."""
+    from manga_translator.runtime_files import ensure_runtime_files
 
-    startup_files = [
-        ("custom_api_params", lambda: ensure_custom_api_params_file(logger=logger)),
-        ("ocr_prompt", ensure_ai_ocr_prompt_file),
-        ("renderer_prompt", ensure_ai_renderer_prompt_file),
-        ("colorizer_prompt", ensure_ai_colorizer_prompt_file),
-        ("filter_list", ensure_filter_list_exists),
-        ("text_replacements", ensure_text_replacements_exists),
-        ("translation_template", ensure_translation_template_exists),
-    ]
-
-    for label, factory in startup_files:
-        try:
-            path = factory()
-            logger.info(f"Startup file ready [{label}]: {path}")
-        except Exception as exc:
-            logger.warning(f"Failed to prepare startup file [{label}]: {exc}")
+    ensure_runtime_files(logger)
 
 # Import route modules
 # Import sessions_router
@@ -96,11 +83,13 @@ logger = logging.getLogger('manga_translator.server')
 os.environ['MANGA_TRANSLATOR_WEB_SERVER'] = 'true'
 
 # 启动时加载 .env 文件
-from dotenv import load_dotenv
+from manga_translator.utils.dotenv_utils import APP_DOTENV_PATH_ENV, load_app_dotenv
+from manga_translator.runtime_paths import get_application_dir
 
-env_path = os.path.join(os.path.dirname(__file__), '..', '..', '.env')
+env_path = os.path.join(get_application_dir(), '.env')
+os.environ[APP_DOTENV_PATH_ENV] = env_path
 if os.path.exists(env_path):
-    load_dotenv(env_path)
+    load_app_dotenv(env_path, override=False)
     print(f"[INFO] Loaded environment variables from: {env_path}")
     # 打印已加载的 API Keys（不显示值）
     loaded_keys = [k for k in os.environ.keys() if 'API' in k or 'KEY' in k or 'TOKEN' in k]
@@ -285,7 +274,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 # Mount static files
-static_dir = os.path.join(os.path.dirname(__file__), "static")
+static_dir = os.path.join(get_application_dir(), "manga_translator", "server", "static")
 if not os.path.exists(static_dir):
     os.makedirs(static_dir, exist_ok=True)
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -300,7 +289,7 @@ async def favicon():
 
 
 # Mount Qt UI locales for i18n (共享翻译文件)
-locales_dir = os.path.join(os.path.dirname(__file__), "../../desktop_qt_ui/locales")
+locales_dir = os.path.join(get_application_dir(), "desktop_qt_ui", "locales")
 if os.path.exists(locales_dir):
     app.mount("/locales", StaticFiles(directory=locales_dir), name="locales")
 
@@ -355,9 +344,7 @@ def start_translator_client_proc(host: str, port: int, nonce: str, params: Names
         cmds.extend(['--pre-dict', params.pre_dict])
     if getattr(params, 'post_dict', None):
         cmds.extend(['--post-dict', params.post_dict])       
-    base_path = os.path.dirname(os.path.abspath(__file__))
-    parent = os.path.dirname(base_path)
-    proc = subprocess.Popen(cmds, cwd=parent)
+    proc = subprocess.Popen(cmds, cwd=get_application_dir())
     executor_instances.register(ExecutorInstance(ip=host, port=port))
 
     def handle_exit_signals(signal, frame):

@@ -15,28 +15,48 @@ This guide only lists Git-tracked directories and files that are maintained toge
 - You can use `venv`, Conda, or the project install scripts to create the environment.
 - The environment name does **not** have to be `manga-env`.
 
+### Dependency declaration
+
+Dependencies are now declared in `pyproject.toml` at the repository root:
+
+- Common dependencies live in `[project] dependencies`.
+- The five backends are mutually exclusive dependency groups: `cpu` / `cuda13.0` / `cuda12.6` / `rocm7.2.1` / `metal` (`[tool.uv] conflicts` enforces exclusivity). Docker retains an internal `gpu` compatibility alias that is not used by the installer or release assets.
+- The default groups are `cuda13.0` + `packaging` + `test`, so plain `uv sync` / `uv run` uses NVIDIA CUDA 13.0. CUDA 12.6 uses the `cuda12.6` group in the same source branch. The installer uses `--no-default-groups`, so it neither checks nor installs the `test` group.
+- PyTorch sources are bound through `[tool.uv.sources]` + `[[tool.uv.index]]`: `cuda13.0` uses `whl/cu130`, `cuda12.6` uses `whl/cu126`, `cpu` uses `whl/cpu`, Linux `rocm7.2.1` uses `whl/rocm7.2`, and `metal` uses normal PyPI.
+- `uv.lock` is the lockfile. It is committed to the repository; do not edit it by hand.
+
+The old `requirements_cpu.txt` / `requirements_gpu.txt` / `requirements_amd.txt` / `requirements_metal.txt` files have been removed.
+
 ### Dependency installation
 
-Install only one dependency set based on your target runtime:
+uv is recommended. Install only one dependency group for the target runtime:
 
 ```bash
-# CPU
-pip install -r requirements_cpu.txt
+# NVIDIA CUDA 13.0 (default)
+uv sync
 
-# NVIDIA GPU (CUDA 12.x)
-pip install -r requirements_gpu.txt
+# NVIDIA CUDA 12.6
+uv sync --no-default-groups --group cuda12.6
 
-# AMD GPU (experimental)
-pip install -r requirements_amd.txt
+# For other backends, disable the defaults and select one group
+uv sync --no-default-groups --group cpu
+uv sync --no-default-groups --group metal
 
-# Apple Silicon / Metal
-pip install -r requirements_metal.txt
+# AMD (Linux): use the official PyTorch ROCm 7.2 index
+uv sync --no-default-groups --group rocm7.2.1
+# Windows AMD is handled by the Windows installer in Radeon ROCm 7.2.1 SDK -> PyTorch order
 ```
 
-If you want to build a PyInstaller package, you also need:
+In a source checkout, `uv sync` creates `.venv` and reproduces dependencies from `uv.lock`. The Windows portable installer uses bundled `packaging\python` and does not create `.venv`. To install source dependencies into an existing environment instead:
 
 ```bash
-pip install pyinstaller
+uv sync --active
+```
+
+The default GPU environment already includes the `packaging` and `test` groups. For another backend, add `packaging` explicitly when building:
+
+```bash
+uv sync --no-default-groups --group cpu --group packaging
 ```
 
 ---
@@ -76,7 +96,7 @@ manga-translator-ui-package/
 │  ├─ utils/                   # Shared utilities and intermediate formats
 │  └─ server/                  # FastAPI server, static pages, admin panel
 ├─ packaging/                  # Launch scripts, update scripts, PyInstaller, Docker
-├─ examples/                   # Default config, templates, translator registry
+├─ config/                     # Default config, templates, translator registry
 ├─ .github/                    # CI/CD and issue templates
 ├─ doc/                        # User documentation and changelogs
 ├─ fonts/                      # Default font resources
@@ -186,9 +206,9 @@ Before changing any resource-path logic, make sure you know which tracked resour
 ### Common tracked resources used in development mode
 
 - default config template:
-  - `examples/config-example.json`
+  - `config/config-example.json`
 - translator registry:
-  - `examples/config/translators.json`
+  - `config/config/translators.json`
 - resource directories:
   - `fonts/`
   - `dict/`
@@ -197,7 +217,7 @@ Before changing any resource-path logic, make sure you know which tracked resour
 
 ### Tracked resources to pay attention to during packaging
 
-- `examples/`
+- `config/`
 - `fonts/`
 - `dict/`
 - `doc/`
@@ -215,14 +235,11 @@ If you add a new resource directory, template file, or config file, check both o
 ### 5.1 Recommended startup order
 
 ```bash
-# 1. Create and activate an environment
-python -m venv .venv
+# 1. Install the default GPU dependencies (creates .venv and reproduces uv.lock automatically)
+uv sync
 
-# Windows PowerShell
+# 2. Activate the environment (Windows PowerShell)
 .venv\Scripts\Activate.ps1
-
-# 2. Install dependencies (CPU example)
-pip install -r requirements_cpu.txt
 
 # 3. Start the desktop app
 python -m desktop_qt_ui.main
@@ -245,7 +262,7 @@ At minimum, check the chain below. Many settings require more than changing only
 2. `manga_translator/config.py`
    If the setting is used by the core translation pipeline, CLI, Web service, or a lower-level module, sync the core config model and related enums here as well.
    Otherwise the desktop app may save the value, but the backend runtime may never read it.
-3. `examples/config-example.json`
+3. `config/config-example.json`
    Sync the default config template so the new field appears in exported config and first-run config.
 4. `desktop_qt_ui/ui/main_page/settings_tab_layout.json`
    If the setting should appear in the settings page, add `section.key` to the correct tab `items`.
@@ -274,7 +291,7 @@ Depending on the setting type, also check these extra locations:
 - If the setting should also affect CLI or Web behavior:
   check `manga_translator/config.py`, `manga_translator/args.py`, the relevant mode or service parameter-merge logic, and the actual backend consumption point.
 - If the setting introduces new API dependencies or environment variables:
-  check `examples/config/translators.json` and the validation logic in `desktop_qt_ui/services/config_service.py`.
+  check `config/config/translators.json` and the validation logic in `desktop_qt_ui/services/config_service.py`.
 - If the setting is temporary state that should be excluded from import/export:
   check `export_config()` and `import_config()` in `desktop_qt_ui/app_logic.py`.
 - If the setting affects editor-side display or editing behavior:
@@ -298,7 +315,7 @@ You usually need to update all of these together:
 
 1. add the implementation under `manga_translator/<corresponding_module>/`
 2. update the config and enum entry points
-3. if API environment variables are involved, update `examples/config/translators.json`
+3. if API environment variables are involved, update `config/config/translators.json`
 4. add UI options, documentation, and tests if needed
 
 #### Modify editor behavior
@@ -330,7 +347,7 @@ ruff check desktop_qt_ui manga_translator --config desktop_qt_ui/ruff.toml
 
 The boundary of that statement is:
 
-- the repository does not currently include other tracked config files such as `pyproject.toml`, `setup.cfg`, `tox.ini`, `.flake8`, or a second `ruff.toml`
+- the `pyproject.toml` at the repository root only declares dependencies and contains no lint configuration; beyond that, the repository does not include other tracked config files such as `setup.cfg`, `tox.ini`, `.flake8`, or a second `ruff.toml`
 - the current GitHub Actions workflows also do not explicitly run a lint step
 - so the command above is better treated as a local self-check, not proof that CI currently treats it as a required pass gate
 
@@ -370,11 +387,9 @@ Related files:
 
 The main end-user scripts live in the repository root:
 
-- `步骤1-首次安装.bat`
-- `步骤2-启动Qt界面.bat`
-- `步骤3-检查更新并启动.bat`
-- `步骤4-更新维护.bat`
-- `macOS_*.sh`
+- `Win-Start.bat` (launcher)
+- `Win-Install-or-Update.bat` (install / update maintenance menu)
+- `Unix-Install-or-Update.sh` / `Unix-Start.sh` (Linux/macOS)
 
 The actual logic behind those scripts is concentrated in files such as:
 
@@ -386,12 +401,12 @@ When changing install or update behavior, do not change only the `.bat` or `.sh`
 ### CI/CD
 
 - `.github/workflows/build-and-release.yml`
-  - builds Windows CPU and GPU PyInstaller packages
-  - prepares `_internal` resources on Ubuntu and publishes a Release
+  - builds CPU, NVIDIA CUDA 13.0 GPU, NVIDIA CUDA 12.6 GPU, and AMD Windows runtimes from the portable base, installs locked dependencies and models, then creates split 7z archives
+  - collects all four build artifacts on Ubuntu and publishes the GitHub Release
 - `.github/workflows/docker-build-push.yml`
   - builds CPU and GPU Docker images based on `packaging/Dockerfile`
 
-If you add resources that must be included in packaged builds, also update the workflow steps that copy files into `_internal`.
+If you add resources that must be included in packaged builds, also update the workflow steps that copy them next to the executable.
 
 ---
 

@@ -7,6 +7,12 @@ import numpy as np
 import tqdm
 from PIL import Image, ImageOps
 
+from ..image_formats import (
+    QUALITY_PIL_FORMATS,
+    RGB_PIL_FORMATS,
+    resolve_pil_image_format,
+)
+
 # 解除 PIL 图片大小限制（防止 DecompressionBombWarning）
 # 可通过环境变量 PIL_MAX_IMAGE_PIXELS 自定义，设为 0 表示无限制
 _max_pixels = os.environ.get('PIL_MAX_IMAGE_PIXELS', '0')
@@ -41,12 +47,11 @@ except AttributeError: # Supports Python versions below 3.8
 MODULE_PATH = os.path.dirname(os.path.realpath(__file__))
 EXIF_ORIENTATION_TAG = 274
 
-# PyInstaller compatibility: use sys._MEIPASS if available
-if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-    # Running in PyInstaller bundle
-    BASE_PATH = sys._MEIPASS
+# Runtime resources live beside the executable in packaged builds.  PyInstaller's
+# _internal directory is reserved for Python/native dependencies.
+if getattr(sys, 'frozen', False):
+    BASE_PATH = os.path.dirname(os.path.abspath(sys.executable))
 else:
-    # Running in normal Python environment
     BASE_PATH = os.path.abspath(os.path.join(MODULE_PATH, '..', '..'))
 
 # Adapted from argparse.Namespace
@@ -270,6 +275,11 @@ def open_pil_image(source, eager: bool = False, apply_exif: bool = True) -> Imag
     eager=False: 尽量懒加载，只在需要 EXIF 方向修正时提前解码。
     """
     image = Image.open(source)
+    try:
+        resolve_pil_image_format(image.format)
+    except Exception:
+        image.close()
+        raise
     try:
         if getattr(image, 'name', None) is None and getattr(image, 'filename', None):
             image.name = image.filename
@@ -528,30 +538,16 @@ def dump_image(
                 return Image.fromarray(img)
             img = np.concatenate([img.astype(np.uint8), alpha_array[..., None]], axis = 2)
     else:
-        img = img.astype(np.uint8)
+        # 无 alpha 通道时 paste(mask=None) 就是全量覆盖，结果等价于渲染数组本身；
+        # 直接构造 RGB 结果，省去整页 convert('RGBA')/resize/paste 三次拷贝
+        return Image.fromarray(img.astype(np.uint8, copy=False))
     result = img_pil.convert('RGBA').resize((img.shape[1], img.shape[0]))
     result.paste(Image.fromarray(img), mask = mask_for_paste)
     return result
 
 
 def _infer_pil_save_format(output_path: str, format: Optional[str] = None) -> str:
-    if format:
-        return format.upper()
-
-    ext = os.path.splitext(output_path)[1].lower()
-    format_map = {
-        '.jpg': 'JPEG',
-        '.jpeg': 'JPEG',
-        '.png': 'PNG',
-        '.webp': 'WEBP',
-        '.bmp': 'BMP',
-        '.tif': 'TIFF',
-        '.tiff': 'TIFF',
-        '.avif': 'AVIF',
-        '.heic': 'HEIF',
-        '.heif': 'HEIF',
-    }
-    return format_map.get(ext, 'PNG')
+    return resolve_pil_image_format(format or output_path)
 
 
 def build_preserved_pil_save_kwargs(source_image: Optional[Image.Image] = None) -> dict:
@@ -589,7 +585,7 @@ def save_pil_image(
     converted_image = None
 
     try:
-        if target_format in {'JPEG', 'BMP'}:
+        if target_format in RGB_PIL_FORMATS:
             if image_to_save.mode != 'RGB':
                 converted_image = normalize_rgb_image(image_to_save)
                 image_to_save = converted_image
@@ -600,13 +596,11 @@ def save_pil_image(
         for key, value in build_preserved_pil_save_kwargs(source_image).items():
             save_kwargs.setdefault(key, value)
 
-        if quality is not None and target_format in {'JPEG', 'WEBP', 'AVIF', 'HEIF'}:
+        if quality is not None and target_format in QUALITY_PIL_FORMATS:
             save_kwargs.setdefault('quality', quality)
 
-        if format is not None:
-            image_to_save.save(output_path, format=target_format, **save_kwargs)
-        else:
-            image_to_save.save(output_path, **save_kwargs)
+        # Always pass an explicit encoder so atomic ``.tmp`` writes still work.
+        image_to_save.save(output_path, format=target_format, **save_kwargs)
     finally:
         if converted_image is not None:
             converted_image.close()
@@ -1337,6 +1331,30 @@ def hex2rgb(h):
     h = h.lstrip('#')
     return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
+def parse_color(value, default=None):
+    """宽容的颜色解析：#RGB / #RRGGBB / (r,g,b) 序列，越界钳制，非法回退 default。
+
+    与 hex2rgb 的区别：hex2rgb 只接受 6 位且非法直接抛异常；本函数是各渲染/
+    样式入口共用的"用户输入"解析器，永不抛错。
+    """
+    if value is None:
+        return default
+    if isinstance(value, (tuple, list)) and len(value) >= 3:
+        try:
+            return tuple(max(0, min(255, int(c))) for c in value[:3])
+        except (TypeError, ValueError):
+            return default
+    if isinstance(value, str):
+        text = value.strip().lstrip('#')
+        if len(text) == 3:
+            text = ''.join(ch * 2 for ch in text)
+        if len(text) == 6:
+            try:
+                return tuple(int(text[i:i + 2], 16) for i in (0, 2, 4))
+            except ValueError:
+                return default
+    return default
+
 def get_color_name(rgb: List[int]) -> str:
         try:
             # TODO: Maybe replace with offline alternative
@@ -1376,7 +1394,11 @@ def square_pad_resize(img: np.ndarray, tgt_size: int):
 
     return img, down_scale_ratio, pad_h, pad_w
 
-def build_det_rearrange_plan(img: np.ndarray, tgt_size: int = 1280) -> Optional[dict]:
+def build_det_rearrange_plan(
+    img: np.ndarray,
+    tgt_size: int = 1280,
+    min_effective_short_side: float = 341.0,
+) -> Optional[dict]:
     """
     Build a shared rearrange plan for long-image detection.
     Returns None if rearrangement is not required.
@@ -1397,15 +1419,27 @@ def build_det_rearrange_plan(img: np.ndarray, tgt_size: int = 1280) -> Optional[
 
     img_for_split = einops.rearrange(img, 'h w c -> w h c') if transpose else img
 
-    pw_num = max(int(np.floor(2 * tgt_size / w)), 2)
+    # Pack as many long-axis stripes as possible while preserving enough
+    # effective short-side resolution after the detector resize. This keeps
+    # the old dense packing when each stripe still has readable resolution,
+    # but avoids crushing very narrow pages down to tiny effective widths.
+    no_downscale_pw_num = max(int(np.floor(tgt_size / w)), 1)
+    min_effective_short_side = max(1.0, min(float(min_effective_short_side), float(w)))
+    max_pw_num_by_resolution = max(int(np.floor(tgt_size / min_effective_short_side)), 1)
+    max_pw_num_by_legacy_cap = max(int(np.floor(2 * tgt_size / w)), 2)
+    pw_num = max(no_downscale_pw_num, min(max_pw_num_by_resolution, max_pw_num_by_legacy_cap))
     patch_size = ph = pw_num * w
 
     ph_num = int(np.ceil(h / ph))
-    ph_step = int((h - ph) / (ph_num - 1)) if ph_num > 1 else 0
+    if ph_num > 1:
+        start_positions = [int(round(pos)) for pos in np.linspace(0, h - ph, ph_num)]
+        ph_step = int(round((h - ph) / (ph_num - 1)))
+    else:
+        start_positions = [0]
+        ph_step = 0
     rel_step_list = []
     patch_list = []
-    for ii in range(ph_num):
-        t = ii * ph_step
+    for t in start_positions:
         b = t + ph
         rel_step_list.append(t / h)
         patch_list.append(img_for_split[t:b])
@@ -1427,12 +1461,14 @@ def build_det_rearrange_plan(img: np.ndarray, tgt_size: int = 1280) -> Optional[
         'patch_list': patch_list,
         'p_num': p_num,
         'pad_num': pad_num,
+        'min_effective_short_side': min_effective_short_side,
     }
 
 def det_rearrange_patch_array(plan: dict) -> np.ndarray:
     """
-    Rearrange plan patch list into square patch batches.
-    Output shape is (p_num, patch_size, patch_size[, c]).
+    Rearrange plan patch list into detector patch batches.
+    Output shape is (p_num, patch_size, packed_width[, c]) for vertical long
+    images, or (p_num, packed_width, patch_size[, c]) for horizontal long images.
     """
     patch_array = np.stack(plan['patch_list'], axis=0)
     squeeze_channel = False
@@ -1525,6 +1561,10 @@ def det_unrearrange_patch_maps(
     """
     Merge rearranged patch outputs back into original image coordinates.
     Supports patch inputs in CHW / HWC / HW.
+
+    重叠区按「离条带切割边缘的距离」羽化加权：条带在自己被切断的上/下边缘附近
+    权重线性趋 0，由相邻条带的完整视角主导接缝区，避免被切断文字的近零响应
+    把完整视角的强响应等权摊薄导致丢框。全图首尾不是切割边，不做羽化。
     """
     if not patch_lst:
         raise ValueError('patch_lst must not be empty')
@@ -1534,38 +1574,67 @@ def det_unrearrange_patch_maps(
     w = int(plan['w'])
     pw_num = int(plan['pw_num'])
     patch_size = int(plan['patch_size'])
-    ph_step = int(plan['ph_step'])
     rel_step_list = plan['rel_step_list']
     pad_num = int(plan['pad_num'])
 
-    patch0 = _to_chw_patch(patch_lst[0], data_format)
-    _psize = int(patch0.shape[-1])
-    _step = int(ph_step * _psize / patch_size)
-    _pw = int(_psize / pw_num)
-    _h = int(_pw / w * h)
-
-    tgtmap = np.zeros((patch0.shape[0], _h, _pw), dtype=np.float32)
-    num_patches = len(patch_lst) * pw_num - pad_num
-
-    for ii, patch in enumerate(patch_lst):
+    def _to_internal_patch(patch: np.ndarray) -> np.ndarray:
         p = _to_chw_patch(patch, data_format)
         if transpose:
             p = einops.rearrange(p, 'c h w -> c w h')
+        return p
+
+    patch0 = _to_internal_patch(patch_lst[0])
+    _patch_h = int(patch0.shape[-2])
+    _packed_w = int(patch0.shape[-1])
+    _pw = max(int(_packed_w / pw_num), 1)
+    _scale_h = _patch_h / patch_size
+    _scale_w = _pw / w
+    _h = max(int(round(h * _scale_h)), 1)
+    _w = max(int(round(w * _scale_w)), 1)
+
+    tgtmap = np.zeros((patch0.shape[0], _h, _w), dtype=np.float32)
+    weightmap = np.zeros((1, _h, _w), dtype=np.float32)
+    num_patches = len(patch_lst) * pw_num - pad_num
+
+    for ii, patch in enumerate(patch_lst):
+        p = _to_internal_patch(patch)
+        patch_h = int(p.shape[-2])
+        packed_w = int(p.shape[-1])
+        patch_w = max(int(packed_w / pw_num), 1)
+
+        def _stripe_span(idx: int) -> Tuple[int, int]:
+            st = int(round(float(rel_step_list[idx]) * _h))
+            return st, min(st + patch_h, _h)
+
         for jj in range(pw_num):
             pidx = ii * pw_num + jj
             if pidx >= len(rel_step_list):
                 break
-            rel_t = float(rel_step_list[pidx])
-            t = int(round(rel_t * _h))
-            b = min(t + _psize, _h)
-            l = jj * _pw
-            r = l + _pw
-            tgtmap[..., t:b, :] += p[..., : b - t, l:r]
-            if pidx > 0 and _step < _psize:
-                interleave = _psize - _step
-                tgtmap[..., t:t + interleave, :] /= 2.
+            t, b = _stripe_span(pidx)
+            if b <= t:
+                continue
+            l = jj * patch_w
+            src_w = min(patch_w, packed_w - l, _w)
+            if src_w <= 0:
+                continue
+            n_rows = b - t
+            wvec = np.ones((n_rows,), dtype=np.float32)
+            if pidx > 0:
+                ov = min(_stripe_span(pidx - 1)[1] - t, n_rows)
+                if ov > 0:
+                    ramp = (np.arange(ov, dtype=np.float32) + 0.5) / ov
+                    wvec[:ov] = np.minimum(wvec[:ov], ramp)
+            if pidx < num_patches - 1:
+                ov = min(b - _stripe_span(pidx + 1)[0], n_rows)
+                if ov > 0:
+                    ramp = (np.arange(ov, dtype=np.float32) + 0.5) / ov
+                    wvec[n_rows - ov:] = np.minimum(wvec[n_rows - ov:], ramp[::-1])
+            tgtmap[..., t:b, :src_w] += p[..., : b - t, l:l + src_w] * wvec[:, None]
+            weightmap[..., t:b, :src_w] += wvec[:, None]
             if pidx >= num_patches - 1:
                 break
+
+    np.divide(tgtmap, np.maximum(weightmap, 1e-6), out=tgtmap)
 
     if transpose:
         tgtmap = einops.rearrange(tgtmap, 'c h w -> c w h')
@@ -1583,7 +1652,8 @@ def det_rearrange_forward(
     dbnet_batch_forward: Callable[[np.ndarray, str], Tuple[np.ndarray, np.ndarray]], 
     tgt_size: int = 1280, 
     max_batch_size: int = 4, 
-    device='cuda', verbose=False, result_path_fn=None):
+    device='cuda', verbose=False, result_path_fn=None,
+    min_effective_short_side: float = 341.0):
     '''
     Rearrange image to square batches before feeding into network if following conditions are satisfied: \n
     1. Extreme aspect ratio
@@ -1595,16 +1665,16 @@ def det_rearrange_forward(
 
     def _patch2batches(patch_arr: np.ndarray):
         batches = [[]]
-        down_scale_ratio, pad_size = 1.0, 0
+        batch_pad_sizes = [[]]
         for ii, patch in enumerate(patch_arr):
 
             if len(batches[-1]) >= max_batch_size:
                 batches.append([])
-            p, down_scale_ratio, pad_h, pad_w = square_pad_resize(patch, tgt_size=tgt_size)
+                batch_pad_sizes.append([])
+            p, _down_scale_ratio, pad_h, pad_w = square_pad_resize(patch, tgt_size=tgt_size)
 
-            assert pad_h == pad_w
-            pad_size = pad_h
             batches[-1].append(p)
+            batch_pad_sizes[-1].append((pad_h, pad_w))
             if verbose:
                 import logging
                 logger = logging.getLogger('manga_translator')
@@ -1613,9 +1683,13 @@ def det_rearrange_forward(
                 else:
                     debug_path = f'result/rearrange_{ii}.png'
                 imwrite_unicode(debug_path, p[..., ::-1], logger)
-        return batches, down_scale_ratio, pad_size
+        return batches, batch_pad_sizes
 
-    plan = build_det_rearrange_plan(img, tgt_size=tgt_size)
+    plan = build_det_rearrange_plan(
+        img,
+        tgt_size=tgt_size,
+        min_effective_short_side=min_effective_short_side,
+    )
     if plan is None:
         return None, None
 
@@ -1627,19 +1701,28 @@ def det_rearrange_forward(
         else:
             print('Input image will be rearranged to square batches before fed into network.\n Rearranged batches will be saved to result/rearrange_%d.png')
 
-    batches, down_scale_ratio, pad_size = _patch2batches(patch_arr)
+    batches, batch_pad_sizes = _patch2batches(patch_arr)
 
     db_lst, mask_lst = [], []
-    for batch in batches:
+    for batch, pad_sizes in zip(batches, batch_pad_sizes):
         batch = np.array(batch)
         db, mask = dbnet_batch_forward(batch, device=device)
 
-        for d, m in zip(db, mask):
-            if pad_size > 0:
-                paddb = int(db.shape[-1] / tgt_size * pad_size)
-                padmsk = int(mask.shape[-1] / tgt_size * pad_size)
-                d = d[..., :-paddb, :-paddb]
-                m = m[..., :-padmsk, :-padmsk]
+        for d, m, (pad_h, pad_w) in zip(db, mask, pad_sizes):
+            if pad_h > 0:
+                paddb_h = int(d.shape[-2] / tgt_size * pad_h)
+                padmsk_h = int(m.shape[-2] / tgt_size * pad_h)
+                if paddb_h > 0:
+                    d = d[..., :-paddb_h, :]
+                if padmsk_h > 0:
+                    m = m[..., :-padmsk_h, :]
+            if pad_w > 0:
+                paddb_w = int(d.shape[-1] / tgt_size * pad_w)
+                padmsk_w = int(m.shape[-1] / tgt_size * pad_w)
+                if paddb_w > 0:
+                    d = d[..., :, :-paddb_w]
+                if padmsk_w > 0:
+                    m = m[..., :, :-padmsk_w]
             db_lst.append(d)
             mask_lst.append(m)
 

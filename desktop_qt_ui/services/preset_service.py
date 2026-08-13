@@ -5,8 +5,11 @@
 import json
 import logging
 import os
-import sys
 from typing import Dict, List, Optional
+
+from manga_translator.runtime_paths import get_application_dir
+
+DEFAULT_PRESET_NAME = "默认"
 
 
 class PresetService:
@@ -18,16 +21,8 @@ class PresetService:
         
         # 预设存储目录
         if presets_dir is None:
-            # 默认存储在_internal目录的presets文件夹
-            # 打包后：E:\manga-translator-cpu-v1.9.2\_internal\presets
-            # 开发时：项目根目录\presets
-            if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-                # 打包环境：_internal目录 (sys._MEIPASS)
-                base_dir = sys._MEIPASS
-            else:
-                # 开发环境：当前工作目录
-                base_dir = os.getcwd()
-            self.presets_dir = os.path.join(base_dir, "presets")
+            # 打包后位于 app.exe 同级，开发时位于项目根目录。
+            self.presets_dir = os.path.join(get_application_dir(), "presets")
         else:
             self.presets_dir = presets_dir
         
@@ -37,7 +32,6 @@ class PresetService:
         # 创建默认预设（如果不存在）
         self._create_default_preset()
         
-        self.logger.info(f"预设目录: {self.presets_dir}")
 
     def _get_known_preset_env_keys(self) -> List[str]:
         """获取预设应覆盖的全部 env 键。"""
@@ -100,7 +94,7 @@ class PresetService:
     
     def _create_default_preset(self):
         """创建默认预设"""
-        default_preset_path = os.path.join(self.presets_dir, "默认.json")
+        default_preset_path = os.path.join(self.presets_dir, f"{DEFAULT_PRESET_NAME}.json")
         if not os.path.exists(default_preset_path):
             default_env = self._build_default_preset_env()
             try:
@@ -168,6 +162,10 @@ class PresetService:
     
     def delete_preset(self, preset_name: str) -> bool:
         """删除预设"""
+        if preset_name == DEFAULT_PRESET_NAME:
+            self.logger.warning("默认预设不可删除")
+            return False
+
         try:
             preset_path = os.path.join(self.presets_dir, f"{preset_name}.json")
             

@@ -1,79 +1,52 @@
 import logging
-import os
 from time import perf_counter
 
 import cv2
 import numpy as np
+from editor.render_text_value import (
+    has_renderable_text,
+    render_text_value_from_text_block,
+)
 from PyQt6.QtCore import QPointF
 from PyQt6.QtGui import QImage, QPixmap, QPolygonF
 
 from manga_translator.rendering import text_render
+from manga_translator.rendering.rich_text import (
+    has_legacy_line_breaks,
+    legacy_line_breaks_to_document,
+    plain_text_of,
+)
 from manga_translator.rendering.text_render import (
     set_font,
 )
-from manga_translator.utils import TextBlock
+from manga_translator.utils import TextBlock, parse_color
 
 logger = logging.getLogger('manga_translator')
 
 _APPLIED_FONT_TARGET = None
 
 
-def resource_path(relative_path):
-    """ Get absolute path to resource, works for dev and for PyInstaller """
-    import os
-    import sys
-    try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-    return os.path.join(base_path, relative_path)
+def _translation_preview(value, limit: int = 50) -> str:
+    # F12："富文本值转纯文本"统一委托协议层单点 plain_text_of
+    return plain_text_of(value)[:limit]
 
-def resolve_font_path(font_path: str) -> str:
-    """Resolve absolute/relative font path for both dev and packaged runtime.
 
-    When an absolute path does not exist on the current machine (e.g., the path
-    was saved on a different machine or the install directory changed), we fall
-    back to searching for the font file by name inside the local fonts/ directory.
-    """
-    if not font_path:
-        return ''
-    if os.path.exists(font_path):
-        return font_path
-
-    # 路径不存在时（含绝对路径盘符不同的情况），用文件名在 fonts/ 目录里继续找
-    font_basename = os.path.basename(font_path)
-    candidates = (
-        resource_path(os.path.join('fonts', font_basename)),
-        resource_path(font_basename),
-    )
-    if not os.path.isabs(font_path):
-        # 相对路径还额外尝试直接 join
-        candidates = (
-            resource_path(font_path),
-        ) + candidates
-
-    for candidate in candidates:
-        if os.path.exists(candidate):
-            return candidate
-    return ''
-
-def apply_font_for_render(font_path: str) -> str:
-    """Apply font for current render call; fallback to built-in default."""
+def apply_font_for_render(font_value: str) -> str:
+    """Apply a Qt family name for the current render call."""
     global _APPLIED_FONT_TARGET
 
-    resolved_font_path = resolve_font_path(font_path)
-    target_font = resolved_font_path or text_render.DEFAULT_FONT
+    target_font = font_value or text_render.DEFAULT_FONT_FAMILY
     if _APPLIED_FONT_TARGET == target_font:
-        return resolved_font_path
+        return target_font
 
     try:
         set_font(target_font)
         _APPLIED_FONT_TARGET = target_font
     except Exception:
-        set_font(text_render.DEFAULT_FONT)
-        _APPLIED_FONT_TARGET = text_render.DEFAULT_FONT
+        set_font(text_render.DEFAULT_FONT_FAMILY)
+        _APPLIED_FONT_TARGET = text_render.DEFAULT_FONT_FAMILY
         return ''
-    return resolved_font_path
+    return target_font
 
 
 def _rgba_image_to_qimage(rgba_image: np.ndarray) -> QImage:
@@ -103,20 +76,20 @@ def _target_rect_from_points(points: np.ndarray):
     return x_s, y_s, w_s, h_s
 
 
-def _is_axis_aligned_rect(points: np.ndarray, tolerance: float = 0.01) -> bool:
-    p = np.asarray(points, dtype=np.float32).reshape(4, 2)
-    return (
-        abs(float(p[0, 1] - p[1, 1])) <= tolerance
-        and abs(float(p[2, 1] - p[3, 1])) <= tolerance
-        and abs(float(p[0, 0] - p[3, 0])) <= tolerance
-        and abs(float(p[1, 0] - p[2, 0])) <= tolerance
+def _native_rect_points(center, width: int, height: int, angle: float) -> np.ndarray:
+    """按原生像素宽高生成实际渲染四角；只旋转，不缩放。"""
+    cx, cy = float(center[0]), float(center[1])
+    hw, hh = float(width) / 2.0, float(height) / 2.0
+    local = np.array(
+        [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]],
+        dtype=np.float32,
     )
-
-
-def _resize_to_target_rect(box: np.ndarray, width: int, height: int) -> np.ndarray:
-    if box.shape[1] == width and box.shape[0] == height:
-        return box
-    return cv2.resize(box, (width, height), interpolation=cv2.INTER_LINEAR)
+    rad = np.deg2rad(float(angle or 0.0))
+    cos_a, sin_a = float(np.cos(rad)), float(np.sin(rad))
+    rotated = np.empty_like(local)
+    rotated[:, 0] = cx + local[:, 0] * cos_a - local[:, 1] * sin_a
+    rotated[:, 1] = cy + local[:, 0] * sin_a + local[:, 1] * cos_a
+    return rotated.reshape(1, 4, 2)
 
 
 def _record_profile_elapsed(stats: dict | None, key: str, start_time: float | None) -> None:
@@ -129,23 +102,24 @@ def render_text_image_for_region(text_block: TextBlock, dst_points: np.ndarray, 
     为单个区域渲染文本的核心函数
     返回一个包含 (QImage, QPointF) 的元组，适合离屏/线程内处理。
     """
-    original_translation = text_block.translation
     profile_stats = render_params.get("_profile_stats") if isinstance(render_params, dict) else None
     stage_t0 = perf_counter() if profile_stats is not None else None
     try:
         # --- 1. 文本预处理 ---
-        text_to_render = original_translation or text_block.text
-        if not text_to_render:
+        text_to_render = render_text_value_from_text_block(text_block)
+        if not has_renderable_text(text_to_render):
             logger.debug("[EDITOR RENDER SKIPPED] Text is empty")
             return None
+        if isinstance(text_to_render, str) and has_legacy_line_breaks(text_to_render):
+            text_to_render = legacy_line_breaks_to_document(text_to_render).to_dict()
 
-        text_block.translation = text_to_render
-
-        # 区域级字体优先：render_params.font_path -> text_block.font_path -> 默认字体
-        region_font_path = render_params.get('font_path') or getattr(text_block, 'font_path', '')
-        resolved_font_path = apply_font_for_render(region_font_path)
-        if not resolved_font_path and region_font_path:
-            logger.warning(f"[EDITOR RENDER] Font path not found: {region_font_path}, fallback to default font")
+        region_font = (
+            render_params.get('font_family')
+            or getattr(text_block, 'font_family', '')
+        )
+        applied_font = apply_font_for_render(region_font)
+        if not applied_font and region_font:
+            logger.warning(f"[EDITOR RENDER] Font unavailable: {region_font}, fallback to default font")
 
         # --- 2. 渲染 ---
         disable_font_border = render_params.get('disable_font_border', False)
@@ -165,14 +139,19 @@ def render_text_image_for_region(text_block: TextBlock, dst_points: np.ndarray, 
         render_h = round(norm_v)
         font_size = text_block.font_size
 
-        # 从 text_block 获取默认颜色
-        fg_color, bg_color_default = text_block.get_font_colors()
+        # 区域属性面板修改的颜色已经解析到 render_params。
+        # 直接从这份当次渲染快照取值，避免继续使用 TextBlock 中的
+        # 旧 fg_colors，导致画布预览在选色后仍保持原颜色。
+        text_block_fg, bg_color_default = text_block.get_font_colors()
+        fg_color = parse_color(render_params.get('font_color'), None)
+        if fg_color is None:
+            fg_color = text_block_fg
         
         # 优先使用 render_params 中用户设置的描边颜色
         bg_color = render_params.get('text_stroke_color', bg_color_default)
         
         # 从 render_params 中获取描边宽度
-        stroke_width = render_params.get('text_stroke_width', None)
+        stroke_width = render_params['stroke_width']
         
         if disable_font_border:
             bg_color = None
@@ -192,11 +171,7 @@ def render_text_image_for_region(text_block: TextBlock, dst_points: np.ndarray, 
             except Exception:
                 region_count = 1
 
-        text_for_render = text_render.prepare_text_for_direction_rendering(
-            text_block.get_translation_for_rendering(),
-            is_horizontal=text_block.horizontal,
-            auto_rotate_symbols=bool(render_params.get('auto_rotate_symbols')),
-        )
+        text_for_render = text_to_render
         _record_profile_elapsed(profile_stats, "backend_prepare_ms", stage_t0)
 
         # 使用 Qt 离屏渲染器
@@ -238,10 +213,13 @@ def render_text_image_for_region(text_block: TextBlock, dst_points: np.ndarray, 
         _record_profile_elapsed(profile_stats, "backend_draw_ms", stage_t0)
 
         if rendered_surface is None or rendered_surface.size == 0:
-            logger.debug(f"[EDITOR RENDER SKIPPED] Rendered surface is None or empty. Text: '{text_block.translation[:50] if hasattr(text_block, 'translation') else 'N/A'}...'")
+            logger.debug(
+                "[EDITOR RENDER SKIPPED] Rendered surface is None or empty. "
+                f"Text: '{_translation_preview(getattr(text_block, 'translation', None), 50)}...'"
+            )
             return None
         
-        # 预乘 Alpha: 防止 cv2.warpPerspective 插值或填充 0 (透明黑) 时导致黑边灰边
+        # 转为预乘 Alpha，与 QImage.Format_RGBA8888_Premultiplied 的输入契约一致。
         stage_t0 = perf_counter() if profile_stats is not None else None
         rendered_surface = rendered_surface.copy()
         alpha_f = rendered_surface[:, :, 3] / 255.0
@@ -250,84 +228,41 @@ def render_text_image_for_region(text_block: TextBlock, dst_points: np.ndarray, 
         rendered_surface[:, :, 2] = (rendered_surface[:, :, 2] * alpha_f).astype(np.uint8)
         _record_profile_elapsed(profile_stats, "backend_premul_ms", stage_t0)
 
-        # --- 3. 宽高比校正 (与后端渲染逻辑完全同步) ---
-        stage_t0 = perf_counter() if profile_stats is not None else None
-        h_temp, w_temp, _ = rendered_surface.shape
-        if h_temp == 0 or w_temp == 0:
-            logger.debug(f"[EDITOR RENDER SKIPPED] Rendered surface has zero dimensions: width={w_temp}, height={h_temp}")
+        # --- 3. 保持原生像素尺寸 ---
+        # dst_points 只提供文字的布局锚点，不再作为 RGBA 图层的缩放/透视目标。
+        # RegionTextItem 的父节点负责 angle 旋转，因此编辑器后端只需把原生
+        # pixmap 居中放到目标框中心。文字大于白框时允许自然溢出。
+        native_image = rendered_surface
+        h, w, ch = native_image.shape
+        if h == 0 or w == 0:
+            logger.debug(
+                f"[EDITOR RENDER SKIPPED] Rendered surface has zero dimensions: "
+                f"width={w}, height={h}"
+            )
             return None
-        r_temp = w_temp / h_temp
-        
-        r_orig = norm_h / norm_v
 
-        box = None
-        if text_block.horizontal:
-            if r_temp > r_orig:
-                h_ext = int((w_temp / r_orig - h_temp) // 2) if r_orig > 0 else 0
-                if h_ext >= 0:
-                    box = np.zeros((h_temp + h_ext * 2, w_temp, 4), dtype=np.uint8)
-                    box[h_ext:h_ext+h_temp, 0:w_temp] = rendered_surface
-                else:
-                    box = rendered_surface.copy()
-            else:
-                w_ext = int((h_temp * r_orig - w_temp) // 2)
-                if w_ext >= 0:
-                    box = np.zeros((h_temp, w_temp + w_ext * 2, 4), dtype=np.uint8)
-                    # 横排文本默认水平居中
-                    box[0:h_temp, w_ext:w_ext+w_temp] = rendered_surface
-                else:
-                    box = rendered_surface.copy()
-        else: # Vertical
-            if r_temp > r_orig:
-                h_ext = int(w_temp / (2 * r_orig) - h_temp / 2) if r_orig > 0 else 0
-                if h_ext >= 0:
-                    box = np.zeros((h_temp + h_ext * 2, w_temp, 4), dtype=np.uint8)
-                    box[h_ext:h_ext+h_temp, 0:w_temp] = rendered_surface
-                else:
-                    box = rendered_surface.copy()
-            else:
-                w_ext = int((h_temp * r_orig - w_temp) / 2)
-                if w_ext >= 0:
-                    box = np.zeros((h_temp, w_temp + w_ext * 2, 4), dtype=np.uint8)
-                    # 竖排文本水平居中
-                    box[0:h_temp, w_ext:w_ext+w_temp] = rendered_surface
-                else:
-                    box = rendered_surface.copy()
+        target_center = np.mean(dst_points_screen, axis=0)
+        native_pos = QPointF(
+            float(target_center[0]) - w / 2.0,
+            float(target_center[1]) - h / 2.0,
+        )
+        native_dst_points = _native_rect_points(
+            target_center,
+            w,
+            h,
+            getattr(text_block, "angle", 0.0),
+        )
 
-        if box is None:
-            box = rendered_surface.copy()
-        _record_profile_elapsed(profile_stats, "backend_box_ms", stage_t0)
-
-        # --- 4. 坐标变换与扭曲 (Warping) ---
-        stage_t0 = perf_counter() if profile_stats is not None else None
-        if _is_axis_aligned_rect(dst_points_screen):
-            # 编辑器文字框在当前渲染链路里通常是轴对齐矩形；直接缩放比
-            # findHomography + warpPerspective 轻很多，视觉结果等价。
-            warped_image = _resize_to_target_rect(box, w_s, h_s)
-        else:
-            src_points = np.float32([[0, 0], [box.shape[1], 0], [box.shape[1], box.shape[0]], [0, box.shape[0]]])
-            dst_points_warp = dst_points_screen - [x_s, y_s]
-            matrix = cv2.getPerspectiveTransform(src_points, dst_points_warp.astype(np.float32))
-            if matrix is None:
-                logger.debug("[EDITOR RENDER SKIPPED] Failed to compute perspective matrix for text transformation")
-                return None
-
-            warped_image = cv2.warpPerspective(box, matrix, (w_s, h_s), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0,0))
-        _record_profile_elapsed(profile_stats, "backend_warp_ms", stage_t0)
-
-        # --- 5. 转换为QImage并返回绘制信息 ---
-        h, w, ch = warped_image.shape
+        # --- 4. 转换为QImage并返回绘制信息 ---
         if ch == 4:
             stage_t0 = perf_counter() if profile_stats is not None else None
-            final_image = _rgba_image_to_qimage(warped_image)
+            final_image = _rgba_image_to_qimage(native_image)
             _record_profile_elapsed(profile_stats, "backend_qimage_ms", stage_t0)
-            return (final_image, QPointF(x_s, y_s))
+            return (final_image, native_pos, native_dst_points)
 
     except Exception as e:
         logger.debug(f"Error during backend text rendering: {e}")
         return None
-    finally:
-        text_block.translation = original_translation
 
 
 def render_text_for_region(text_block: TextBlock, dst_points: np.ndarray, transform, render_params: dict, pure_zoom: float = 1.0, total_regions: int = 1):
@@ -342,9 +277,9 @@ def render_text_for_region(text_block: TextBlock, dst_points: np.ndarray, transf
     if image_result is None:
         return None
 
-    final_image, pos = image_result
+    final_image, pos, native_dst_points = image_result
     profile_stats = render_params.get("_profile_stats") if isinstance(render_params, dict) else None
     stage_t0 = perf_counter() if profile_stats is not None else None
     pixmap = QPixmap.fromImage(final_image)
     _record_profile_elapsed(profile_stats, "backend_pixmap_ms", stage_t0)
-    return (pixmap, pos)
+    return (pixmap, pos, native_dst_points)

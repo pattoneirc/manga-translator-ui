@@ -1,37 +1,86 @@
 from __future__ import annotations
 
-import asyncio
+import concurrent.futures
 import copy
 import math
 import os
+import threading
+import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 
-import cv2
 import numpy as np
-from PyQt6.QtCore import QTimer
-from PyQt6.QtWidgets import QMessageBox
-from services import get_render_parameter_service
-
+from manga_translator.image_formats import resolve_pil_image_format
+from manga_translator.utils import save_pil_image
 from manga_translator.utils.path_manager import (
-    find_inpainted_path,
     find_json_path,
     get_inpainted_path,
     get_json_path,
-    get_paint_overlay_path,
 )
 
-from .image_utils import image_like_to_pil, image_like_to_rgb_array
+from services import get_render_parameter_service
+
+from .image_utils import image_like_to_pil
+from .region_geometry_state import normalize_region_geometry_data
 
 if TYPE_CHECKING:
     from .editor_controller import EditorController
 
 
+def _close_images(*images: object) -> None:
+    for image in images:
+        close = getattr(image, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+
+@dataclass(slots=True)
+class ExportJob:
+    automatic: bool
+    source_path: str
+    output_path: str
+    image: object
+    regions: list[dict]
+    mask: Optional[np.ndarray]
+    config: dict
+    inpainted_image: object = None
+    paint_overlay: Optional[np.ndarray] = None
+    stamp_overlay: Optional[np.ndarray] = None
+
+    @property
+    def source_key(self) -> str:
+        return os.path.normcase(os.path.abspath(self.source_path))
+
+    def release_resources(self) -> None:
+        _close_images(self.image, self.inpainted_image)
+
+
+@dataclass(frozen=True, slots=True)
+class ExportOutcome:
+    automatic: bool
+    source_path: str
+    output_path: str
+    success: bool
+    error: Optional[str] = None
+
+
 class EditorControllerExportService:
-    """导出与导出前持久化流程。"""
+    """编辑器工程保存与渲染图片导出流程。"""
 
     def __init__(self, controller: "EditorController"):
         self.controller = controller
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="editor-export",
+        )
+        self._state_lock = threading.RLock()
+        self._accepting = True
+        self._unfinished = 0
+        self._pending_auto: dict[str, concurrent.futures.Future] = {}
 
     @property
     def model(self):
@@ -45,82 +94,85 @@ class EditorControllerExportService:
     def config_service(self):
         return self.controller.config_service
 
-    @property
-    def resource_manager(self):
-        return self.controller.resource_manager
+    def has_unsaved_changes(self) -> bool:
+        """脏检测唯一真相源：仅成功保存工程数据后标记 clean。"""
+        return not self.controller.history_service.is_clean()
 
-    @property
-    def async_service(self):
-        return self.controller.async_service
-
-    def generate_export_snapshot(self) -> dict:
-        regions = self.controller._get_regions()
-        snapshot_data = []
-        for region in regions:
-            region_key = {
-                "translation": region.get("translation", ""),
-                "font_size": region.get("font_size"),
-                "font_color": region.get("font_color"),
-                "alignment": region.get("alignment"),
-                "direction": region.get("direction"),
-                "xyxy": region.get("xyxy"),
-                "lines": str(region.get("lines", [])),
-            }
-            snapshot_data.append(str(region_key))
-
-        mask = self.model.get_refined_mask()
-        if mask is None:
-            mask = self.model.get_raw_mask()
-        mask_signature = ""
-        if mask is not None:
-            mask_signature = f"{mask.shape}_{mask.sum()}_{np.count_nonzero(mask)}"
-
-        overlay = self.model.get_paint_overlay_image()
-        overlay_signature = ""
-        if overlay is not None:
-            overlay_arr = np.asarray(overlay)
-            overlay_signature = (
-                f"{overlay_arr.shape}_{int(overlay_arr.sum())}_{int(np.count_nonzero(overlay_arr))}"
+    def save_editor_state(self) -> bool:
+        """同步保存 JSON 与当前修复图，不执行图片渲染导出。"""
+        self.controller.commit_pending_edits()
+        source_path = self.model.get_source_image_path()
+        if not source_path:
+            self._reject_export("保存失败：当前图片没有来源路径")
+            return False
+        try:
+            image = self.controller._get_current_image()
+            if image is None:
+                self._reject_export("保存失败：缺少图像数据")
+                return False
+            regions = copy.deepcopy(self.controller._get_regions() or [])
+            mask = self.model.get_refined_mask()
+            if mask is None:
+                mask = self.model.get_raw_mask()
+            mask_snapshot = None if mask is None else np.array(mask, copy=True)
+            config = self.config_service.get_config()
+            config_dict = self._build_config_dict(config)
+            paint_snapshot = self._snapshot_overlay(
+                self.model.get_paint_overlay_image()
             )
+            stamp_snapshot = self._snapshot_overlay(
+                self.model.get_stamp_overlay_image()
+            )
+            from services.export_service import ExportService
 
-        return {
-            "regions_hash": hash("|".join(snapshot_data)),
-            "mask_signature": mask_signature,
-            "overlay_signature": overlay_signature,
-            "source_path": self.model.get_source_image_path(),
-        }
+            persistence_service = ExportService()
+            self.save_editor_json(
+                export_service=persistence_service,
+                source_path=os.path.abspath(source_path),
+                regions=regions,
+                mask=mask_snapshot,
+                config_dict=config_dict,
+                last_export_dir=self._read_saved_export_dir(source_path),
+                paint_overlay=paint_snapshot,
+                stamp_overlay=stamp_snapshot,
+            )
+            inpainted = self.model.get_inpainted_image()
+            if inpainted is not None:
+                inpainted_snapshot = self.controller._snapshot_image_for_export(
+                    inpainted, "inpainted image"
+                )
+                try:
+                    self.save_inpainted_image(
+                        os.path.abspath(source_path), config_dict, inpainted_snapshot
+                    )
+                finally:
+                    _close_images(inpainted_snapshot)
+            self.controller.history_service.mark_clean()
+            toast_manager = self.controller.get_toast_manager()
+            if toast_manager is not None:
+                toast_manager.show_success("保存成功", 2500)
+            return True
+        except Exception as e:
+            self.logger.error("Failed to save editor state", exc_info=True)
+            self._reject_export(f"保存失败：{e}")
+            return False
 
-    def has_changes_since_last_export(self) -> bool:
-        if self.controller._last_export_snapshot is None:
-            return self.controller.history_service.can_undo()
+    def export_image(
+        self,
+        automatic: bool = False,
+    ) -> Optional[concurrent.futures.Future]:
+        source_path = self.model.get_source_image_path()
+        if not source_path:
+            return self._reject_export("导出失败：当前图片没有来源路径")
 
-        current_snapshot = self.generate_export_snapshot()
-        if current_snapshot["source_path"] != self.controller._last_export_snapshot["source_path"]:
-            return self.controller.history_service.can_undo()
-
-        return (
-            current_snapshot["regions_hash"] != self.controller._last_export_snapshot["regions_hash"]
-            or current_snapshot["mask_signature"] != self.controller._last_export_snapshot["mask_signature"]
-            or current_snapshot.get("overlay_signature", "")
-            != self.controller._last_export_snapshot.get("overlay_signature", "")
-        )
-
-    def save_export_snapshot(self) -> None:
-        self.controller._last_export_snapshot = self.generate_export_snapshot()
-        self.logger.debug(f"Export snapshot saved: {self.controller._last_export_snapshot}")
-
-    def export_image(self):
+        image_snapshot = None
+        inpainted_snapshot = None
         try:
             image = self.controller._get_current_image()
             regions = self.controller._get_regions()
-            source_path = self.model.get_source_image_path()
-
             if image is None:
                 self.logger.warning("Cannot export: missing image data")
-                toast_manager = self.controller.get_toast_manager()
-                if toast_manager is not None:
-                    toast_manager.show_error("导出失败：缺少图像数据")
-                return
+                return self._reject_export("导出失败：缺少图像数据")
 
             if regions is None:
                 regions = []
@@ -130,66 +182,134 @@ class EditorControllerExportService:
                 mask = self.model.get_raw_mask()
             if mask is None and regions:
                 self.logger.warning("Cannot export: no mask data available for regions")
-                toast_manager = self.controller.get_toast_manager()
-                if toast_manager is not None:
-                    toast_manager.show_error("导出失败：没有可用的蒙版数据")
-                return None
+                return self._reject_export("导出失败：没有可用的蒙版数据")
 
-            self.controller._export_toast = None
-            toast_manager = self.controller.get_toast_manager()
-            if toast_manager is not None:
-                self.controller._export_toast = toast_manager.show_info("正在导出...", duration=0)
-
-            image_snapshot = self.controller._snapshot_image_for_export(image, "base image")
-            paint_overlay = self.model.get_paint_overlay_image()
-            overlay_snapshot = None
-            if paint_overlay is not None:
-                overlay_arr = np.asarray(paint_overlay)
-                if overlay_arr.ndim == 3 and overlay_arr.shape[2] == 4 and np.any(overlay_arr[..., 3]):
-                    overlay_snapshot = overlay_arr.copy()
-
-            # 有画板涂层时，inpainted snapshot 就取「inpainted ⊕ 画板」合成图。
-            # 没有实时 inpainted 但磁盘上有旧 inpainted 时回退加载，
-            # 避免后端因拿不到 inpainted 而重跑修复、把画板涂层丢掉。
+            image_snapshot = self.controller._snapshot_image_for_export(
+                image, "base image"
+            )
+            paint_snapshot = self._snapshot_overlay(
+                self.model.get_paint_overlay_image()
+            )
+            stamp_snapshot = self._snapshot_overlay(
+                self.model.get_stamp_overlay_image()
+            )
             inpainted_base = self.model.get_inpainted_image()
-            if inpainted_base is None and overlay_snapshot is not None and source_path:
-                inpainted_base = self._load_existing_inpainted_for_compose(source_path)
-            if overlay_snapshot is not None and inpainted_base is not None:
-                composed = self.compose_image_with_overlay(inpainted_base, overlay_snapshot)
-                if composed is not None and composed is not inpainted_base:
-                    inpainted_base = composed
+            if inpainted_base is None:
+                # 没有修复图时导出仍以底图作为渲染底图。
+                inpainted_base = image
             inpainted_snapshot = self.controller._snapshot_image_for_export(
                 inpainted_base,
                 "inpainted image",
             )
             regions_snapshot = copy.deepcopy(regions)
             mask_snapshot = None if mask is None else np.array(mask, copy=True)
+            config = self.config_service.get_config()
+            config_dict = self._build_config_dict(config)
+            self._prepare_render_config(config_dict)
+            output_path = self._build_output_path(config, source_path)
 
-            # 乐观更新：提交异步任务前先打快照，避免 Ctrl+Q 后立刻切图弹"未保存的编辑"。
-            # 失败时 success_callback 不会再次刷新快照，用户重新 Ctrl+Q 即可。
-            self.save_export_snapshot()
-
-            return self.async_service.submit_task(
-                self.async_export_with_desktop_ui_service(
-                    image_snapshot,
-                    regions_snapshot,
-                    mask_snapshot,
-                    source_path,
-                    inpainted_snapshot,
-                    overlay_snapshot,
-                )
+            job = ExportJob(
+                automatic=bool(automatic),
+                source_path=os.path.abspath(source_path),
+                output_path=output_path,
+                image=image_snapshot,
+                regions=regions_snapshot,
+                mask=mask_snapshot,
+                config=config_dict,
+                inpainted_image=inpainted_snapshot,
+                paint_overlay=paint_snapshot,
+                stamp_overlay=stamp_snapshot,
             )
+            future = self._submit_job(job)
+            if future is None:
+                job.release_resources()
+                return self._reject_export("导出队列已经关闭")
+
+            return future
         except Exception as e:
             self.logger.error(f"Error during export request: {e}", exc_info=True)
-            toast_manager = self.controller.get_toast_manager()
-            if toast_manager is not None:
-                toast_manager.show_error("导出失败")
-            return None
+            _close_images(image_snapshot, inpainted_snapshot)
+            return self._reject_export(f"导出快照创建失败：{e}")
+
+    def _reject_export(self, message: str):
+        toast_manager = self.controller.get_toast_manager()
+        if toast_manager is not None:
+            toast_manager.show_error(message, 5000)
+        return None
+
+    def _submit_job(self, job: ExportJob) -> Optional[concurrent.futures.Future]:
+        source_key = job.source_key if job.automatic else None
+        with self._state_lock:
+            if not self._accepting:
+                return None
+            previous = self._pending_auto.get(source_key) if source_key else None
+            try:
+                future = self._executor.submit(self.execute_export_job, job)
+            except RuntimeError:
+                return None
+            self._unfinished += 1
+            if source_key:
+                self._pending_auto[source_key] = future
+
+        future.add_done_callback(
+            lambda done, queued_job=job, key=source_key: self._on_job_done(
+                done,
+                queued_job,
+                key,
+            )
+        )
+        if previous is not None:
+            previous.cancel()
+        self.controller._export_queue_status_signal.emit(self.unfinished_count())
+        return future
+
+    def _on_job_done(
+        self,
+        future: concurrent.futures.Future,
+        job: ExportJob,
+        source_key: Optional[str],
+    ) -> None:
+        outcome = None
+        if not future.cancelled():
+            try:
+                outcome = future.result()
+            except Exception as e:
+                self.logger.exception("Unhandled editor export error")
+                outcome = ExportOutcome(
+                    automatic=job.automatic,
+                    source_path=job.source_path,
+                    output_path=job.output_path,
+                    success=False,
+                    error=str(e),
+                )
+
+        with self._state_lock:
+            self._unfinished = max(0, self._unfinished - 1)
+            if source_key and self._pending_auto.get(source_key) is future:
+                self._pending_auto.pop(source_key, None)
+            unfinished = self._unfinished
+
+        job.release_resources()
+        self.controller._export_queue_status_signal.emit(unfinished)
+        if outcome is not None:
+            self.controller._export_job_finished_signal.emit(outcome)
+
+    def unfinished_count(self) -> int:
+        with self._state_lock:
+            return self._unfinished
+
+    def shutdown(self) -> None:
+        with self._state_lock:
+            if not self._accepting:
+                return
+            self._accepting = False
+        self._executor.shutdown(wait=True, cancel_futures=False)
 
     @staticmethod
     def resolve_effective_box_local(region: dict):
         if not isinstance(region, dict):
             return None
+        region = normalize_region_geometry_data(region)
 
         custom_box = region.get("white_frame_rect_local")
         render_box = region.get("render_box_rect_local")
@@ -197,7 +317,11 @@ class EditorControllerExportService:
 
         # 解绑：与编辑器 snapshot 同步——用户手动白框存在时优先白框，
         # 让导出和预览的渲染中心走同一条路。
-        if has_custom and isinstance(custom_box, (list, tuple)) and len(custom_box) == 4:
+        if (
+            has_custom
+            and isinstance(custom_box, (list, tuple))
+            and len(custom_box) == 4
+        ):
             return custom_box
         if isinstance(render_box, (list, tuple)) and len(render_box) == 4:
             return render_box
@@ -225,21 +349,28 @@ class EditorControllerExportService:
             angle = float(region.get("angle") or 0.0)
             rad = math.radians(angle)
             cos_a, sin_a = math.cos(rad), math.sin(rad)
-            region["center"] = [cx + lx * cos_a - ly * sin_a, cy + lx * sin_a + ly * cos_a]
+            region["center"] = [
+                cx + lx * cos_a - ly * sin_a,
+                cy + lx * sin_a + ly * cos_a,
+            ]
             # 同步平移 local 坐标，以新 center 为原点，防止存/读漂移
             if "white_frame_rect_local" in region:
                 wf = region["white_frame_rect_local"]
                 if isinstance(wf, (list, tuple)) and len(wf) == 4:
                     region["white_frame_rect_local"] = [
-                        float(wf[0]) - lx, float(wf[1]) - ly,
-                        float(wf[2]) - lx, float(wf[3]) - ly,
+                        float(wf[0]) - lx,
+                        float(wf[1]) - ly,
+                        float(wf[2]) - lx,
+                        float(wf[3]) - ly,
                     ]
             if "render_box_rect_local" in region:
                 rb = region["render_box_rect_local"]
                 if isinstance(rb, (list, tuple)) and len(rb) == 4:
                     region["render_box_rect_local"] = [
-                        float(rb[0]) - lx, float(rb[1]) - ly,
-                        float(rb[2]) - lx, float(rb[3]) - ly,
+                        float(rb[0]) - lx,
+                        float(rb[1]) - ly,
+                        float(rb[2]) - lx,
+                        float(rb[3]) - ly,
                     ]
         except (TypeError, ValueError):
             return
@@ -248,199 +379,86 @@ class EditorControllerExportService:
         json_path = find_json_path(source_path)
         if not json_path:
             json_path = get_json_path(source_path, create_dir=True)
-            self.logger.info(f"No existing JSON found, will create new one at: {json_path}")
+            self.logger.info(
+                f"No existing JSON found, will create new one at: {json_path}"
+            )
         else:
             self.logger.info(f"Found existing JSON, will replace: {json_path}")
         return json_path
 
-    def save_current_inpainted_image(
+    def save_inpainted_image(
         self,
         source_path: str,
         config_dict: dict,
-        mask: Optional[np.ndarray],
-        current_inpainted_image: Optional[object] = None,
-        has_regions: bool = False,
-    ) -> None:
+        image: object,
+    ) -> str:
+        inpainted_path = get_inpainted_path(source_path, create_dir=True)
+        save_quality = config_dict.get("cli", {}).get("save_quality", 95)
+        save_image = image_like_to_pil(image)
+        if save_image is None:
+            raise ValueError("inpainted image snapshot is empty")
+
+        image_format = resolve_pil_image_format(inpainted_path)
+        temp_path = f"{inpainted_path}.{uuid.uuid4().hex}.tmp"
         try:
-            image_to_save = current_inpainted_image
-            if image_to_save is None:
-                image_to_save = self.model.get_inpainted_image()
-            if image_to_save is None:
-                if mask is not None or has_regions:
-                    existing_inpainted_path = find_inpainted_path(source_path)
-                    if existing_inpainted_path and os.path.exists(existing_inpainted_path):
-                        self.logger.info(
-                            "No live inpainted preview during export, keep existing inpainted image: %s",
-                            existing_inpainted_path,
-                        )
-                    else:
-                        self.logger.warning(
-                            "Skipped updating inpainted image during export because no inpainted preview is available yet: %s",
-                            source_path,
-                        )
-                    return
-                image_to_save = self.model.get_image()
-            if image_to_save is None:
-                return
-
-            inpainted_path = get_inpainted_path(source_path, create_dir=True)
-            save_quality = config_dict.get("cli", {}).get("save_quality", 95)
-
-            save_image = image_like_to_pil(image_to_save)
-            if save_image is None:
-                return
+            save_pil_image(
+                save_image,
+                temp_path,
+                quality=save_quality,
+                format=image_format,
+            )
+            os.replace(temp_path, inpainted_path)
+            self.logger.info(f"已更新修复图片: {inpainted_path}")
+            return inpainted_path
+        finally:
             try:
-                save_kwargs = {}
-                if inpainted_path.lower().endswith((".jpg", ".jpeg")):
-                    if save_image.mode in ("RGBA", "LA"):
-                        converted_image = save_image.convert("RGB")
-                        save_image.close()
-                        save_image = converted_image
-                    save_kwargs["quality"] = save_quality
-                elif inpainted_path.lower().endswith(".webp"):
-                    save_kwargs["quality"] = save_quality
-
-                save_image.save(inpainted_path, **save_kwargs)
-
-                if self.controller._is_same_source_image(self.model.get_source_image_path(), source_path):
-                    self.model.set_inpainted_image_path(inpainted_path)
-                    self.resource_manager.set_cache(
-                        self.controller.CACHE_LAST_INPAINTED,
-                        image_like_to_rgb_array(save_image, copy=True),
-                    )
-                    if mask is not None:
-                        mask_to_cache = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY) if len(mask.shape) == 3 else mask
-                        self.resource_manager.set_cache(
-                            self.controller.CACHE_LAST_MASK,
-                            np.array(mask_to_cache, copy=True),
-                        )
-                else:
-                    self.logger.debug(
-                        "Skipped runtime inpaint cache update because active image changed during export"
-                    )
-
-                self.logger.info(f"已更新修复图片: {inpainted_path}")
-            finally:
+                save_image.close()
+            except Exception:
+                pass
+            if os.path.exists(temp_path):
                 try:
-                    save_image.close()
+                    os.remove(temp_path)
                 except Exception:
                     pass
-        except Exception as e:
-            self.logger.warning(f"更新inpainted图片失败: {e}")
-
-    def save_paint_overlay_image(
-        self,
-        source_path: str,
-        overlay: Optional[np.ndarray],
-    ) -> Optional[str]:
-        """将 paint overlay 落盘到 manga_translator_work/paint_overlay 目录。
-
-        若 overlay 为 None 或全透明，且已存在旧文件，则保留旧文件不删除；
-        若从未保存过则不创建空文件。
-        """
-        try:
-            if overlay is None:
-                return None
-            overlay_arr = np.asarray(overlay)
-            if overlay_arr.ndim != 3 or overlay_arr.shape[2] < 4:
-                return None
-            if not np.any(overlay_arr[..., 3]):
-                return None
-
-            from PIL import Image as _PILImage
-
-            overlay_path = get_paint_overlay_path(source_path, create_dir=True)
-            pil_overlay = _PILImage.fromarray(overlay_arr.astype(np.uint8, copy=False), mode="RGBA")
-            try:
-                pil_overlay.save(overlay_path, format="PNG", optimize=False)
-            finally:
-                pil_overlay.close()
-            self.logger.info(f"已更新彩色画笔图层: {overlay_path}")
-            return overlay_path
-        except Exception as e:
-            self.logger.warning(f"保存彩色画笔图层失败: {e}")
-            return None
-
-    def _load_existing_inpainted_for_compose(self, source_path: str):
-        """无实时 inpainted 预览时，从磁盘加载旧 inpainted 作为画板合成底图。"""
-        try:
-            existing_path = find_inpainted_path(source_path)
-            if not existing_path or not os.path.exists(existing_path):
-                return None
-            from PIL import Image as _PILImage
-
-            with _PILImage.open(existing_path) as fp:
-                fp.load()
-                return fp.copy()
-        except Exception as e:
-            self.logger.warning(f"加载磁盘 inpainted 作为画板底图失败: {e}")
-            return None
 
     @staticmethod
-    def compose_image_with_overlay(
-        base_image: Optional[object],
-        overlay: Optional[np.ndarray],
-    ) -> Optional[object]:
-        """把 paint overlay（RGBA）合成到 inpainted 底图上，返回 numpy RGB 数组。
-
-        若 overlay 为空或无有效 alpha，则原样返回 base_image（不复制）。
-        """
-        if base_image is None:
-            return base_image
+    def _snapshot_overlay(overlay) -> Optional[np.ndarray]:
+        """有有效 alpha 内容时返回 overlay 的 RGBA 副本，否则 None。"""
         if overlay is None:
-            return base_image
-
+            return None
         overlay_arr = np.asarray(overlay)
-        if overlay_arr.ndim != 3 or overlay_arr.shape[2] < 4:
-            return base_image
+        if overlay_arr.ndim != 3 or overlay_arr.shape[2] != 4:
+            return None
         if not np.any(overlay_arr[..., 3]):
-            return base_image
+            return None
+        return overlay_arr.copy()
 
-        base_rgb = image_like_to_rgb_array(base_image, copy=True)
-        if base_rgb is None:
-            return base_image
-
-        h, w = base_rgb.shape[:2]
-        overlay_resized = overlay_arr
-        if overlay_arr.shape[:2] != (h, w):
-            try:
-                overlay_resized = cv2.resize(
-                    overlay_arr,
-                    (w, h),
-                    interpolation=cv2.INTER_NEAREST,
-                )
-            except Exception:
-                return base_image
-
-        alpha = overlay_resized[..., 3].astype(np.float32) / 255.0
-        alpha3 = np.repeat(alpha[..., None], 3, axis=2)
-        rgb = overlay_resized[..., :3].astype(np.float32)
-        composed = base_rgb.astype(np.float32) * (1.0 - alpha3) + rgb * alpha3
-        return np.clip(composed, 0, 255).astype(np.uint8, copy=False)
-
-    def persist_editor_state_for_export(
+    def save_editor_json(
         self,
         export_service,
         source_path: str,
         regions: list,
         mask: Optional[np.ndarray],
         config_dict: dict,
-        inpainted_image: Optional[object] = None,
-    ) -> str:
+        last_export_dir: Optional[str] = None,
+        paint_overlay: Optional[np.ndarray] = None,
+        stamp_overlay: Optional[np.ndarray] = None,
+    ) -> None:
         json_path = self.resolve_editor_json_path(source_path)
         # 写盘的 region 保持 center=源区域中心、white_frame_rect_local 相对该中心。
         # 给后端 load_text 渲染用的副本（_build_enhanced_regions）才需要把
         # center 平移到白框中心；两条路径不能共用，否则下次编辑器加载会再叠加一次偏移。
         json_regions = [dict(region) for region in regions]
-        export_service._save_regions_data_with_path(json_regions, json_path, source_path, mask, config_dict)
-        self.save_current_inpainted_image(
+        export_service._save_regions_data_with_path(
+            json_regions,
+            json_path,
             source_path,
-            config_dict,
             mask,
-            current_inpainted_image=inpainted_image,
-            has_regions=bool(regions),
+            config_dict,
+            last_export_dir=last_export_dir,
+            paint_overlay=paint_overlay,
+            stamp_overlay=stamp_overlay,
         )
-        return json_path
 
     def _read_saved_export_dir(self, source_path: Optional[str]) -> Optional[str]:
         """从该图片对应的 _translations.json 中读取主翻译流程记录的输出目录。"""
@@ -451,6 +469,7 @@ class EditorControllerExportService:
             if not json_path or not os.path.exists(json_path):
                 return None
             import json as _json
+
             with open(json_path, "r", encoding="utf-8") as f:
                 data = _json.load(f)
             if not isinstance(data, dict) or not data:
@@ -462,37 +481,56 @@ class EditorControllerExportService:
             if not isinstance(image_data, dict):
                 return None
             saved_dir = image_data.get("last_export_dir")
-            if isinstance(saved_dir, str) and saved_dir and os.path.isdir(saved_dir):
-                return saved_dir
+            if isinstance(saved_dir, str) and saved_dir.strip():
+                return os.path.normpath(saved_dir.strip())
         except Exception as e:
             self.logger.debug(f"Failed to read saved export dir for {source_path}: {e}")
         return None
 
     def _build_output_path(self, config, source_path: Optional[str]) -> str:
-        save_to_source_dir = getattr(config.cli, "save_to_source_dir", False) if hasattr(config, "cli") else False
-        if save_to_source_dir and source_path:
-            output_dir = os.path.join(os.path.dirname(source_path), "manga_translator_work", "result")
-            os.makedirs(output_dir, exist_ok=True)
+        saved_export_dir = self._read_saved_export_dir(source_path)
+        if saved_export_dir:
+            output_dir = saved_export_dir
         else:
-            # 优先使用 JSON 中记录的目录（主翻译流程上次导出的位置），让编辑器导出回到原目录
-            output_dir = self._read_saved_export_dir(source_path)
-            if not output_dir:
-                output_dir = getattr(config.app, "last_output_path", None) if hasattr(config, "app") else None
-            if not output_dir or not os.path.exists(output_dir):
-                output_dir = os.path.dirname(source_path) if source_path else os.getcwd()
+            save_to_source_dir = (
+                getattr(config.cli, "save_to_source_dir", False)
+                if hasattr(config, "cli")
+                else False
+            )
+            if save_to_source_dir and source_path:
+                output_dir = os.path.join(
+                    os.path.dirname(source_path), "manga_translator_work", "result"
+                )
+            else:
+                output_dir = (
+                    getattr(config.app, "last_output_path", None)
+                    if hasattr(config, "app")
+                    else None
+                )
+                if not output_dir or not os.path.exists(output_dir):
+                    output_dir = (
+                        os.path.dirname(source_path) if source_path else os.getcwd()
+                    )
+        os.makedirs(output_dir, exist_ok=True)
 
         if source_path:
             base_name = os.path.splitext(os.path.basename(source_path))[0]
-            output_format = getattr(config.cli, "format", "") if hasattr(config, "cli") else ""
+            output_format = (
+                getattr(config.cli, "format", "") if hasattr(config, "cli") else ""
+            )
             if output_format == "不指定":
                 output_format = None
             if output_format and output_format.strip():
                 output_filename = f"{base_name}.{output_format.lower()}"
             else:
                 original_ext = os.path.splitext(source_path)[1].lower()
-                output_filename = f"{base_name}{original_ext}" if original_ext else f"{base_name}.png"
+                output_filename = (
+                    f"{base_name}{original_ext}" if original_ext else f"{base_name}.png"
+                )
         else:
-            output_filename = f"exported_image_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+            output_filename = (
+                f"exported_image_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+            )
 
         return os.path.join(output_dir, output_filename)
 
@@ -524,102 +562,74 @@ class EditorControllerExportService:
                 enhanced_region["direction"] = "auto"
 
             self.apply_white_frame_center(enhanced_region)
-            enhanced_region.update(render_service.export_parameters_for_backend(index, enhanced_region))
+            enhanced_region.update(
+                render_service.export_parameters_for_backend(index, enhanced_region)
+            )
             enhanced_regions.append(enhanced_region)
         return enhanced_regions
 
-    async def async_export_with_desktop_ui_service(
-        self,
-        image,
-        regions,
-        mask,
-        source_path: Optional[str] = None,
-        inpainted_image=None,
-        paint_overlay: Optional[np.ndarray] = None,
-    ):
-        outcome = {
-            "success": False,
-            "error": None,
-            "output_path": None,
-            "json_path": None,
-        }
+    def execute_export_job(self, job: ExportJob) -> ExportOutcome:
+        """在队列线程中渲染不可变快照，不写编辑器工程数据。"""
+        from services.export_service import ExportService
+
+        export_service = ExportService()
+        render_success = False
+        render_error: Optional[str] = None
+        render_image = None
+        render_inpainted = None
         try:
-            from services.export_service import ExportService
-
-            config = self.config_service.get_config()
-            output_path = self._build_output_path(config, source_path)
-            outcome["output_path"] = output_path
-            export_service = ExportService()
-            config_dict = self._build_config_dict(config)
-            self._prepare_render_config(config_dict)
-
-            persisted_json_path = None
-            if source_path:
-                persisted_json_path = self.persist_editor_state_for_export(
-                    export_service=export_service,
-                    source_path=source_path,
-                    regions=regions,
-                    mask=mask,
-                    config_dict=config_dict,
-                    inpainted_image=inpainted_image,
-                )
-                outcome["json_path"] = persisted_json_path
-                # 同步持久化彩色画笔图层
-                self.save_paint_overlay_image(source_path, paint_overlay)
-            else:
-                self.logger.warning("Exporting without source image path, skipped JSON persistence")
-
-            # inpainted_image 已在 export_image() 入口完成「inpainted ⊕ 画板」合成，
-            # 直接交给后端复用即可。
-            render_inpainted_image = inpainted_image
-
-            def progress_callback(_message):
-                return None
+            render_image = image_like_to_pil(job.image)
+            if render_image is None:
+                raise ValueError("base image snapshot is empty")
+            if job.inpainted_image is not None:
+                render_inpainted = image_like_to_pil(job.inpainted_image)
 
             def success_callback(_message):
-                outcome["success"] = True
-                success_message = f"导出成功\n{output_path}"
-                if persisted_json_path:
-                    success_message += "\n已同步 JSON"
-                self.controller._show_toast_signal.emit(success_message, 5000, True, output_path)
-
-                if self.controller._is_same_source_image(self.model.get_source_image_path(), source_path):
-                    self.save_export_snapshot()
-                    self.resource_manager.release_memory_after_export()
-                    self.resource_manager.release_image_cache_except_current()
-                    self.controller._log_memory_snapshot("after-export-cleanup")
-                else:
-                    self.logger.debug("Skipped export snapshot update because active image changed during export")
+                nonlocal render_success
+                render_success = True
 
             def error_callback(message):
-                outcome["error"] = str(message)
-                self.logger.error(f"Export error: {message}")
-                self.controller._show_toast_signal.emit(f"导出失败：{message}", 5000, False, "")
+                nonlocal render_error
+                render_error = str(message)
 
-            enhanced_regions = self._build_enhanced_regions(regions)
-            await asyncio.to_thread(
-                export_service._perform_backend_render_export,
-                image,
-                enhanced_regions,
-                config_dict,
-                output_path,
-                mask,
-                progress_callback,
+            export_service._perform_backend_render_export(
+                render_image,
+                self._build_enhanced_regions(job.regions),
+                job.config,
+                job.output_path,
+                job.mask,
+                None,
                 success_callback,
                 error_callback,
-                source_path,
+                job.source_path,
                 False,
-                render_inpainted_image,
+                render_inpainted,
+                job.paint_overlay,
+                job.stamp_overlay,
             )
-            if not outcome["success"] and outcome["error"] is None:
-                outcome["error"] = "导出未返回成功状态"
-            return outcome
         except Exception as e:
-            self.logger.error(f"Error during async export: {e}", exc_info=True)
-            err_msg = str(e)
-            outcome["error"] = err_msg
-            QTimer.singleShot(
-                0,
-                lambda: QMessageBox.critical(None, "导出失败", f"导出过程中发生意外错误:\n{err_msg}"),
+            render_error = str(e)
+            self.logger.error("Failed to render editor export job", exc_info=True)
+        finally:
+            for image in (render_image, render_inpainted):
+                if image is not None:
+                    try:
+                        image.close()
+                    except Exception:
+                        pass
+
+        if not render_success:
+            return ExportOutcome(
+                automatic=job.automatic,
+                source_path=job.source_path,
+                output_path=job.output_path,
+                success=False,
+                error=render_error or "导出未返回成功状态",
             )
-            return outcome
+
+        return ExportOutcome(
+            automatic=job.automatic,
+            source_path=job.source_path,
+            output_path=job.output_path,
+            success=True,
+        )

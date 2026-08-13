@@ -7,11 +7,11 @@
 ## 📋 目录
 
 - [系统要求](#系统要求)
-- [安装方式一：使用安装脚本（推荐，支持自动更新）](#安装方式一使用安装脚本推荐支持自动更新)
+- [安装方式一：便携安装包（推荐，支持自动更新）](#安装方式一便携安装包推荐支持自动更新)
 - [安装方式二：下载打包版本](#安装方式二下载打包版本)
 - [安装方式三：从源码运行](#安装方式三从源码运行)
 - [安装方式四：Docker部署](#安装方式四docker部署)
-- [安装方式五：macOS 原生运行（Apple Silicon）](#安装方式五macos原生运行apple-silicon)
+- [安装方式五：Linux/macOS 原生运行](#安装方式五linuxmacos原生运行)
 - [故障排除](#故障排除)
 
 ---
@@ -29,140 +29,92 @@
 
 - **内存**：16 GB RAM 或更多
 - **GPU**：
-  - **NVIDIA 显卡**：支持 CUDA 12.x（需驱动版本 >= 525.60.13）
+  - **NVIDIA 显卡**：GeForce 10 系必须使用 CUDA 12.6；CUDA 13.0 仅支持 Turing（计算能力 7.5）及更新架构，支持 CUDA 13.0 及以上的驱动也能运行 CUDA 12.6 版本
     - 建议显存：6 GB 或更多
     - 支持的 NVIDIA 显卡：GTX 1060 及以上
+    - RTX 20/30/40/50 系列在驱动支持 CUDA 13.0 时可选择 CUDA 13.0；RTX 50 系列推荐此版本
   - **AMD 显卡**：支持 ROCm（实验性）
     - 支持的显卡：**仅 RX 7000/9000 系列（RDNA 3/4）**
     - ⚠️ RX 5000/6000 系列请使用 CPU 版本
-    - ⚠️ AMD GPU 仅支持安装脚本方式，不支持打包版本
+    - ⚠️ Windows AMD 可使用实验性 AMD 发布便携包或维护脚本；要求受支持显卡和 AMD 26.2.2 驱动
     - ⚠️ Windows 上 ROCm 支持有限，Linux 下体验更好
 - **存储空间**：10 GB SSD
 
 ---
 
-## 安装方式一：使用安装脚本（⭐ 推荐，自动安装 Miniconda）
+## 安装方式一：便携安装包（⭐ 推荐，支持自动更新）
 
-脚本会自动完成所有配置，并支持一键更新。
+从 GitHub Releases 下载便携安装包，解压即用。安装包内置打包版 Python 3.12（`packaging\python\python.exe`）和 uv 包管理器（`packaging\uv.exe`），完全绿色、不写注册表、**无需预装 Python**。
 
-> ⚠️ **网络提示**：下载过程需要从 GitHub 拉取代码，网络不好建议开代理。
-> 💡 **新特性**：无需预装 Python，脚本会自动安装 Miniconda（轻量级Python环境管理）
+> ⚠️ **网络提示**：安装过程需要下载代码和依赖，国内网络可在菜单中选择 Gitee 或 GitCode 镜像和国内 PyPI 镜像。
 
 ### 前提条件
 
-- **无需预装 Python**：脚本会自动下载安装 Miniconda
-- **Git**（可选）：脚本可以自动下载便携版 Git
+- **无需预装 Python**：安装包自带打包版 Python 3.12 和 uv
+- 从 [便携整合包发布页](https://github.com/hgmzhn/manga-translator-ui/releases/tag/portable) 下载最新版本并解压到任意目录
 
-### 详细步骤
+### 两个入口脚本
 
-#### 1. 获取安装脚本
+解压后目录中有两个入口脚本，双击即可运行：
 
-- 访问仓库：[https://github.com/hgmzhn/manga-translator-ui](https://github.com/hgmzhn/manga-translator-ui)
-- 下载 [`步骤1-首次安装.bat`](https://github.com/hgmzhn/manga-translator-ui/raw/main/步骤1-首次安装.bat)
-- 保存到你想安装程序的目录（如 `D:\manga-translator-ui\`）
+| 脚本 | 作用 |
+|------|------|
+| `Win-Start.bat` | 启动程序 |
+| `Win-Install-or-Update.bat` | 打开安装/更新维护菜单 |
 
-#### 2. 运行安装脚本
+### 首次安装
 
-双击 `步骤1-首次安装.bat`，脚本会：
+双击 `Win-Install-or-Update.bat`，在维护菜单中选择 **[1] 安装**，流程如下：
 
-**2.1 检测并安装 Miniconda**
-- ✓ 如果系统已有 Python/Conda，直接使用
-- ✗ 如果未安装：
-  - 提供下载源选择：清华大学镜像（国内推荐）或 Anaconda 官方
-  - 自动下载 Miniconda3 安装程序（约 50MB）
-  - 静默安装到：`<项目目录>\Miniconda3`（不占用C盘）
-  - 自动配置环境变量
-  - **注意**：安装完成后需要重新运行脚本（重新加载环境变量）
+1. **选择下载线路**：GitHub 官方 / Gitee / GitCode 镜像（国内推荐）
+2. **强制同步最新代码**：同步失败会提示切换到另一条线路重试
+3. **检测显卡**：自动识别 NVIDIA / AMD / 集显；多显卡时列出让用户选择
+4. **选择 PyTorch 版本**：
+   - **NVIDIA**：按显卡型号、计算能力和驱动自动选择；GeForce 10 系强制 CUDA 12.6，Turing（计算能力 7.5）及更新架构在驱动支持时使用 CUDA 13.0
+   - **AMD**：ROCm（实验性，**仅 RX 7000/9000 系列**）
+   - **其他/集显**：CPU 版本
+5. **uv 高速批量安装依赖**：
+   - PyTorch 走官方源或国内镜像
+   - 其余依赖走 PyPI 多镜像回退：清华 → 阿里 → 豆瓣 → 官方
+   - 安装失败可重试（已装的包会保留，不会重复下载）
+6. **完成后自动清理下载缓存**
 
-**2.2 检测/安装 Git**
-- ✓ 如果系统已有 Git，使用系统 Git
-- ✗ 如果没有 Git，提供两个选项：
-  - **选项 1**（推荐）：自动下载便携版 Git（约 50MB）
-  - **选项 2**：手动安装 Git 后重新运行
+### 维护菜单说明
 
-**2.3 选择下载源**
-- **选项 1**：GitHub 官方源（国外网络）
-- **选项 2**（推荐）：gh-proxy.com 镜像（国内更快）
+维护菜单会自动检测系统语言显示中文或英文，配置持久化在 `packaging\maintenance_config.json`。菜单选项：
 
-**2.4 克隆/更新代码**
-- 如果是首次安装：从 GitHub 克隆代码
-- 如果已有代码：自动更新到最新版本
+- **[1] 安装**：完整安装流程（见上）
+- **[2] 更新**：检查代码（按当前分支比对远程 VERSION 和提交数）+ 依赖（只安装缺失的包）
+- **[3] 切换分支**：main 稳定版 / beta 测试版
+- **[4] 按 tag 切换历史版本**
+- **[5] 切换镜像源**
+- **[6] 重新检查版本**
+- **[7] 切换语言**（中/英）
+- **[8] 退出**
 
-**2.5 创建 Conda 环境**
-- 在项目目录创建 `conda_env` 环境（Python 3.12）
-- 位置：`<项目目录>\conda_env\`
-- **不占用C盘系统空间**，环境在项目目录内
-- 隔离项目依赖，不影响系统
+### 依赖管理说明
 
-**2.6 安装依赖**
-- 自动检测 GPU：
-  - ✓ **NVIDIA 显卡**：
-    - 检测 CUDA 版本
-    - CUDA >= 12: 安装 GPU 版本依赖（requirements_gpu.txt）
-    - CUDA < 12: 提示更新驱动或使用 CPU 版本
-  - ✓ **AMD 显卡**：
-    - 自动识别显卡型号和 gfx 版本
-    - 询问用户确认后安装 AMD ROCm PyTorch（requirements_amd.txt）
-    - **仅支持 RX 7000/9000 系列（RDNA 3/4）**
-    - RX 5000/6000 系列会自动使用 CPU 版本
-  - ✗ **其他显卡/集显**：安装 CPU 版本依赖（requirements_cpu.txt）
-- 使用 `launch.py` 智能安装所有必需的包
+依赖声明在 `pyproject.toml`（`cpu` / `cuda13.0` / `cuda12.6` / `rocm7.2.1` / `metal` 五个互斥 dependency groups），并由 `uv.lock` 锁定版本。便携安装脚本直接把依赖装入自带的 `packaging\python`，**不会创建 `.venv`**；`.venv` 仅用于源码开发。
 
-**2.7 完成安装**
-- 显示安装位置
-- 询问是否立即运行程序
+### 启动程序
 
-### Miniconda 特点
+安装完成后，以后每次使用只需双击 `Win-Start.bat`。
 
-**优势：**
-- ✅ 体积小（约 50MB）
-- ✅ 可管理多个 Python 版本
-- ✅ 环境隔离，互不干扰
-- ✅ 自带 pip 包管理
-- ✅ **完全安装在项目目录，不占用 C 盘系统空间**
+### 更新程序
 
-**目录结构：**
-```
-D:\manga-translator-ui\          # 你选择的安装目录
-├── 步骤1-首次安装.bat            # 安装脚本
-├── 步骤2-启动Qt界面.bat          # 启动脚本
-├── 步骤3-检查更新并启动.bat      # 更新并启动
-├── 步骤4-更新维护.bat            # 维护工具
-├── Miniconda3\                   # Miniconda主程序（约600MB）
-│   ├── python.exe
-│   ├── Scripts\
-│   ├── pkgs\
-│   └── ...
-├── conda_env\                    # 项目虚拟环境（约2-5GB）
-│   ├── python.exe
-│   ├── Scripts\
-│   ├── Lib\
-│   └── ...
-├── PortableGit\                  # 便携版Git（如果下载）
-├── desktop_qt_ui\                # Qt界面源码
-├── manga_translator\             # 核心翻译模块
-└── ...                           # 其他项目文件
-```
+双击 `Win-Install-or-Update.bat`，选择 **[2] 更新** 即可。
 
-#### 3. 启动程序
+### 卸载
 
-安装完成后，以后每次使用只需：
+新版为完全绿色安装，**直接删除整个文件夹即可卸载**。旧版（conda 方式）的卸载请参考 [卸载指南](UNINSTALL.md)。
 
-双击 `步骤2-启动Qt界面.bat`
-
-> **提示**：也可以双击 `步骤3-检查更新并启动.bat` 在启动前自动检查更新
-
-#### 4. 更新程序（可选）
-
-需要更新到最新版本时：
-
-双击 `步骤4-更新维护.bat`，选择"完整更新"
+> 💡 **旧版用户兼容说明**：如果你之前用旧版脚本安装了 Miniconda3 + `manga-env` / `conda_env` 环境，新脚本在找不到打包版 Python 时会自动回退使用旧的 conda 环境，无需重装。
 
 ---
 
-## 安装方式二：下载打包版本
+## 安装方式二：下载已集成发布包
 
-适合不想安装 Python 的用户，但文件较大（约 3-5 GB）。
+适合希望直接解压运行的 Windows 用户。发布包已经包含便携 Python、对应硬件依赖和模型文件，因此下载体积较大。
 
 ### 1. 访问发布页面
 
@@ -170,62 +122,37 @@ D:\manga-translator-ui\          # 你选择的安装目录
 
 ### 2. 选择版本
 
-下载最新版本的安装包：
+- `manga-translator-cpu-vX.Y.Z.7z.001`：兼容性最好，不需要独立显卡。
+- `manga-translator-cuda13.0-vX.Y.Z.7z.001`：适用于 Turing（计算能力 7.5）及更新的 NVIDIA 显卡，并且驱动支持 CUDA 13.0；RTX 50 系列推荐此版本。
+- `manga-translator-cuda12.6-vX.Y.Z.7z.001`：GeForce 10 系列必须选择此版本；也适用于其他需要兼容版本的 NVIDIA 显卡，支持 CUDA 13.0 及以上的驱动可向下兼容运行。
+- `manga-translator-rocm7.2.1-vX.Y.Z.7z.001`：实验性 Radeon ROCm 7.2.1 版本，需要受支持的 AMD 显卡和 AMD 26.2.2 驱动。
 
-**CPU 版本**：
-- 文件名：`manga-translator-cpu-vX.X.X.zip` 或分卷文件
-- 适用范围：所有电脑
-- 优点：无需 GPU，兼容性好
-- 缺点：翻译速度较慢
+> CUDA 13.0 已不支持 Turing 之前的 NVIDIA 架构。GTX 1060/1070/1080 等 GeForce 10 系列不要下载 CUDA 13.0 包，必须使用 CUDA 12.6 包。
 
-**GPU 版本**：
-- 文件名：`manga-translator-gpu-vX.X.X.zip` 或分卷文件
-- 适用范围：拥有 NVIDIA 显卡的电脑
-- 要求：CUDA 12.x 支持
-- 优点：翻译速度快
-- 缺点：需要兼容的 NVIDIA 显卡
+### 3. 分卷解压
 
-### 3. 分卷下载说明
+下载同一版本的全部 `.7z.001`、`.002` 等分卷到同一目录，保持原文件名不变，然后解压 `.001`。缺少任一分卷都会导致解压失败。
 
-如果文件被分成多个压缩包（如 `part1.rar`, `part2.rar`, `part3.rar`...），请按照以下步骤操作：
+### 4. 启动
 
-1. **下载所有分卷**：
-   - 必须下载所有分卷文件到同一文件夹
-   - 例如：`part1.rar`, `part2.rar`, `part3.rar`
+解压后的目录包含：
 
-2. **解压第一个分卷**：
-   - 只需右键点击 `part1.rar`
-   - 选择"解压到..."或"Extract to..."
-   - 其他分卷会自动参与解压
+```text
+manga-translator/
+├── Win-Start.bat
+├── Win-Install-or-Update.bat
+├── packaging/
+│   ├── python/         # Python 3.12 和已安装依赖
+│   └── uv.exe
+├── PortableGit/
+├── models/             # 已安装模型文件
+├── config/
+├── dict/
+├── fonts/
+└── desktop_qt_ui/
+```
 
-3. **注意事项**：
-   - 所有分卷必须在同一目录
-   - 不要重命名分卷文件
-   - 缺少任何一个分卷都会导致解压失败
-
-### 4. 安装步骤
-
-1. **解压文件**：
-   ```
-   将下载的压缩包解压到任意目录
-   例如：D:\manga-translator\
-   ```
-
-2. **检查文件结构**：
-   ```
-   manga-translator/
-   ├── app.exe          # 主程序
-   ├── _internal/       # 依赖文件
-   ├── fonts/           # 字体文件
-   ├── models/          # AI 模型文件
-   └── examples/        # 配置示例
-   ```
-
-3. **运行程序**：
-   - 双击 `app.exe` 启动程序
-   - 首次运行会自动加载模型文件
-
----
+双击 `Win-Start.bat` 启动。需要重新安装依赖或切换版本时运行 `Win-Install-or-Update.bat`。
 
 ## 安装方式三：从源码运行
 
@@ -240,22 +167,35 @@ cd manga-translator-ui
 
 ### 2. 安装依赖
 
-```bash
-# CPU 版本
-pip install -r requirements_cpu.txt
+依赖声明在 `pyproject.toml`。`cpu` / `cuda13.0` / `cuda12.6` / `rocm7.2.1` / `metal` 五个 dependency groups 互斥，只选择一个后端：
 
-# GPU 版本（需要 CUDA 12.x）
-pip install -r requirements_gpu.txt
+```bash
+# NVIDIA CUDA 13.0（源码开发默认）
+uv sync
+
+# NVIDIA CUDA 12.6
+uv sync --no-default-groups --group cuda12.6
+
+# CPU
+uv sync --no-default-groups --group cpu
+
+# Linux AMD ROCm 7.2；Windows 使用安装器提供的 ROCm 7.2.1 流程
+uv sync --no-default-groups --group rocm7.2.1
+
+# Apple Silicon / Metal
+uv sync --no-default-groups --group metal
 ```
+
+> 💡 **pip 用户**：可用 `uv export` 生成 requirements 文件后再用 pip 安装。
 
 ### 3. 运行程序
 
 ```bash
 # 运行 PyQt6 界面
-python -m desktop_qt_ui.main
+uv run --no-sync python -m desktop_qt_ui.main
 
 # 或运行旧版 CustomTkinter 界面
-python -m desktop-ui.main
+uv run --no-sync python -m desktop-ui.main
 ```
 
 ---
@@ -303,7 +243,7 @@ docker run -d --name manga-translator -p 8000:8000 hgmzhn/manga-translator:lates
 | 容器内路径 | 建议程度 | 作用 |
 |-----------|---------|------|
 | `/app/manga_translator/server/data` | 必须 | 统一保存 `admin_config.json`、`user_resources/`、账号、会话、用户组、权限、配额、API Key 预设、用户配置、审计日志、翻译历史索引与 Web 历史结果 |
-| `/app/examples` | 强烈建议 | 保存 `config.json`、`custom_api_params.json`、`filter_list.json` 等会自动生成或被编辑的配置文件 |
+| `/app/config` | 强烈建议 | 保存 `config.json`、`custom_api_params.json`、`filter_list.json` 等会自动生成或被编辑的配置文件 |
 | `/app/dict` | 强烈建议 | 保存术语表、网页端/本地 AI prompt 文件（如 `ai_ocr_prompt.yaml`、`ai_renderer_prompt.yaml`、`ai_colorizer_prompt.yaml`） |
 | `/app/fonts` | 强烈建议 | 保存服务器级字体文件 |
 | `/app/models` | 强烈建议 | 保存下载后的模型文件，避免容器重建后重新下载 |
@@ -335,7 +275,7 @@ services:
       - ./data/models:/app/models
       - ./data/fonts:/app/fonts
       - ./data/dict:/app/dict
-      - ./data/config:/app/examples
+      - ./data/config:/app/config
       - ./data/server:/app/manga_translator/server/data
       - ./data/logs:/app/logs
       - ./data/result:/app/result
@@ -451,7 +391,7 @@ services:
    - **环境变量**：根据需要添加（可选）
    - **挂载目录/文件**：建议至少挂载下面这些路径
      - `宿主机目录 -> /app/manga_translator/server/data`
-     - `宿主机目录 -> /app/examples`
+     - `宿主机目录 -> /app/config`
      - `宿主机目录 -> /app/dict`
      - `宿主机目录 -> /app/fonts`
      - `宿主机目录 -> /app/models`
@@ -486,26 +426,24 @@ services:
 
 ---
 
-## 安装方式五：macOS 原生运行（Apple Silicon）
+## 安装方式五：Linux/macOS 原生运行
 
-专为搭载 Apple Silicon (M1/M2/M3/M4) 芯片的 Mac 设备设计，利用 MPS (Metal Performance Shaders) 提供原生 GPU 加速。
+Linux/macOS 共用同一套安装脚本。Apple Silicon 使用 MPS (Metal Performance Shaders)，Linux 根据设备选择 NVIDIA、AMD ROCm 或 CPU 依赖组。
 
 ### 系统要求
 
-- **硬件**：Mac 电脑 (M1/M2/M3/M4 芯片，Intel Mac 也可运行但使用 CPU 模式)
-- **系统**：macOS 12.0 或更高版本
-- **软件**：Xcode Command Line Tools（脚本会自动检查并提示安装）
+- **硬件**：Linux x86_64 或 macOS；Intel Mac 使用 CPU 模式
+- **系统**：Linux；macOS 12.0 或更高版本
+- **软件**：Git 和 `uv`（脚本会自动安装 `uv`）
 
 ### 脚本说明
 
-项目提供了 4 个 macOS 专用脚本，对应 Windows 的批处理脚本：
+Linux 和 macOS 共用 2 个脚本，对应 Windows 的两个批处理脚本：
 
 | 脚本文件 | 说明 | 对应 Windows |
 |---------|------|-------------|
-| `macOS_1_首次安装.sh` | 首次环境配置、代码克隆、Miniforge 安装、依赖安装 | 步骤1-首次安装.bat |
-| `macOS_2_启动Qt界面.sh` | 启动图形界面 | 步骤2-启动Qt界面.bat |
-| `macOS_3_检查更新并启动.sh` | 检查版本更新后启动 | 步骤3-检查更新并启动.bat |
-| `macOS_4_更新维护.sh` | 运行维护菜单（更新代码、更新依赖、清理缓存等） | 步骤4-更新维护.bat |
+| `Unix-Install-or-Update.sh` | 开头确认一次后，引导 Git、uv、Python 3.12 和 `packaging`，然后直接进入双语安装/更新菜单 | Win-Install-or-Update.bat |
+| `Unix-Start.sh` | 启动图形界面 | Win-Start.bat |
 
 ### 安装步骤
 
@@ -515,22 +453,23 @@ services:
 
 ```bash
 # 1. 下载安装脚本
-curl -O https://raw.githubusercontent.com/hgmzhn/manga-translator-ui/main/macOS_1_首次安装.sh
+curl -O https://raw.githubusercontent.com/hgmzhn/manga-translator-ui/main/Unix-Install-or-Update.sh
 
 # 2. 赋予执行权限
-chmod +x macOS_1_首次安装.sh
+chmod +x Unix-Install-or-Update.sh
 
 # 3. 运行安装
-./macOS_1_首次安装.sh
+./Unix-Install-or-Update.sh
 ```
 
 脚本会自动完成：
-- 检查并提示安装 Xcode Command Line Tools（包含 Git）
+- 检查 Git
 - 克隆项目代码
-- 检测并安装 Miniforge（如未安装）
-- 创建独立的 `manga-env` 虚拟环境（Python 3.12）
-- 安装所有依赖（使用 `requirements_metal.txt`）
-- 配置 MPS GPU 加速
+- 使用 `uv` 安装 Python 3.12
+- 创建项目本地 `.venv`
+- 进入双语 Python 菜单，由 `launch.py` 选择并安装 `cpu`、`cuda13.0`、`cuda12.6`、`rocm7.2.1` 或 `metal`
+
+启动时仅会询问一次 `Start installation now? [Y/n]`；正常确认后，初始化过程不会再次要求确认，完成即进入双语菜单。
 
 **方式二：手动克隆**
 
@@ -542,10 +481,10 @@ git clone https://github.com/hgmzhn/manga-translator-ui.git
 cd manga-translator-ui
 
 # 2. 赋予执行权限
-chmod +x macOS_*.sh
+chmod +x Unix-*.sh
 
 # 3. 运行安装
-./macOS_1_首次安装.sh
+./Unix-Install-or-Update.sh
 ```
 
 ### 验证与启动
@@ -554,23 +493,14 @@ chmod +x macOS_*.sh
 
 - **正常启动**：
   ```bash
-  ./macOS_2_启动Qt界面.sh
+  ./Unix-Start.sh
   ```
 
-- **检查更新并启动**：
+- **更新代码和依赖**：
   ```bash
-  ./macOS_3_检查更新并启动.sh
+  ./Unix-Install-or-Update.sh
+  # 在 Python 菜单中选择 [2] 更新
   ```
-
-- **更新维护**：
-  ```bash
-  ./macOS_4_更新维护.sh
-  ```
-  维护菜单提供：
-  - 更新代码（强制同步到远程）
-  - 更新/安装依赖
-  - 完整更新（代码+依赖）
-  - 修复模式（重装所有依赖）
 
 ### 常见问题
 
@@ -578,10 +508,10 @@ chmod +x macOS_*.sh
 A: 约 10-20 分钟，取决于网络速度。需要下载约 2GB 的依赖包。
 
 **Q: Intel Mac 可以使用吗？**
-A: 可以，脚本会自动检测并使用 Intel 版本的 Miniforge，但只能使用 CPU 模式（无 MPS 加速）。
+A: 可以，脚本会使用项目本地的 `uv` 环境；Intel Mac 会使用 CPU 模式，Apple Silicon 会使用 Metal/MPS。
 
 **Q: 如何更新到最新版本？**
-A: 运行 `./macOS_4_更新维护.sh`，选择"完整更新"即可。
+A: 运行 `./Unix-Install-or-Update.sh`，在 Python 菜单中选择 [2] 更新。
 
 ---
 
@@ -589,8 +519,7 @@ A: 运行 `./macOS_4_更新维护.sh`，选择"完整更新"即可。
 
 ### 1. 启动程序
 
-双击 `app.exe`，程序会自动：
-- 加载 AI 模型（首次运行需要几分钟）
+双击 `Win-Start.bat`，程序会直接使用包内依赖和模型文件：
 - 初始化翻译引擎
 - 打开主界面
 
@@ -627,7 +556,7 @@ A: 运行 `./macOS_4_更新维护.sh`，选择"完整更新"即可。
 - **方式 2**：点击"添加文件夹"按钮选择文件夹
 - **方式 3**：直接拖拽图片到窗口
 
-支持的图片格式：`.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`
+支持的图片格式：`.png`, `.jpg`, `.jpeg`, `.jfif`, `.webp`, `.avif`, `.bmp`, `.tiff`, `.tif`, `.heic`, `.heif`
 
 ### 6. 开始翻译
 
@@ -642,12 +571,12 @@ A: 运行 `./macOS_4_更新维护.sh`，选择"完整更新"即可。
 
 ### 程序无法启动
 
-**问题**：双击 `app.exe` 没有反应或闪退
+**问题**：双击 `Win-Start.bat` 没有反应或闪退
 
 **解决方法**：
-1. 检查是否解压了所有文件（不要直接在压缩包中运行）
+1. 检查是否解压了所有分卷（不要直接在压缩包中运行）
 2. 检查杀毒软件是否拦截了程序
-3. 以管理员身份运行 `app.exe`
+3. 运行 `Win-Install-or-Update.bat` 检查依赖
 4. 查看 `logs/error.log` 文件
 
 ### 缺少 DLL 文件
@@ -664,9 +593,9 @@ A: 运行 `./macOS_4_更新维护.sh`，选择"完整更新"即可。
 **问题**：GPU 版本运行时崩溃或报错
 
 **解决方法**：
-1. 确认显卡支持 CUDA 12.x
+1. 确认版本匹配：GeForce 10 系必须使用 CUDA 12.6；CUDA 13.0 需要 Turing（计算能力 7.5）及更新架构和支持 CUDA 13.0 的驱动
 2. 安装或更新 NVIDIA 显卡驱动
-3. 下载并安装 [CUDA Toolkit 12.x](https://developer.nvidia.com/cuda-downloads)
+3. 如需开发工具链，下载并安装 [CUDA Toolkit 12.x](https://developer.nvidia.com/cuda-downloads)
 4. 如果仍然失败，使用 CPU 版本
 
 ### 翻译失败
@@ -703,4 +632,3 @@ A: 运行 `./macOS_4_更新维护.sh`，选择"完整更新"即可。
 ---
 
 返回 [主页](../README.md)
-

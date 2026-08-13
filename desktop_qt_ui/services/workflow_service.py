@@ -8,11 +8,21 @@ from typing import List, Tuple
 
 # 添加项目根目录到路径以便导入path_manager
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+from manga_translator.image_formats import (
+    IMAGE_FILE_GLOB_PATTERNS,
+    SUPPORTED_IMAGE_EXTENSIONS,
+)
+from manga_translator.runtime_paths import get_application_dir, get_config_path
 from manga_translator.utils.path_manager import (
     find_json_path,
     find_txt_files,
     get_original_txt_path,
     get_translated_txt_path,
+)
+from manga_translator.utils.translation_template import (
+    ensure_translation_template_exists,
+    get_translation_output_format,
+    parse_translation_template_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -175,7 +185,11 @@ def parse_template(template_string: str):
     Parses a free-form text template to find prefix, suffix, item_template, and separator.
     An 'item' is defined as a line containing the <original> placeholder.
     """
-    logger.debug(f"Parsing template:\n---\n{template_string[:200]}...\n---")
+    output_format, template_string = parse_translation_template_config(template_string)
+    logger.debug(
+        f"Parsing template (output_format={output_format}):\n---\n"
+        f"{template_string[:200]}...\n---"
+    )
     # Find all lines containing <original>
     lines = template_string.splitlines(True) # Keep endings to preserve original spacing
     item_line_indices = [i for i, line in enumerate(lines) if "<original>" in line]
@@ -261,6 +275,33 @@ def parse_template(template_string: str):
     logger.debug(f"Separator spaces: {separator.count(' ')}")
     return prefix, item_template, separator, suffix
 
+
+def _load_template_definition(template_path: str = None):
+    """统一加载输出格式与占位符模板；所有扩展名共用同一套解析逻辑。"""
+    output_format = get_translation_output_format(template_path)
+    if not template_path or not os.path.exists(template_path):
+        return output_format, None
+
+    with open(template_path, 'r', encoding='utf-8') as f:
+        template_string = f.read()
+    return output_format, parse_template(template_string)
+
+
+def _render_template_items(items, template_parts, fallback_field: str) -> str:
+    if template_parts is None:
+        return '\n'.join(item[fallback_field] for item in items)
+
+    prefix, item_template, separator, suffix = template_parts
+    if not items:
+        return prefix + suffix
+
+    formatted_items = []
+    for item in items:
+        formatted_item = item_template.replace('<original>', item['original'])
+        formatted_item = formatted_item.replace('<translated>', item['translated'])
+        formatted_items.append(formatted_item)
+    return prefix + separator.join(formatted_items) + suffix
+
 def generate_original_text(
     detailed_json_path: str,
     template_path: str = None,
@@ -298,10 +339,18 @@ def generate_original_text(
                 'original': original_text,
                 'translated': translated_text if translated_text else original_text  # 如果translation为空，使用原文作为占位符
             })
+
+    try:
+        output_format, template_parts = _load_template_definition(template_path)
+    except Exception as e:
+        return f"Error reading template file: {e}"
     
     # 记录是否有文本
     if not items:
-        logger.info(f"No text regions found in {detailed_json_path}, will create empty TXT file")
+        logger.info(
+            f"No text regions found in {detailed_json_path}, "
+            f"will create empty .{output_format} file"
+        )
 
     # 生成输出路径
     if output_path is None:
@@ -315,44 +364,28 @@ def generate_original_text(
             work_dir = os.path.dirname(json_dir)
             image_dir = os.path.dirname(work_dir)
             image_name = json_basename.replace('_translations.json', '')
-            # 尝试常见图片扩展名
-            for ext in ['.jpg', '.png', '.jpeg', '.webp', '.avif']:
+            for ext in SUPPORTED_IMAGE_EXTENSIONS:
                 image_path = os.path.join(image_dir, image_name + ext)
                 if os.path.exists(image_path):
-                    output_path = get_original_txt_path(image_path)
+                    output_path = get_original_txt_path(
+                        image_path,
+                        output_format=output_format,
+                    )
                     break
             if output_path is None:
                 # 如果找不到图片，使用JSON同目录
-                output_path = os.path.splitext(detailed_json_path)[0] + '_original.txt'
+                output_path = os.path.splitext(detailed_json_path)[0] + f'_original.{output_format}'
         else:
             # 旧格式，使用JSON同目录
-            output_path = os.path.splitext(detailed_json_path)[0] + '_original.txt'
+            output_path = os.path.splitext(detailed_json_path)[0] + f'_original.{output_format}'
 
     # 使用模板格式化输出
     try:
-        # 如果没有文本，创建空文件
-        if not items:
-            output_content = ""
-        elif template_path and os.path.exists(template_path):
-            with open(template_path, 'r', encoding='utf-8') as f:
-                template_string = f.read()
-            prefix, item_template, separator, suffix = parse_template(template_string)
-
-            # 格式化每个条目
-            formatted_items = []
-            for i, item in enumerate(items):
-                # 直接替换，不添加额外的引号（模板中已经有引号了）
-                formatted_item = item_template.replace('<original>', item['original'])
-                formatted_item = formatted_item.replace('<translated>', item['translated'])
-                formatted_items.append(formatted_item)
-                # 记录所有条目
-                logger.debug(f"Item {i}: original='{item['original']}', translated='{item['translated']}', formatted='{formatted_item}'")
-
-            # 组合最终输出
-            output_content = prefix + separator.join(formatted_items) + suffix
-        else:
-            # 没有模板，使用简单格式
-            output_content = '\n'.join([item['original'] for item in items])
+        output_content = _render_template_items(
+            items,
+            template_parts,
+            fallback_field='original',
+        )
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with open(output_path, 'w', encoding='utf-8') as f:
@@ -402,6 +435,11 @@ def generate_translated_text(
                 'translated': translated_text  # 导出翻译时，翻译字段是真正的翻译
             })
 
+    try:
+        output_format, template_parts = _load_template_definition(template_path)
+    except Exception as e:
+        return f"Error reading template file: {e}"
+
     # 生成输出路径
     if output_path is None:
         # 从JSON路径推断图片路径
@@ -414,42 +452,28 @@ def generate_translated_text(
             work_dir = os.path.dirname(json_dir)
             image_dir = os.path.dirname(work_dir)
             image_name = json_basename.replace('_translations.json', '')
-            # 尝试常见图片扩展名
-            for ext in ['.jpg', '.png', '.jpeg', '.webp', '.avif']:
+            for ext in SUPPORTED_IMAGE_EXTENSIONS:
                 image_path = os.path.join(image_dir, image_name + ext)
                 if os.path.exists(image_path):
-                    output_path = get_translated_txt_path(image_path)
+                    output_path = get_translated_txt_path(
+                        image_path,
+                        output_format=output_format,
+                    )
                     break
             if output_path is None:
                 # 如果找不到图片，使用JSON同目录
-                output_path = os.path.splitext(detailed_json_path)[0] + '_translated.txt'
+                output_path = os.path.splitext(detailed_json_path)[0] + f'_translated.{output_format}'
         else:
             # 旧格式，使用JSON同目录
-            output_path = os.path.splitext(detailed_json_path)[0] + '_translated.txt'
+            output_path = os.path.splitext(detailed_json_path)[0] + f'_translated.{output_format}'
 
     # 使用模板格式化输出
     try:
-        # 如果没有文本，创建空文件
-        if not items:
-            output_content = ""
-        elif template_path and os.path.exists(template_path):
-            with open(template_path, 'r', encoding='utf-8') as f:
-                template_string = f.read()
-            prefix, item_template, separator, suffix = parse_template(template_string)
-
-            # 格式化每个条目
-            formatted_items = []
-            for item in items:
-                # 直接替换，不添加额外的引号（模板中已经有引号了）
-                formatted_item = item_template.replace('<original>', item['original'])
-                formatted_item = formatted_item.replace('<translated>', item['translated'])
-                formatted_items.append(formatted_item)
-
-            # 组合最终输出
-            output_content = prefix + separator.join(formatted_items) + suffix
-        else:
-            # 没有模板，使用简单格式
-            output_content = '\n'.join([item['translated'] for item in items])
+        output_content = _render_template_items(
+            items,
+            template_parts,
+            fallback_field='translated',
+        )
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with open(output_path, 'w', encoding='utf-8') as f:
@@ -492,13 +516,7 @@ def get_template_path_from_config(custom_path: str = None) -> str:
     Returns:
         str: 最终使用的模板路径
     """
-    import sys
-
-    # Define base_path for resolving relative paths, works for dev and for PyInstaller
-    try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+    base_path = get_application_dir()
 
     # 优先级: 用户指定 > 环境变量 > 默认路径
     if custom_path:
@@ -643,53 +661,14 @@ def import_with_custom_template(
         return f"导入过程中出错: {e}"
 
 
-def resource_path(relative_path):
-    """ Get absolute path to resource, works for dev and for PyInstaller """
-    import os
-    import sys
-    try:
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-    return os.path.join(base_path, relative_path)
-
 def get_default_template_path() -> str:
     """获取默认模板文件路径"""
-    return resource_path(os.path.join("examples", "translation_template.json"))
+    return get_config_path("translation_template.json")
 
 
 def ensure_default_template_exists() -> str:
-    """
-    确保默认模板文件存在，如果不存在则自动创建
-    
-    Returns:
-        str: 模板文件路径
-    """
-    template_path = get_default_template_path()
-    
-    if not os.path.exists(template_path):
-        # 创建目录（如果不存在）
-        template_dir = os.path.dirname(template_path)
-        os.makedirs(template_dir, exist_ok=True)
-        
-        # 创建默认模板内容
-        default_template_content = '''翻译模板文件
-
-原文: <original>
-译文: <translated>
-
-'''
-        
-        try:
-            with open(template_path, 'w', encoding='utf-8') as f:
-                f.write(default_template_content)
-            logger.info(f"Created default template at: {template_path}")
-        except Exception as e:
-            logger.error(f"Failed to create default template: {e}")
-            return None
-    
-    return template_path
+    """确保默认模板存在，并复用核心层的统一默认内容。"""
+    return ensure_translation_template_exists()
 
 
 def smart_update_translations_from_images(
@@ -779,11 +758,9 @@ def auto_detect_and_update_translations(
         if os.path.isdir(directory_or_files):
             import glob
             
-            # 常见图片格式
-            image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tiff', '*.webp', '*.avif', '*.heic', '*.heif']
             image_files = []
             
-            for ext in image_extensions:
+            for ext in IMAGE_FILE_GLOB_PATTERNS:
                 pattern = os.path.join(directory_or_files, "**", ext)
                 image_files.extend(glob.glob(pattern, recursive=True))
                 # 也搜索大写扩展名
@@ -817,6 +794,19 @@ def _load_large_json_optimized(json_file_path: str):
         logger.warning("ijson不可用，使用标准方法读取大文件")
         with open(json_file_path, 'r', encoding='utf-8') as f:
             return json.load(f)
+
+def _strip_legacy_horizontal_tags(text):
+    """剥除已废除的 <H>...</H> 局部横排标记（保留内文）。
+
+    渲染管线已删除全部 <H> 消费方，字面标记会被当普通字符画上成品图；
+    局部横排改用富文本 tcy（旧 <H> 协议已废除）。
+    """
+    if not isinstance(text, str):
+        return text
+    if '<H>' not in text and '</H>' not in text:
+        return text
+    return text.replace('<H>', '').replace('</H>', '')
+
 
 def safe_update_large_json_from_text(
     text_file_path: str,
@@ -988,11 +978,14 @@ def safe_update_large_json_from_text(
             # 首先尝试精确匹配
             if original_text in translations:
                 old_translation = region.get('translation', '')
-                new_translation = translations[original_text]
+                new_translation = _strip_legacy_horizontal_tags(translations[original_text])
 
                 # 总是更新translation字段，即使原文和译文相同
                 if old_translation != new_translation:
                     region['translation'] = new_translation
+                    # 写纯文本译文必须同步失效富文本文档（渲染时 rich 优先，
+                    # 不清会导致成图渲染旧译文；与 editor_controller 写入姿势一致）
+                    region.pop('translation_rich', None)
                     updated_count += 1
                     logger.debug(f"更新翻译: '{original_text[:30]}...' -> '{new_translation[:30]}...'")
             else:
@@ -1002,13 +995,15 @@ def safe_update_large_json_from_text(
                 if normalized in normalized_to_original:
                     matched_original = normalized_to_original[normalized]
                     old_translation = region.get('translation', '')
-                    new_translation = translations[matched_original]
+                    new_translation = _strip_legacy_horizontal_tags(translations[matched_original])
 
                     logger.debug(f"模糊匹配成功: '{original_text}' -> '{matched_original}', old='{old_translation}', new='{new_translation}'")
 
                     # 总是更新translation字段，即使原文和译文相同
                     if old_translation != new_translation:
                         region['translation'] = new_translation
+                        # 同上：写 translation 时同步 pop translation_rich
+                        region.pop('translation_rich', None)
                         updated_count += 1
                 else:
                     logger.debug(f"模糊匹配也失败: '{normalized}' not in normalized_to_original")
@@ -1171,9 +1166,8 @@ def batch_update_directory_translations(
             image_dir = os.path.dirname(work_dir)
             image_name = json_basename.replace('_translations.json', '')
 
-            # 尝试常见图片扩展名
             image_path = None
-            for ext in ['.jpg', '.png', '.jpeg', '.webp', '.avif']:
+            for ext in SUPPORTED_IMAGE_EXTENSIONS:
                 candidate = os.path.join(image_dir, image_name + ext)
                 if os.path.exists(candidate):
                     image_path = candidate
@@ -1206,10 +1200,3 @@ def batch_update_directory_translations(
     summary = f"批量更新完成 (处理: {successful}/{total}):\n" + "\n".join(results)
     logger.debug(f"Batch update summary:\n{summary}")
     return summary
-
-
-
-
-
-
-

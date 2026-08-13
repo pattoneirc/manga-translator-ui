@@ -1,0 +1,34 @@
+# 卸载指南
+
+## 新版（便携版，目录里有 `packaging\python`）
+
+新版是完全绿色的：Python、依赖、缓存全部在本文件夹内，不写注册表、不装服务。
+
+**卸载 = 直接删除整个文件夹。** 没有其他步骤。
+
+可选清理（无害残留，不清也没影响）：
+
+| 残留内容 | 位置 | 清理方式 |
+|---|---|---|
+| AI 模型缓存 | `C:\Users\<你>\.cache\huggingface`、`.cache\torch` | 直接删除对应文件夹 |
+| git 安全目录记录 | `C:\Users\<你>\.gitconfig` 中的一行 | `git config --global --unset-all safe.directory` |
+
+## 旧版（Conda 版，目录里有 `Miniconda3` 或用过 `步骤1-首次安装.bat`）
+
+按顺序做两步：
+
+### 1. 卸载 Miniconda
+
+- **如果 Miniconda3 是安装脚本装的**（在本程序目录里，或磁盘根目录如 `D:\Miniconda3`）：
+  打开 `Miniconda3` 文件夹，**双击运行 `Uninstall-Miniconda3.exe`**，按提示完成卸载
+  （它会自动清理注册表、环境变量和开始菜单项，环境 `manga-env` 也会一并删除）。
+  卸载完如果 `Miniconda3` 文件夹还有残留，直接删掉即可。
+- **如果你是自己单独安装的 Miniconda 且还要继续用**：
+  不要卸载，只删除本程序的环境即可，在命令行执行：
+  ```
+  conda env remove -n manga-env -y
+  ```
+
+### 2. 删除整个程序文件夹
+
+Miniconda 处理完后，把整个程序文件夹（含 `PortableGit`、代码、脚本）直接删除即可。

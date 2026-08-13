@@ -7,8 +7,10 @@ from typing import Any, Dict, List
 
 from google.genai import types
 
+from ..api_request_params import apply_gemini_sdk_generation_params
 from ..api_key_rotation import APIRotationExhaustedError, run_with_api_candidates
 from ..runtime_api_resolver import resolve_runtime_api_config
+from ..utils.dotenv_utils import load_app_dotenv
 from .common import (
     VALID_LANGUAGES,
     AsyncGeminiCurlCffi,
@@ -56,8 +58,7 @@ class GeminiTranslator(CommonTranslator):
         # 只在非Web环境下重新加载.env文件
         is_web_server = os.getenv('MANGA_TRANSLATOR_WEB_SERVER', 'false').lower() == 'true'
         if not is_web_server:
-            from dotenv import load_dotenv
-            load_dotenv(override=True)
+            load_app_dotenv(override=True)
         
         self.api_key = os.getenv(self.API_KEY_ENV, '')
         self.base_url = os.getenv(self.API_BASE_ENV, self.DEFAULT_BASE_URL) if self.API_BASE_ENV else self.DEFAULT_BASE_URL
@@ -295,8 +296,7 @@ class GeminiTranslator(CommonTranslator):
             self._setup_client()
         
         if not self.client:
-            self.logger.error("Gemini客户端初始化失败")
-            return texts
+            raise RuntimeError("Gemini客户端初始化失败：请检查 GEMINI_API_KEY / GEMINI_API_BASE / GEMINI_MODEL 配置")
         
         # 初始化重试信息
         retry_attempt = 0
@@ -346,8 +346,7 @@ class GeminiTranslator(CommonTranslator):
                 self._setup_client(system_instruction=None)
             
             if not self.client:
-                self.logger.error("Gemini客户端初始化失败")
-                return texts
+                raise RuntimeError("Gemini客户端初始化失败：请检查 GEMINI_API_KEY / GEMINI_API_BASE / GEMINI_MODEL 配置")
             
             # 构建用户提示词
             # 如果加载了 HQ Prompt，_build_user_prompt (即 _build_user_prompt_for_texts) 会生成 JSON 格式的输入，与 System Prompt 匹配
@@ -365,16 +364,6 @@ class GeminiTranslator(CommonTranslator):
             if self.max_tokens is not None:
                 config_params["max_output_tokens"] = self.max_tokens
             
-            generation_config = types.GenerateContentConfig(**config_params)
-            generation_config.system_instruction = system_instruction
-            
-            # 合并自定义API参数
-            if self._custom_api_params:
-                for key, value in self._custom_api_params.items():
-                    if hasattr(generation_config, key):
-                        setattr(generation_config, key, value)
-
-
             try:
                 # RPM限制
                 if self._MAX_REQUESTS_PER_MINUTE > 0:
@@ -406,6 +395,12 @@ class GeminiTranslator(CommonTranslator):
                     streamed_text = None
                     streamed_finish_reason = None
                     streamed_diagnostics = None
+                    generation_config = types.GenerateContentConfig(**config_params)
+                    generation_config.system_instruction = system_instruction
+                    custom_api_params = self._resolve_translator_custom_api_params(self.model_name)
+                    apply_gemini_sdk_generation_params(generation_config, custom_api_params)
+                    if custom_api_params:
+                        self.logger.debug(f"使用翻译模型预设参数: {custom_api_params}")
                     if use_streaming:
                         try:
                             self._reset_stream_json_preview()
@@ -649,7 +644,7 @@ class GeminiTranslator(CommonTranslator):
                 
                 await self._sleep_with_cancel_polling(1)
         
-        return texts
+        raise last_exception if last_exception else RuntimeError("Gemini translation failed without a response")
 
     async def _translate(self, from_lang: str, to_lang: str, queries: List[str], ctx=None) -> List[str]:
         """主翻译方法"""

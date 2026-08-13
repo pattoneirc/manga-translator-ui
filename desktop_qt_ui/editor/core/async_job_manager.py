@@ -66,7 +66,6 @@ class AsyncJobManager:
 
             self._loop.set_exception_handler(handle_loop_exception)
             self._running = True
-            self.logger.info("AsyncJobManager event loop started")
             try:
                 self._loop.run_forever()
             finally:
@@ -78,7 +77,6 @@ class AsyncJobManager:
                 finally:
                     asyncio.set_event_loop(None)
                     self._running = False
-                    self.logger.info("AsyncJobManager event loop stopped")
         
         self._thread = threading.Thread(target=run_loop, daemon=True)
         self._thread.start()
@@ -153,7 +151,6 @@ class AsyncJobManager:
         if not self._running:
             return
         
-        self.logger.info("Shutting down AsyncJobManager")
         self._stopping = True
         
         if not wait:
@@ -185,12 +182,15 @@ class AsyncJobManager:
         self._running = False
         self._stopping = False
 
-        self.logger.info("AsyncJobManager shutdown complete")
     
     def __del__(self):
-        """析构函数"""
+        """析构函数。
+
+        解释器退出期对象可能处于半初始化状态（__init__ 中途失败）或依赖的
+        模块已被清理，全部防御式访问，绝不让异常从 __del__ 泄漏。"""
         try:
-            self.shutdown(wait=False)
+            if getattr(self, "_running", False):
+                self.shutdown(wait=False)
         except Exception:
             # 忽略析构时的错误
             pass

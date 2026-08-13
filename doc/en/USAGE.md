@@ -114,7 +114,7 @@ You can add input pages in three ways:
    - Drag images or folders directly into the file list
    - Multiple items are supported
 
-**Supported formats**: `.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`
+**Supported formats**: `.png`, `.jpg`, `.jpeg`, `.jfif`, `.webp`, `.avif`, `.bmp`, `.tiff`, `.tif`, `.heic`, `.heif`
 
 ### Choose a translator
 
@@ -346,13 +346,10 @@ Notes:
 
 ### Font management
 
-The app automatically loads fonts from the `fonts` directory.
-
-You can also open `Font Management` to:
-
-- `Import` new fonts
-- Preview fonts
-- Use `Apply Selected Font`
+Install the desired font in the operating system, or copy a `.ttf`, `.otf`, or
+`.ttc` file into the project `fonts` directory. Then select it from `Settings`
+-> `Typesetting` -> `Font`. Use `Open Directory` beside the selector to access
+the project directory; reopen the dropdown to refresh the combined font list.
 
 ### Prompt management
 
@@ -380,7 +377,7 @@ Relevant UI entries:
 
 Storage:
 
-- `examples/filter_list.json`
+- `config/filter_list.json`
 
 Two filter modes:
 
@@ -416,9 +413,10 @@ If you want to adjust the result after translation:
 
 Shortcuts:
 
-- `Q`: selection tool
-- `W`: brush tool
-- `E`: eraser tool
+- `1` / `2` / `3`: switch the Mask / Paint / Clone Stamp tab
+- `Q`: choose the first tool (No Selection) on the current tab
+- `W`: choose the second tool (Brush or Clone Stamp) on the current tab
+- `E`: choose the third tool (Eraser) on the current tab
 
 **Text actions**
 
@@ -426,7 +424,6 @@ Shortcuts:
 - `Translate`
 - `Placeholder`
 - `Newline↵`
-- `Horizontal⇄`
 
 **Property area**
 
@@ -473,7 +470,7 @@ The right panel is `Property Editor`, where you can edit:
 - `Shift + wheel`: change mask brush size
 - plain wheel: zoom the view
 
-> 💡 Single-key shortcuts such as `A`, `D`, `Q`, `W`, and `E` are context-aware. If focus is inside a text input, those keys type normally instead of triggering tool switches.
+> 💡 Single-key shortcuts such as `A`, `D`, `1`, `2`, `3`, `Q`, `W`, and `E` are context-aware. If focus is inside a text input, those keys type normally instead of triggering tab, tool, or image switches.
 
 **Editor-related details** → [./FEATURES.md](./FEATURES.md)
 
@@ -524,7 +521,8 @@ Detailed debug reference:
 
 Try this:
 
-1. Check whether the GPU supports CUDA 12.x
+1. Check whether the GPU and driver support CUDA 13.0 by default, or CUDA 12.6 for the alternate package
+   - RTX 50 series cards must use the NVIDIA GPU build
 2. Update the NVIDIA driver
 3. Enable `Disable ONNX GPU Acceleration` in `Settings` -> `General`
 4. Fall back to the CPU build if the machine is not compatible

@@ -7,11 +7,11 @@ This document provides detailed installation steps, system requirements, first-r
 ## 📋 Table of Contents
 
 - [System Requirements](#system-requirements)
-- [Method 1: Install Script](#method-1-install-script)
+- [Method 1: Portable Installer](#method-1-portable-installer)
 - [Method 2: Packaged Release](#method-2-packaged-release)
 - [Method 3: Run from Source](#method-3-run-from-source)
 - [Method 4: Docker Deployment](#method-4-docker-deployment)
-- [Method 5: Native macOS Run Apple Silicon](#method-5-native-macos-run-apple-silicon)
+- [Method 5: Native Linux/macOS Run](#method-5-native-linuxmacos-run)
 - [First Run](#first-run)
 - [Troubleshooting](#troubleshooting)
 - [Next Steps](#next-steps)
@@ -31,147 +31,92 @@ This document provides detailed installation steps, system requirements, first-r
 
 - **Memory**: 16 GB RAM or more
 - **GPU**:
-  - **NVIDIA GPU**: CUDA 12.x compatible, driver `>= 525.60.13`
+  - **NVIDIA GPU**: GeForce 10-series GPUs must use CUDA 12.6; CUDA 13.0 requires Turing (compute capability 7.5) or newer. Drivers supporting CUDA 13.0 or newer can also run the CUDA 12.6 build
     - Recommended VRAM: 6 GB or more
     - Typical supported class: GTX 1060 and above
+    - RTX 20/30/40/50-series GPUs may use CUDA 13.0 when the driver supports it; CUDA 13.0 is recommended for RTX 50-series GPUs
   - **AMD GPU**: ROCm support is experimental
     - Supported cards: **RX 7000 / 9000 only**
     - ⚠️ RX 5000 / 6000 should use the CPU build
-    - ⚠️ AMD GPU is supported through the install-script path, not the packaged release
+    - ⚠️ Windows AMD can use the experimental AMD portable release or the maintenance installer; a supported GPU and AMD driver 26.2.2 are required
     - ⚠️ ROCm support on Windows is limited. Linux usually works better
 - **Storage**: SSD with 10 GB or more free space
 
 ---
 
-## Method 1: Install Script
+## Method 1: Portable Installer
 
-This is the recommended path for Windows users. It handles environment setup automatically and supports later updates.
+This is the recommended path for Windows users. Download the portable installer package from GitHub Releases, extract it, and it is ready to use. The package ships with a bundled Python 3.12 (`packaging\python\python.exe`) and the uv package manager (`packaging\uv.exe`). It is fully portable: no registry writes and **no Python pre-install required**.
 
-> ⚠️ **Network note**: the installer downloads code from GitHub. If your network is unstable, use a proxy or a faster mirror.
->
-> 💡 **No Python pre-install required**: the script can install Miniconda automatically.
+> ⚠️ **Network note**: installation downloads code and dependencies. Users in mainland China can pick the Gitee mirror and domestic PyPI mirrors from the menu.
 
 ### Prerequisites
 
-- **No Python pre-install needed**
-- **Git is optional**: the script can download a portable Git build for you
+- **No Python pre-install needed**: bundled Python 3.12 and uv are included
+- Download the latest version from the [Portable Package release page](https://github.com/hgmzhn/manga-translator-ui/releases/tag/portable) and extract it to any folder
 
-### Detailed Steps
+### Two entry scripts
 
-#### 1. Get the install script
+After extraction, the folder contains two entry scripts. Just double-click them:
 
-- Visit the repository: [https://github.com/hgmzhn/manga-translator-ui](https://github.com/hgmzhn/manga-translator-ui)
-- Download [`步骤1-首次安装.bat`](https://github.com/hgmzhn/manga-translator-ui/raw/main/步骤1-首次安装.bat)
-- Save it into the folder where you want the app installed, for example `D:\manga-translator-ui\`
+| Script | Purpose |
+|------|------|
+| `Win-Start.bat` | Start the program |
+| `Win-Install-or-Update.bat` | Open the install / update maintenance menu |
 
-#### 2. Run the install script
+### First-time install
 
-Double-click `步骤1-首次安装.bat`.
+Double-click `Win-Install-or-Update.bat` and choose **[1] Install** in the maintenance menu. The flow is:
 
-The script will:
+1. **Choose a download route**: GitHub official / Gitee mirror (recommended in mainland China)
+2. **Force-sync the latest code**: after a successful sync, the maintenance launcher reloads the updated code before continuing
+3. **GPU detection**: automatically detects NVIDIA / AMD / integrated graphics; with multiple GPUs you get a list to pick from
+4. **Choose a PyTorch build**:
+   - **NVIDIA**: selected automatically from the GPU model, compute capability, and driver; GeForce 10-series GPUs are forced to CUDA 12.6, while Turing (compute capability 7.5) or newer uses CUDA 13.0 when supported by the driver
+   - **AMD**: ROCm, experimental, **RX 7000 / 9000 series only**
+   - **Other / integrated graphics**: CPU build
+5. **Fast batch dependency install with uv**:
+   - PyTorch comes from the official source or a domestic mirror
+   - Everything else uses PyPI with mirror fallback: Tsinghua → Aliyun → Douban → official
+   - Failed installs can be retried; already-installed packages are kept
+6. **Download caches are cleaned up automatically** when finished
 
-**2.1 Detect and install Miniconda**
+### Maintenance menu
 
-- ✓ If Python or Conda already exists, it uses what is available
-- ✗ If not installed:
-  - It offers a download source such as the Tsinghua mirror or the official Anaconda source
-  - Downloads a Miniconda installer, about 50 MB
-  - Silently installs to `<project_dir>\Miniconda3`
-  - Configures environment variables automatically
-  - **Important**: after the first Miniconda install, you may need to run the script again so the refreshed environment is picked up
+The menu detects your system language and displays Chinese or English automatically. Its configuration is persisted in `packaging\maintenance_config.json`. Menu options:
 
-**2.2 Detect and install Git**
+- **[1] Install**: full install flow, see above
+- **[2] Update**: checks code (compares remote VERSION and commit count on the current branch), reloads the launcher after code sync, then rechecks and updates dependencies
+- **[3] Switch branch**: `main` stable / `beta` testing
+- **[4] Switch to a historical version by tag**
+- **[5] Switch mirror source**
+- **[6] Re-check versions**
+- **[7] Switch language** (Chinese / English)
+- **[8] Exit**
 
-- ✓ If Git already exists, it uses the system Git
-- ✗ If Git is missing, it offers:
-  - **Option 1**: download portable Git automatically, recommended
-  - **Option 2**: install Git manually and run the script again
+### Dependency management
 
-**2.3 Choose a download source**
+Dependencies are declared in `pyproject.toml` (five mutually exclusive dependency groups: `cpu` / `cuda13.0` / `cuda12.6` / `rocm7.2.1` / `metal`) and locked with `uv.lock`. The portable installer installs them directly into bundled `packaging\python`; it **does not create `.venv`**. `.venv` is only for source development.
 
-- **Option 1**: official GitHub source
-- **Option 2**: mirror source, usually faster in some regions
+### Start the program
 
-**2.4 Clone or update the repository**
+After installation, just double-click `Win-Start.bat` whenever you want to use the app.
 
-- First install: clone the repository
-- Existing install: update to the latest version automatically
+### Update later
 
-**2.5 Create the Conda environment**
+Double-click `Win-Install-or-Update.bat` and choose **[2] Update**.
 
-- Creates `conda_env` in the project directory using Python 3.12
-- Path: `<project_dir>\conda_env\`
-- The environment stays inside the project folder and does not consume system Python space
+### Uninstall
 
-**2.6 Install dependencies**
+The new setup is fully portable: **just delete the whole folder**. For old conda-based installs, see the [Uninstall Guide](UNINSTALL.md).
 
-- Detects hardware automatically:
-  - ✓ **NVIDIA GPU**
-    - Checks CUDA version
-    - CUDA 12 or newer: installs `requirements_gpu.txt`
-    - Older CUDA: prompts you to update the driver or use the CPU build
-  - ✓ **AMD GPU**
-    - Detects the GPU model and gfx version
-    - After confirmation, installs `requirements_amd.txt`
-    - **RX 7000 / 9000 only**
-    - RX 5000 / 6000 automatically falls back to CPU
-  - ✗ **Other GPU / integrated graphics**
-    - Installs `requirements_cpu.txt`
-- Uses `launch.py` to install the required packages
-
-**2.7 Finish installation**
-
-- Shows the install location
-- Optionally launches the app immediately
-
-### Miniconda Layout
-
-**Advantages**
-
-- ✅ Small initial installer, about 50 MB
-- ✅ Supports multiple Python versions
-- ✅ Keeps environments isolated
-- ✅ Includes pip support
-- ✅ Installs entirely inside the project directory
-
-**Typical folder layout**
-
-```text
-D:\manga-translator-ui\
-├── 步骤1-首次安装.bat
-├── 步骤2-启动Qt界面.bat
-├── 步骤3-检查更新并启动.bat
-├── 步骤4-更新维护.bat
-├── Miniconda3\
-├── conda_env\
-├── PortableGit\
-├── desktop_qt_ui\
-├── manga_translator\
-└── ...
-```
-
-#### 3. Start the program
-
-After installation, your normal start entry is:
-
-- Double-click `步骤2-启动Qt界面.bat`
-
-You can also use:
-
-- `步骤3-检查更新并启动.bat` to check for updates before launch
-
-#### 4. Update later
-
-When you want the latest version:
-
-- Double-click `步骤4-更新维护.bat`
-- Choose the full update option
+> 💡 **Compatibility with old installs**: if you previously installed with the old scripts (Miniconda3 plus a `manga-env` / `conda_env` environment), the new scripts fall back to that conda environment automatically when the bundled Python is not found. No reinstall is required.
 
 ---
 
-## Method 2: Packaged Release
+## Method 2: Integrated Portable Release
 
-This is the simplest path if you do not want to install Python, but the download is large.
+This path is for Windows users who want to extract and run immediately. Each release already contains portable Python, the selected hardware dependencies, and model files, so downloads are large.
 
 ### 1. Open the release page
 
@@ -179,55 +124,37 @@ Go to [GitHub Releases](https://github.com/hgmzhn/manga-translator-ui/releases).
 
 ### 2. Choose a build
 
-**CPU build**
+- `manga-translator-cpu-vX.Y.Z.7z.001`: best compatibility; no dedicated GPU required.
+- `manga-translator-cuda13.0-vX.Y.Z.7z.001`: for Turing (compute capability 7.5) or newer NVIDIA GPUs whose driver supports CUDA 13.0; recommended for RTX 50-series GPUs.
+- `manga-translator-cuda12.6-vX.Y.Z.7z.001`: required for GeForce 10-series GPUs and suitable for other NVIDIA GPUs needing compatibility; drivers supporting CUDA 13.0 or newer can run it through backward compatibility.
+- `manga-translator-rocm7.2.1-vX.Y.Z.7z.001`: experimental Radeon ROCm 7.2.1; requires a supported AMD GPU and AMD driver 26.2.2.
 
-- Filename pattern: `manga-translator-cpu-vX.X.X.zip` or split archives
-- Works on all machines
-- No dedicated GPU required
-- Slower than GPU builds
+> CUDA 13.0 no longer supports NVIDIA architectures before Turing. GeForce 10-series GPUs such as the GTX 1060/1070/1080 must use the CUDA 12.6 package and must not download the CUDA 13.0 package.
 
-**GPU build**
+### 3. Extract split volumes
 
-- Filename pattern: `manga-translator-gpu-vX.X.X.zip` or split archives
-- For NVIDIA GPUs
-- Requires CUDA 12.x support
-- Faster, but needs compatible hardware
+Download every `.7z.001`, `.002`, and later volume for the selected build into one directory without renaming them, then extract `.001`. Missing any volume makes extraction fail.
 
-### 3. Split archive notes
+### 4. Start
 
-If the release is split into multiple archive parts such as `part1.rar`, `part2.rar`, `part3.rar`:
+The extracted directory contains:
 
-1. Download **all** parts into the same folder
-2. Extract only the first part
-3. Keep the original filenames unchanged
-4. Missing any part will cause extraction to fail
+```text
+manga-translator/
+├── Win-Start.bat
+├── Win-Install-or-Update.bat
+├── packaging/
+│   ├── python/         # Python 3.12 and installed dependencies
+│   └── uv.exe
+├── PortableGit/
+├── models/             # Installed model files
+├── config/
+├── dict/
+├── fonts/
+└── desktop_qt_ui/
+```
 
-### 4. Install steps
-
-1. **Extract the archive**
-
-   ```text
-   Extract to any folder, for example:
-   D:\manga-translator\
-   ```
-
-2. **Check the structure**
-
-   ```text
-   manga-translator/
-   ├── app.exe
-   ├── _internal/
-   ├── fonts/
-   ├── models/
-   └── examples/
-   ```
-
-3. **Run the program**
-
-- Double-click `app.exe`
-- The first run will load model files automatically
-
----
+Double-click `Win-Start.bat`. Run `Win-Install-or-Update.bat` when you need to reinstall dependencies or switch versions.
 
 ## Method 3: Run from Source
 
@@ -242,28 +169,35 @@ cd manga-translator-ui
 
 ### 2. Install dependencies
 
+Dependencies are declared in `pyproject.toml`. The five dependency groups `cpu` / `cuda13.0` / `cuda12.6` / `rocm7.2.1` / `metal` are mutually exclusive; select one backend:
+
 ```bash
+# NVIDIA CUDA 13.0 (source-development default)
+uv sync
+
+# NVIDIA CUDA 12.6
+uv sync --no-default-groups --group cuda12.6
+
 # CPU
-pip install -r requirements_cpu.txt
+uv sync --no-default-groups --group cpu
 
-# NVIDIA GPU
-pip install -r requirements_gpu.txt
-
-# AMD GPU (experimental)
-pip install -r requirements_amd.txt
+# Linux AMD ROCm 7.2; Windows uses the installer's ROCm 7.2.1 flow
+uv sync --no-default-groups --group rocm7.2.1
 
 # Apple Silicon / Metal
-pip install -r requirements_metal.txt
+uv sync --no-default-groups --group metal
 ```
+
+> 💡 **pip users**: run `uv export` to generate a requirements file, then install it with pip.
 
 ### 3. Run the program
 
 ```bash
 # Qt desktop UI
-python -m desktop_qt_ui.main
+uv run --no-sync python -m desktop_qt_ui.main
 
 # Web UI / API server
-python -m manga_translator web
+uv run --no-sync python -m manga_translator web
 ```
 
 ---
@@ -314,7 +248,7 @@ For a real Web UI deployment, persist these paths:
 | Path inside container | Priority | Purpose |
 |------|------|------|
 | `/app/manga_translator/server/data` | Required | Unified storage for `admin_config.json`, `user_resources/`, accounts, sessions, groups, permissions, quotas, API key presets, user configs, audit logs, translation-history indexes, and Web history result files |
-| `/app/examples` | Strongly recommended | Stores `config.json`, `custom_api_params.json`, `filter_list.json`, and other auto-created editable config files |
+| `/app/config` | Strongly recommended | Stores `config.json`, `custom_api_params.json`, `filter_list.json`, and other auto-created editable config files |
 | `/app/dict` | Strongly recommended | Stores glossaries and AI prompt files such as `ai_ocr_prompt.yaml`, `ai_renderer_prompt.yaml`, and `ai_colorizer_prompt.yaml` |
 | `/app/fonts` | Strongly recommended | Server-level fonts |
 | `/app/models` | Strongly recommended | Downloaded models, so container recreation does not re-download them |
@@ -346,7 +280,7 @@ services:
       - ./data/models:/app/models
       - ./data/fonts:/app/fonts
       - ./data/dict:/app/dict
-      - ./data/config:/app/examples
+      - ./data/config:/app/config
       - ./data/server:/app/manga_translator/server/data
       - ./data/logs:/app/logs
       - ./data/result:/app/result
@@ -444,7 +378,7 @@ After deployment:
 3. Pull the image
 4. Create a container with `8000:8000`
 5. Add environment variables if needed
-6. Add persistent mounts for `/app/manga_translator/server/data`, `/app/examples`, `/app/dict`, `/app/fonts`, and `/app/models`
+6. Add persistent mounts for `/app/manga_translator/server/data`, `/app/config`, `/app/dict`, `/app/fonts`, and `/app/models`
 7. If you want server API keys saved from the Web UI to persist too, also bind-mount `/app/.env` from an empty host file you created in advance
 8. Start the container and open the site
 
@@ -452,24 +386,22 @@ After deployment:
 
 ---
 
-## Method 5: Native macOS Run Apple Silicon
+## Method 5: Native Linux/macOS Run
 
-Designed for Apple Silicon Macs and uses MPS acceleration when available.
+Linux and macOS share the same installer. Apple Silicon uses MPS when available; Linux selects NVIDIA, AMD ROCm, or CPU dependencies.
 
 ### System requirements
 
-- **Hardware**: Mac with Apple Silicon preferred. Intel Mac can still run in CPU mode
-- **OS**: macOS 12.0 or later
-- **Tools**: Xcode Command Line Tools, the script checks and prompts if needed
+- **Hardware**: Linux x86_64 or macOS; Intel Mac runs in CPU mode
+- **OS**: Linux or macOS 12.0 or later
+- **Tools**: Git; the script installs `uv` when needed
 
 ### Script mapping
 
 | Script | Purpose | Windows equivalent |
 |---------|------|-------------|
-| `macOS_1_首次安装.sh` | First-time install, clone, Miniforge install, dependency install | `步骤1-首次安装.bat` |
-| `macOS_2_启动Qt界面.sh` | Start the Qt UI | `步骤2-启动Qt界面.bat` |
-| `macOS_3_检查更新并启动.sh` | Update check then launch | `步骤3-检查更新并启动.bat` |
-| `macOS_4_更新维护.sh` | Maintenance menu | `步骤4-更新维护.bat` |
+| `Unix-Install-or-Update.sh` | After one confirmation, bootstrap Git, uv, Python 3.12, and `packaging`, then open the bilingual install/update menu | `Win-Install-or-Update.bat` |
+| `Unix-Start.sh` | Start the Qt UI | `Win-Start.bat` |
 
 ### Install steps
 
@@ -477,44 +409,47 @@ Designed for Apple Silicon Macs and uses MPS acceleration when available.
 
 ```bash
 # 1. Download script
-curl -O https://raw.githubusercontent.com/hgmzhn/manga-translator-ui/main/macOS_1_首次安装.sh
+curl -O https://raw.githubusercontent.com/hgmzhn/manga-translator-ui/main/Unix-Install-or-Update.sh
 
 # 2. Make it executable
-chmod +x macOS_1_首次安装.sh
+chmod +x Unix-Install-or-Update.sh
 
 # 3. Run installer
-./macOS_1_首次安装.sh
+./Unix-Install-or-Update.sh
 ```
 
 The script automatically:
 
-- Checks Xcode Command Line Tools
+- Checks Git
 - Clones the project
-- Installs Miniforge if needed
-- Creates the `manga-env` environment with Python 3.12
-- Installs `requirements_metal.txt`
-- Configures MPS acceleration
+- Installs Python 3.12 through `uv`
+- Creates a project-local `.venv`
+- Opens the bilingual Python menu; `launch.py` selects and installs `cpu`, `cuda13.0`, `cuda12.6`, `rocm7.2.1`, or `metal`
+
+At startup, the script asks only once: `Start installation now? [Y/n]`. After confirmation, the normal bootstrap flow proceeds directly to the bilingual menu.
 
 **Option 2: Clone manually first**
 
 ```bash
 git clone https://github.com/hgmzhn/manga-translator-ui.git
 cd manga-translator-ui
-chmod +x macOS_*.sh
-./macOS_1_首次安装.sh
+chmod +x Unix-*.sh
+./Unix-Install-or-Update.sh
 ```
 
 ### Verify and run
 
 ```bash
 # Normal launch
-./macOS_2_启动Qt界面.sh
+./Unix-Start.sh
 
 # Update check and launch
-./macOS_3_检查更新并启动.sh
+./Unix-Install-or-Update.sh
+# Choose [2] Update in the Python menu
 
 # Maintenance menu
-./macOS_4_更新维护.sh
+./Unix-Install-or-Update.sh
+# Choose [2] Update in the Python menu
 ```
 
 ### FAQ
@@ -526,7 +461,7 @@ About 10 to 20 minutes depending on your network.
 Yes, but it will use CPU mode.
 
 **Q: How do I update later?**
-Run `./macOS_4_更新维护.sh` and choose the full update option.
+Run `./Unix-Install-or-Update.sh` and choose [2] Update in the Python menu.
 
 ---
 
@@ -538,15 +473,10 @@ This section uses the current Qt UI labels from `en_US.json`.
 
 Start one of these:
 
-- `步骤2-启动Qt界面.bat`
-- `app.exe`
-- `python -m desktop_qt_ui.main`
+- `Win-Start.bat` for a Windows portable release
+- `python -m desktop_qt_ui.main` for a source environment
 
-On the first run, the app will:
-
-- Load AI models, which can take several minutes
-- Initialize translation backends
-- Open the main window on `Translation Interface`
+The app uses the bundled dependency environment and local model files, initializes translation backends, then opens the main window on `Translation Interface`.
 
 ### 2. CPU build users: turn off GPU
 
@@ -588,7 +518,7 @@ You can add input pages in three ways:
 - Click `Add Folder`
 - Drag and drop files or folders into the file list
 
-Supported formats include `.jpg`, `.jpeg`, `.png`, `.webp`, and `.bmp`.
+Supported formats include `.png`, `.jpg`, `.jpeg`, `.jfif`, `.webp`, `.avif`, `.bmp`, `.tiff`, `.tif`, `.heic`, and `.heif`.
 
 ### 6. Start translation
 
@@ -607,14 +537,14 @@ If you want to fine-tune the result later, open it in `Editor View`.
 
 **Symptoms**
 
-- `app.exe` does nothing
+- `Win-Start.bat` exits with an error
 - The window flashes and closes immediately
 
 **Try this**
 
-1. Make sure the package is fully extracted
-2. Check whether antivirus blocked the executable
-3. Run the launcher as administrator
+1. Make sure every archive volume was fully extracted
+2. Check whether antivirus blocked the package
+3. Run `Win-Install-or-Update.bat` to check dependencies
 4. Check the runtime log under `result/log_*.txt`
 
 ### Missing DLL files
@@ -637,7 +567,7 @@ If you want to fine-tune the result later, open it in `Editor View`.
 
 **Try this**
 
-1. Confirm the GPU supports CUDA 12.x
+1. Confirm the build matches the GPU: GeForce 10-series GPUs must use CUDA 12.6; CUDA 13.0 requires Turing (compute capability 7.5) or newer plus a driver that supports CUDA 13.0
 2. Update the NVIDIA driver
 3. If the issue is ONNX-specific, open `Settings` -> `General` and enable `Disable ONNX GPU Acceleration`
 4. If the machine is not compatible, switch to the CPU build

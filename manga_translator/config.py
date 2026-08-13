@@ -171,6 +171,10 @@ class RenderConfig(BaseModel):
     """Center the text block vertically in the bubble"""
     optimize_line_breaks: bool = False
     """Automatically optimize line breaks by testing all combinations to find the best font size"""
+    semantic_linebreak: bool = False
+    """Use local HanLP semantic line breaking for Chinese translations without explicit [BR] markers."""
+    remove_linebreak_punctuation: bool = False
+    """Remove comma/period punctuation immediately before or after line break markers."""
     check_br_and_retry: bool = False
     """Check if translation contains [BR] markers when AI line breaking is enabled (regions≥2). Retry if missing."""
     strict_smart_scaling: bool = False
@@ -185,8 +189,8 @@ class RenderConfig(BaseModel):
     """If renderer should be splitting up words using a hyphen character (-)"""
     bubble_layout_english: bool = False
     """Enable bubble-based English typesetting (balloon mask line breaking) and force horizontal rendering."""
-    font_path: Optional[str] = None
-    """Path to font file for rendering. If not specified, uses default font."""
+    font_family: Optional[str] = None
+    """Qt font family, optionally suffixed with ``::style``, used for rendering."""
     font_color: Optional[str] = None
     """Overwrite the text fg/bg color detected by the OCR model. Use hex string without the "#" such as FFFFFF for a white foreground or FFFFFF:000000 to also have a black background around the text."""
     line_spacing: Optional[float] = None
@@ -197,8 +201,6 @@ class RenderConfig(BaseModel):
     """Use fixed font size for rendering"""
     rtl: bool = True
     """Right-to-left reading order for panel and text_region sorting,"""  
-    auto_rotate_symbols: bool = False
-    """Automatically rotate symbols like '!!' or '??' in vertical text"""
     layout_mode: str = 'smart_scaling'
     """The layout mode to use for rendering. Options: 'smart_scaling', 'strict', 'balloon_fill'"""
     stroke_width: float = 0.07
@@ -336,12 +338,18 @@ class DetectorConfig(BaseModel):
     """"Text detector used for creating a text mask from an image, DO NOT use craft for manga, it\'s not designed for it"""
     detection_size: int = 2048
     """Size of image used for detection"""
+    det_rearrange_min_effective_short_side: int = 341
+    """Minimum effective short-side resolution preserved by long-image detection rearrange"""
     text_threshold: float = 0.5
     """Threshold for text detection"""
     import_yolo_labels: bool = False
     """Import YOLO labels from manga_translator_work/yolo_labels and use them in detection workflows"""
     use_yolo_obb: bool = False
     """Enable YOLO OBB auxiliary detector for hybrid detection"""
+    use_sfx_filter: bool = False
+    """Filter main-detector boxes that are neither wrapped by YOLO 'other' boxes nor overlapping YOLO text boxes"""
+    sfx_filter_include_bubble_text: bool = False
+    """Include text inside bubbles in SFX filtering instead of preserving it unconditionally"""
     yolo_obb_conf: float = 0.4
     """Confidence threshold for YOLO OBB detector"""
     yolo_obb_overlap_threshold: float = 0.1
@@ -362,6 +370,10 @@ class InpainterConfig(BaseModel):
     """Inpainting precision for lama, use bf16 while you can."""
     force_use_torch_inpainting: bool = False
     """Force use PyTorch for inpainting instead of ONNX (useful if ONNX has memory issues)"""
+    solid_fill_pure_bubbles: bool = False
+    """Use model-detected bubble masks to fill solid-color bubbles directly, skipping inpainting for them"""
+    per_block_inpainting: bool = False
+    """Inpaint each isolated refined-mask component in a 2x crop instead of feeding the whole page to the model"""
 
 class ColorizerConfig(BaseModel):
     colorization_size: int = 576
@@ -403,8 +415,6 @@ class CliConfig(BaseModel):
     """Ignore errors and continue processing"""
     export_editable_psd: bool = False
     """Export editable PSD file with layers (requires Photoshop)"""
-    psd_font: Optional[str] = None
-    """Font name for PSD export (PostScript name, e.g. ArialMT, SimHei). If not set, uses default font."""
     save_to_source_dir: bool = False
     """Save translation results to manga_translator_work/result/ subdirectory in the source image directory."""
     psd_script_only: bool = False
@@ -478,7 +488,7 @@ class Config(BaseModel):
     mask_dilation_offset: int = 20
     """By how much to extend the text mask to remove left-over text pixels of the original image."""
     use_custom_api_params: bool = False
-    """Use custom API parameters from examples/custom_api_params.json for supported AI backends."""
+    """Use custom API parameters from config/custom_api_params.json for supported AI backends."""
     _runtime_api_overrides: dict[str, dict[str, dict[str, str]]] = PrivateAttr(default_factory=dict)
     _allow_server_api_keys: bool = PrivateAttr(default=True)
 

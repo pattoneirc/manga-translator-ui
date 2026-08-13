@@ -7,10 +7,12 @@ import numpy as np
 
 from .core.resource_manager import ResourceManager
 from .core.types import MaskType
+from .region_geometry_state import normalize_region_geometry_data
 
 
 INPAINTED_IMAGE_CACHE_KEY = "inpainted_image"
 PAINT_OVERLAY_IMAGE_CACHE_KEY = "paint_overlay_image"
+STAMP_OVERLAY_IMAGE_CACHE_KEY = "stamp_overlay_image"
 
 
 @dataclass(slots=True)
@@ -24,6 +26,7 @@ class DocumentSnapshot:
     inpainted_image: Any = None
     paint_overlay_path: Optional[str] = None
     paint_overlay_image: Any = None
+    stamp_overlay_image: Any = None
 
 
 @dataclass(slots=True)
@@ -59,17 +62,6 @@ class EditorSession:
             mask_np = mask_np[:, :, 0]
         return np.where(mask_np > 0, 255, 0).astype(np.uint8)
 
-    @staticmethod
-    def _close_if_detached(image: Any, *, protected: tuple[Any, ...] = ()) -> None:
-        if image is None or any(image is item for item in protected):
-            return
-        close = getattr(image, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:
-                pass
-
     def _bump_document_revision(self) -> None:
         self._document_revision += 1
 
@@ -83,12 +75,8 @@ class EditorSession:
         return self._source_image_path
 
     def set_image(self, image: Any) -> None:
-        protected = tuple(
-            item
-            for item in (*self.resource_manager.get_managed_images(), image)
-            if item is not None
-        )
-        self._close_if_detached(self._image, protected=protected)
+        # 图以 eager 方式打开，不持有文件句柄，也可能同时被 ResourceManager
+        # 缓存和导出快照持有，因此换图时只丢引用，不做任何关闭判断。
         self._image = image
         self._bump_document_revision()
 
@@ -96,16 +84,49 @@ class EditorSession:
         return self._image
 
     def set_regions(self, regions: list[dict]) -> None:
+        """整体重建 region 列表（文档级操作），region_id 重新分配。"""
         self.resource_manager.clear_regions()
         for region_data in regions:
-            self.resource_manager.add_region(region_data)
+            self.resource_manager.add_region(normalize_region_geometry_data(region_data))
         self._bump_document_revision()
 
-    def set_regions_silent(self, regions: list[dict]) -> None:
-        self.resource_manager.clear_regions()
-        for region_data in regions:
-            self.resource_manager.add_region(region_data)
+    def update_region(self, index: int, region: dict) -> bool:
+        if not self.resource_manager.update_region(index, normalize_region_geometry_data(region)):
+            return False
         self._bump_document_revision()
+        return True
+
+    def insert_region(self, index: int, region: dict) -> int:
+        insert_at = self.resource_manager.insert_region(index, normalize_region_geometry_data(region))
+        self._bump_document_revision()
+        return insert_at
+
+    def remove_region(self, index: int) -> Optional[dict]:
+        removed = self.resource_manager.remove_region(index)
+        if removed is not None:
+            self._bump_document_revision()
+        return removed
+
+    def move_region(self, source_index: int, target_index: int) -> Optional[int]:
+        moved_to = self.resource_manager.move_region(source_index, target_index)
+        if moved_to is not None and moved_to != source_index:
+            self._bump_document_revision()
+        return moved_to
+
+    def store_derived_regions(self, updates: dict[int, dict]) -> None:
+        """按索引覆盖指定 region 数据（region_id 不变），用于渲染派生字段写回。"""
+        applied = False
+        for index, region in updates.items():
+            if self.resource_manager.update_region(index, normalize_region_geometry_data(region)):
+                applied = True
+        if applied:
+            self._bump_document_revision()
+
+    def get_region_id(self, index: int) -> Optional[int]:
+        return self.resource_manager.get_region_id(index)
+
+    def find_region_index(self, region_id: int) -> Optional[int]:
+        return self.resource_manager.find_region_index(region_id)
 
     def get_regions(self) -> list[dict]:
         resources = self.resource_manager.get_all_regions()
@@ -168,10 +189,7 @@ class EditorSession:
         return self.resource_manager.get_cache(INPAINTED_IMAGE_CACHE_KEY)
 
     def set_compare_image(self, image: Any) -> None:
-        protected = tuple(
-            item for item in (*self.resource_manager.get_managed_images(), self._image, image) if item is not None
-        )
-        self._close_if_detached(self._compare_image, protected=protected)
+        # 对照图可能就是底图本身（无独立原图时），同样只丢引用，不做关闭判断。
         self._compare_image = image
         self._bump_document_revision()
 
@@ -240,6 +258,16 @@ class EditorSession:
     def get_paint_overlay_image(self) -> Any:
         return self.resource_manager.get_cache(PAINT_OVERLAY_IMAGE_CACHE_KEY)
 
+    def set_stamp_overlay_image(self, image: Any) -> None:
+        if image is None:
+            self.resource_manager.clear_cache(STAMP_OVERLAY_IMAGE_CACHE_KEY)
+        else:
+            self.resource_manager.set_cache(STAMP_OVERLAY_IMAGE_CACHE_KEY, image)
+        self._bump_document_revision()
+
+    def get_stamp_overlay_image(self) -> Any:
+        return self.resource_manager.get_cache(STAMP_OVERLAY_IMAGE_CACHE_KEY)
+
     def load_document(self, snapshot: DocumentSnapshot) -> None:
         self.set_source_image_path(snapshot.source_path)
         self.set_image(snapshot.image)
@@ -251,6 +279,7 @@ class EditorSession:
         self.set_inpainted_image(snapshot.inpainted_image)
         self.set_paint_overlay_path(snapshot.paint_overlay_path)
         self.set_paint_overlay_image(snapshot.paint_overlay_image)
+        self.set_stamp_overlay_image(snapshot.stamp_overlay_image)
         self.set_selection([])
 
     def clear_document(self) -> None:
@@ -264,4 +293,5 @@ class EditorSession:
         self.set_inpainted_image(None)
         self.set_paint_overlay_path(None)
         self.set_paint_overlay_image(None)
+        self.set_stamp_overlay_image(None)
         self.set_selection([])

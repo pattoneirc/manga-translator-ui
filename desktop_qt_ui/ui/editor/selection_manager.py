@@ -1,7 +1,7 @@
-from ui.theme import get_current_theme_colors
 from PyQt6.QtCore import QObject, QRectF, Qt
 from PyQt6.QtGui import QBrush, QColor, QPen
 from PyQt6.QtWidgets import QGraphicsRectItem
+from qfluentwidgets import themeColor
 from services import get_logger
 
 
@@ -21,7 +21,7 @@ class SelectionManager(QObject):
             scene: QGraphicsScene 实例
             get_region_items_fn: Callable，返回当前 region items 列表
         """
-        super().__init__()
+        super().__init__(model)
         self._model = model
         self._scene = scene
         self._get_region_items = get_region_items_fn
@@ -49,14 +49,12 @@ class SelectionManager(QObject):
         except (RuntimeError, AttributeError):
             return False
 
-    def _set_item_selected(self, item, selected: bool, *, update: bool = False) -> None:
+    def _set_item_selected(self, item, selected: bool) -> None:
         if not self._is_live_item(item):
             return
         try:
             if item.isSelected() != selected:
                 item.setSelected(selected)
-            if update:
-                item.update()
         except (RuntimeError, AttributeError):
             pass
 
@@ -98,17 +96,21 @@ class SelectionManager(QObject):
                 self._box_select_rect_item = None
 
         if need_create:
-            colors = get_current_theme_colors()
-            accent = QColor(colors["cta_gradient_start"])
-            fill = QColor(colors["cta_gradient_start"])
-            accent.setAlpha(190)
-            fill.setAlpha(36)
-            pen = QPen(accent)
-            pen.setWidth(2)
-            pen.setStyle(Qt.PenStyle.DashLine)
-            brush = QBrush(fill)
-            self._box_select_rect_item = self._scene.addRect(0, 0, 0, 0, pen, brush)
+            self._box_select_rect_item = self._scene.addRect(0, 0, 0, 0)
             self._box_select_rect_item.setZValue(300)
+
+        # 每次开始框选时现取主题色，避免缓存的旧 themeColor 在换主题后残留
+        accent = themeColor().toRgb()
+        if not accent.isValid():
+            accent = QColor("#0F6CBD")
+        fill = QColor(accent)
+        accent.setAlpha(190)
+        fill.setAlpha(36)
+        pen = QPen(accent)
+        pen.setWidth(2)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        self._box_select_rect_item.setPen(pen)
+        self._box_select_rect_item.setBrush(QBrush(fill))
 
         self._box_select_rect_item.setVisible(True)
 
@@ -176,6 +178,16 @@ class SelectionManager(QObject):
         except RuntimeError:
             self._box_select_rect_item = None
 
+    def cancel_box_select(self):
+        """中断框选（右键菜单/失焦/Escape 等 release 会丢失的场合）：
+        不改变选择，只清理进行中状态与预览矩形。"""
+        self._is_box_selecting = False
+        self._box_select_start_pos = None
+        try:
+            self._clear_box_select_rect()
+        except RuntimeError:
+            self._box_select_rect_item = None
+
     @property
     def is_box_selecting(self):
         return self._is_box_selecting
@@ -202,16 +214,12 @@ class SelectionManager(QObject):
 
             # 清除所有 item 的选择
             for item in region_items:
-                self._set_item_selected(item, False, update=True)
+                self._set_item_selected(item, False)
 
             # 设置新选中的 items
             for idx in selected_indices:
                 if 0 <= idx < len(region_items):
-                    self._set_item_selected(region_items[idx], True, update=True)
-
-            # 强制场景更新
-            if self._scene:
-                self._scene.update()
+                    self._set_item_selected(region_items[idx], True)
         except Exception as e:
             self._logger.warning("Selection sync failed: %s", e, exc_info=True)
         finally:

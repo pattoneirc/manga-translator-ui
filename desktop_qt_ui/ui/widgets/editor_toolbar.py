@@ -1,31 +1,142 @@
-
-import logging
-import os
-
-from PyQt6.QtCore import QByteArray, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QCursor, QIcon, QPainter, QPalette, QPixmap
-from PyQt6.QtSvg import QSvgRenderer
+from PyQt6.QtCore import QPoint, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QActionGroup
 from PyQt6.QtWidgets import (
-    QComboBox,
-    QFrame,
+    QApplication,
     QHBoxLayout,
-    QLabel,
-    QPushButton,
-    QSlider,
-    QToolButton,
+    QProxyStyle,
+    QSizePolicy,
+    QStyle,
+    QStyleFactory,
     QWidget,
 )
+from qfluentwidgets import (
+    Action,
+    BodyLabel,
+    CardWidget,
+    CheckableMenu,
+    DropDownPushButton,
+    MenuAnimationType,
+    MenuIndicatorType,
+    PrimaryPushButton,
+    PushButton,
+    RoundMenu,
+    SingleDirectionScrollArea,
+    Slider,
+    ToolButton,
+    VerticalSeparator,
+)
+from qfluentwidgets import (
+    FluentIcon as FIF,
+)
+
 from services import get_i18n_manager
-from utils.resource_helper import resource_path
+from ui.fluent_icon import themed_fluent_svg_icon
 from ui.widgets.hover_hint import set_hover_hint
 
 
-class EditorToolbar(QWidget):
+class _LeadingIndicatorMenuStyle(QProxyStyle):
+    """给左侧选中标记腾出独立列，排列为：标记 → 图标 → 文字。
+
+    QProxyStyle 会接管传入基类 style 的所有权，因此绝不能把全局共享的
+    QApplication.style() 实例交给它（菜单 view 销毁时会连带删掉全应用
+    style）。这里用 QStyleFactory 按同名重新创建一个私有实例作为基类。
     """
-    编辑器顶部工具栏，包含返回、导出、撤销/重做、缩放、视图模式等全局操作。
+
+    CONTENT_OFFSET = 24
+
+    def __init__(self):
+        app_style = QApplication.style()
+        base_style = (
+            QStyleFactory.create(app_style.objectName())
+            if app_style is not None
+            else None
+        )
+        if base_style is not None:
+            super().__init__(base_style)
+        else:
+            # 无参构造：代理惰性使用应用 style，且不接管其所有权
+            super().__init__()
+
+    def subElementRect(self, element, option, widget=None):
+        rect = super().subElementRect(element, option, widget)
+        if element == QStyle.SubElement.SE_ItemViewItemDecoration:
+            rect.translate(self.CONTENT_OFFSET, 0)
+        elif element == QStyle.SubElement.SE_ItemViewItemText:
+            rect.setLeft(rect.left() + self.CONTENT_OFFSET)
+        return rect
+
+
+class _ScreenBoundMenuMixin:
+    """Shift a centered popup back on-screen when its anchor is near an edge."""
+
+    def _screen_geometry_for(self, pos: QPoint):
+        app = QApplication.instance()
+        screen = app.screenAt(pos) if app is not None else None
+        if screen is None:
+            window_handle = self.windowHandle()
+            screen = window_handle.screen() if window_handle is not None else None
+        if screen is None and app is not None:
+            screen = app.primaryScreen()
+        return screen.availableGeometry() if screen is not None else None
+
+    def _safe_popup_position(self, pos: QPoint) -> QPoint:
+        rect = self._screen_geometry_for(pos)
+        if rect is None:
+            return pos
+
+        margins = self.layout().contentsMargins()
+        # RoundMenu computes x as ``anchor.x() - left_margin`` without a
+        # corresponding lower bound.  Clamp the anchor only when that would
+        # place the popup outside the left edge; its own right-edge handling is
+        # retained for the opposite side.
+        minimum_anchor_x = rect.left() + margins.left()
+        if pos.x() < minimum_anchor_x:
+            return QPoint(minimum_anchor_x, pos.y())
+        return pos
+
+    def exec(self, pos, ani=True, aniType=MenuAnimationType.DROP_DOWN):
+        super().exec(self._safe_popup_position(pos), ani, aniType)
+
+
+class _IconCheckableMenu(_ScreenBoundMenuMixin, CheckableMenu):
+    """带独立左侧选中标记列和语义图标列的 CheckableMenu。"""
+
+    def __init__(self, title="", parent=None, indicatorType=MenuIndicatorType.CHECK):
+        super().__init__(title, parent, indicatorType)
+        self._leading_indicator_style = _LeadingIndicatorMenuStyle()
+        self._leading_indicator_style.setParent(self.view)
+        self.view.setStyle(self._leading_indicator_style)
+
+
+class _ScreenBoundCheckableMenu(_ScreenBoundMenuMixin, CheckableMenu):
+    """Checkable menu variant used by the display-mode popup."""
+
+
+class _StayOpenCheckableMenu(_IconCheckableMenu):
+    """点击选项后不关闭的单选菜单。
+
+    排列菜单需要一次打开后连续操作（切参照、连续对齐/分布），
+    父类 _onItemClicked 会先 _hideMenu 再触发动作，这里跳过关闭。
+    菜单仍可通过点击外部/Esc 正常关闭。
     """
-    # --- Define signals for all actions ---
-    back_requested = pyqtSignal()
+
+    def _onItemClicked(self, item):
+        action = item.data(Qt.ItemDataRole.UserRole)
+        if action not in self._actions or not action.isEnabled():
+            return
+        action.trigger()
+
+
+class EditorToolbar(CardWidget):
+    """
+    编辑器顶部工具栏。常驻控件只保留适应窗口、原图不透明度滑条，
+    其余操作分装进三个单级下拉菜单（不分级）：
+    「菜单」= 撤销重做/缩放 + 通用开关；「显示模式」= 画布显示单选；
+    「排列」= 参照单选 + 对齐/分布文字选项（点击不关闭，可连续操作）。
+    返回主页不设入口：主窗口侧边栏随时可切换页面。
+    """
+
+    save_requested = pyqtSignal()
     export_requested = pyqtSignal()
     undo_requested = pyqtSignal()
     redo_requested = pyqtSignal()
@@ -36,13 +147,55 @@ class EditorToolbar(QWidget):
     original_image_alpha_changed = pyqtSignal(int)
     align_requested = pyqtSignal(str)
     distribute_requested = pyqtSignal(str)
+    snap_enabled_changed = pyqtSignal(bool)
+    center_scale_enabled_changed = pyqtSignal(bool)
+    rich_text_popup_enabled_changed = pyqtSignal(bool)
+    rich_text_popup_pinned_changed = pyqtSignal(bool)
+    auto_save_on_switch_changed = pyqtSignal(bool)
+    auto_export_on_switch_changed = pyqtSignal(bool)
+    suppress_unsaved_warning_changed = pyqtSignal(bool)
+    auto_rich_text_rules_changed = pyqtSignal(bool)
+    delete_and_recover_changed = pyqtSignal(bool)
 
-    def __init__(self, parent=None):
+    def __init__(
+        self,
+        parent=None,
+        snap_enabled: bool = False,
+        rich_text_popup_enabled: bool = True,
+        rich_text_popup_pinned: bool = False,
+        auto_save_on_switch: bool = True,
+        auto_export_on_switch: bool = True,
+        suppress_unsaved_warning: bool = False,
+        center_scale_enabled: bool = False,
+        auto_rich_text_rules: bool = True,
+        delete_and_recover: bool = False,
+    ):
         super().__init__(parent)
         self.i18n = get_i18n_manager()
+        self._themed_icon_buttons: list[tuple[ToolButton, str]] = []
+        self.content_widget: QWidget | None = None
+        # 菜单在语言切换时整体重建，所有需要恢复的状态都存在字段里
+        self._display_mode = "full"
+        self._align_ref = "selection"
+        self._can_undo = False
+        self._can_redo = False
+        self._export_enabled = True
+        self._last_selection_count = 0
+        self._snap_enabled = bool(snap_enabled)
+        self._center_scale_enabled = bool(center_scale_enabled)
+        self._rich_text_popup_enabled = bool(rich_text_popup_enabled)
+        self._rich_text_popup_pinned = bool(rich_text_popup_pinned)
+        self._auto_save_on_switch = bool(auto_save_on_switch)
+        self._auto_export_on_switch = bool(auto_export_on_switch)
+        self._suppress_unsaved_warning = bool(suppress_unsaved_warning)
+        self._auto_rich_text_rules = bool(auto_rich_text_rules)
+        self._delete_and_recover = bool(delete_and_recover)
+        self.main_menu: RoundMenu | None = None
+        self.display_menu: RoundMenu | None = None
+        self.arrange_menu: RoundMenu | None = None
         self._init_ui()
         self._connect_signals()
-    
+
     def _t(self, key: str, **kwargs) -> str:
         """翻译辅助方法"""
         if self.i18n:
@@ -50,277 +203,332 @@ class EditorToolbar(QWidget):
         return key
 
     def _init_ui(self):
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMinimumHeight(54)
+
+        outer_layout = QHBoxLayout(self)
+        outer_layout.setContentsMargins(6, 4, 6, 4)
+        outer_layout.setSpacing(0)
+
+        self.scroll_area = SingleDirectionScrollArea(self, Qt.Orientation.Horizontal)
+        self.scroll_area.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self.scroll_area.setMinimumHeight(44)
+        self.scroll_area.setWidgetResizable(False)
+        self.scroll_area.setFrameShape(SingleDirectionScrollArea.Shape.NoFrame)
+        self.scroll_area.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.scroll_area.enableTransparentBackground()
+        outer_layout.addWidget(self.scroll_area)
+
+        # 无父构造：setWidget 会认领所有权，先挂在框架上会产生幽灵坯子
+        self.content_widget = QWidget()
+        layout = QHBoxLayout(self.content_widget)
+        layout.setContentsMargins(8, 4, 8, 4)
         layout.setSpacing(10)
 
-        # --- File Actions ---
-        self.back_button = QToolButton()
-        self.back_button.setText(self._t("Back"))
-        set_hover_hint(self.back_button, self._t("Back to Main"))
-        self.back_button.setObjectName("editor_back_button")
-        layout.addWidget(self.back_button)
+        # --- 下拉菜单组：通用 / 显示模式 / 排列（每个都是单级菜单，功能不分级） ---
+        self.menu_button = DropDownPushButton()
+        self.menu_button.setIcon(FIF.MENU)
+        self.menu_button.setText(self._t("Menu"))
+        layout.addWidget(self.menu_button)
 
-        self.export_button = QToolButton()
+        self.display_mode_button = DropDownPushButton()
+        self.display_mode_button.setIcon(FIF.VIEW)
+        self.display_mode_button.setText(self._t("Display Mode"))
+        layout.addWidget(self.display_mode_button)
+
+        self.arrange_button = DropDownPushButton()
+        self.arrange_button.setIcon(FIF.LAYOUT)
+        self.arrange_button.setText(self._t("Arrange"))
+        layout.addWidget(self.arrange_button)
+
+        self.save_button = PrimaryPushButton()
+        self.save_button.setIcon(FIF.SAVE)
+        self.save_button.setText(self._t("Save"))
+        self.save_button.clicked.connect(self.save_requested)
+        layout.addWidget(self.save_button)
+
+        self.export_button = PushButton()
+        self.export_button.setIcon(FIF.IMAGE_EXPORT)
         self.export_button.setText(self._t("Export Image"))
-        set_hover_hint(self.export_button, self._t("Export current rendered image") + " (Ctrl+Q)")
-        self.export_button.setObjectName("editor_export_button")
+        self.export_button.clicked.connect(self.export_requested)
         layout.addWidget(self.export_button)
 
-        layout.addWidget(self._create_separator())
-
-        # --- Edit Actions ---
-        self.undo_button = QToolButton()
-        self.undo_button.setText(self._t("Undo"))
-        self.undo_button.setEnabled(False)
-        set_hover_hint(self.undo_button, self._t("Undo last operation") + " (Ctrl+Z)")
-        self.undo_button.setObjectName("editor_undo_button")
-        layout.addWidget(self.undo_button)
-
-        self.redo_button = QToolButton()
-        self.redo_button.setText(self._t("Redo"))
-        self.redo_button.setEnabled(False)
-        set_hover_hint(self.redo_button, self._t("Redo last undone operation") + " (Ctrl+Y)")
-        self.redo_button.setObjectName("editor_redo_button")
-        layout.addWidget(self.redo_button)
+        self._build_menus()
 
         layout.addWidget(self._create_separator())
 
-        # --- View Actions ---
-        self.zoom_out_button = QToolButton()
-        self.zoom_out_button.setText(self._t("Zoom Out (-)"))
-        self.zoom_out_button.setObjectName("editor_zoom_out_button")
-        layout.addWidget(self.zoom_out_button)
-
-        self.zoom_label = QLabel("100%")
-        self.zoom_label.setMinimumWidth(40)
-        self.zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.zoom_label)
-
-        self.zoom_in_button = QToolButton()
-        self.zoom_in_button.setText(self._t("Zoom In (+)"))
-        self.zoom_in_button.setObjectName("editor_zoom_in_button")
-        layout.addWidget(self.zoom_in_button)
-
-        self.fit_window_button = QToolButton()
-        self.fit_window_button.setText(self._t("Fit to Window"))
-        self.fit_window_button.setObjectName("editor_fit_window_button")
+        # --- 常驻: 适应窗口 ---
+        self.fit_window_button = ToolButton()
+        self.fit_window_button.setIcon(FIF.FIT_PAGE)
+        set_hover_hint(self.fit_window_button, self._t("Fit to Window"))
         layout.addWidget(self.fit_window_button)
 
         layout.addWidget(self._create_separator())
 
-        # --- Display Mode ---
-        # 创建一个容器来包装显示模式控件，确保它们作为一个整体
-        display_mode_container = QWidget()
-        display_mode_container.setObjectName("editor_display_mode_container")
-        display_mode_layout = QHBoxLayout(display_mode_container)
-        display_mode_layout.setContentsMargins(0, 0, 0, 0)
-        display_mode_layout.setSpacing(5)
-        
-        self.display_mode_label = QLabel(self._t("Display Mode:"))
-        display_mode_layout.addWidget(self.display_mode_label)
-        
-        self.display_mode_combo = QComboBox()
-        self.display_mode_combo.setObjectName("editor_display_mode_combo")
-        self._populate_display_mode_items()
-        # 需要容纳新增的“原图对比”模式
-        self.display_mode_combo.setFixedWidth(180)
-        display_mode_layout.addWidget(self.display_mode_combo)
-        
-        # 添加分隔符到容器内
-        display_mode_layout.addWidget(self._create_separator())
-        
-        # 设置容器的尺寸策略，防止被压缩
-        from PyQt6.QtWidgets import QSizePolicy
-        display_mode_container.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
-        
-        # 将整个容器添加到主布局
-        layout.addWidget(display_mode_container, 0)
-
-        self.opacity_label = QLabel(self._t("Original Image Opacity:"))
+        # --- 常驻: 原图不透明度 ---
+        self.opacity_label = BodyLabel(self._t("Original Image Opacity:"))
         layout.addWidget(self.opacity_label)
-        self.original_image_alpha_slider = QSlider(Qt.Orientation.Horizontal)
-        self.original_image_alpha_slider.setObjectName("editor_opacity_slider")
+        self.original_image_alpha_slider = Slider(Qt.Orientation.Horizontal)
         self.original_image_alpha_slider.setRange(0, 100)
-        self.original_image_alpha_slider.setValue(0) # Default to 0 (fully transparent, show inpainted)
-        # 设置滑块自适应，较小的最小宽度
-        self.original_image_alpha_slider.setMinimumWidth(80)
+        self.original_image_alpha_slider.setValue(
+            0
+        )  # Default to 0 (fully transparent, show inpainted)
+        self.original_image_alpha_slider.setMinimumWidth(140)
         layout.addWidget(self.original_image_alpha_slider)
 
-        layout.addWidget(self._create_separator())
-
-        # --- Align / Distribute ---
-        self._build_align_distribute_ui(layout)
-
-        layout.addStretch() # Pushes everything to the left
+        layout.addStretch()  # Pushes everything to the left
+        self.content_widget.setSizePolicy(
+            QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed
+        )
+        self.scroll_area.setWidget(self.content_widget)
+        self.scroll_area.enableTransparentBackground()
+        self._sync_content_width()
 
     # ------------------------------------------------------------------
-    # 对齐/分布 UI — 单行 PS 风格布局
+    # 主菜单
     # ------------------------------------------------------------------
 
-    _ICONS_DIR = resource_path(os.path.join("desktop_qt_ui", "ui", "icons"))
+    def _build_menus(self):
+        """构建三个独立的单级下拉菜单。语言切换时整体重建，状态从字段恢复。"""
+        old_menus = [self.main_menu, self.display_menu, self.arrange_menu]
+        # Popup 菜单必须以真正的顶层窗口作为 QWidget 父级。若把工具栏
+        # （位于 FluentWindow 的 QStackedWidget 内）作为父级，Windows Qt
+        # 会尝试激活该堆叠容器的 QWidgetWindow，并记录“must be a top
+        # level window”警告。工具栏脱离窗口单独测试时自身就是顶层控件，
+        # 因此保留自身作为兜底父级。
+        menu_parent = self.window()
+        if menu_parent is None or not menu_parent.isWindow():
+            menu_parent = self
+        # 旧菜单里的主题图标按钮即将销毁，先清空登记表防止悬空引用
+        self._themed_icon_buttons.clear()
+        menu = _IconCheckableMenu(
+            parent=menu_parent, indicatorType=MenuIndicatorType.CHECK
+        )
 
-    def _themed_icon(self, svg_name: str) -> QIcon:
-        """读 SVG 模板,把占位符颜色替换为主题色后渲染为 QIcon。
+        # --- 通用菜单：撤销重做 / 缩放 / 持久化开关 ---
 
-        SVG 用 `#5599ff` 作参考线占位符,`#888888` 作矩形占位符。
-        线色取主题强调色,矩形色取主题文字色,跟主题切换。
-        """
-        pal = self.palette()
-        rect_color = pal.color(QPalette.ColorRole.Text).name()
-        accent = pal.color(QPalette.ColorRole.Highlight)
-        # accent 太暗/太亮时退回固定蓝
-        if accent.lightness() < 60 or accent.lightness() > 230:
-            line_color = "#5599ff"
-        else:
-            line_color = accent.name()
-        path = os.path.join(self._ICONS_DIR, svg_name)
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                svg_text = f.read()
-        except OSError as exc:
-            logging.getLogger(__name__).warning("加载工具栏图标失败 (%s): %s", path, exc)
-            return QIcon()
-        svg_text = svg_text.replace("#5599ff", line_color).replace("#888888", rect_color)
-        renderer = QSvgRenderer(QByteArray(svg_text.encode("utf-8")))
-        pixmap = QPixmap(28, 28)
-        pixmap.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(pixmap)
-        renderer.render(painter)
-        painter.end()
-        return QIcon(pixmap)
+        # 撤销/重做的真实快捷键由 EditorShortcutManager 全局注册（带焦点感知），
+        # 这里只在文本上做提示，不设 QAction shortcut，避免双重触发。
+        self.undo_action = Action(FIF.LEFT_ARROW, self._t("Undo") + " (Ctrl+Z)")
+        self.undo_action.setEnabled(self._can_undo)
+        self.undo_action.triggered.connect(self.undo_requested)
+        menu.addAction(self.undo_action)
 
-    def _build_align_distribute_ui(self, layout: QHBoxLayout):
-        """构建对齐/分布按钮组：单行 PS 风格。"""
-        BTN_W = 28
+        self.redo_action = Action(FIF.RIGHT_ARROW, self._t("Redo") + " (Ctrl+Y)")
+        self.redo_action.setEnabled(self._can_redo)
+        self.redo_action.triggered.connect(self.redo_requested)
+        menu.addAction(self.redo_action)
+        menu.addSeparator()
 
-        def _make_icon_btn(icon, obj_name, tip):
-            btn = QPushButton()
-            btn.setIcon(icon)
-            btn.setObjectName(obj_name)
-            btn.setToolTip(tip)
-            btn.setFixedSize(QSize(BTN_W + 2, BTN_W + 2))
-            btn.setIconSize(QSize(BTN_W, BTN_W))
-            btn.setFlat(True)
-            btn.setStyleSheet("QPushButton { padding: 0px; border: none; background: transparent; }"
-                             "QPushButton:hover { background: rgba(128,128,128,0.2); }"
-                             "QPushButton:disabled { background: transparent; }")
-            btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-            btn.setEnabled(False)
-            return btn
+        self.zoom_in_action = Action(FIF.ZOOM_IN, self._t("Zoom In (+)"))
+        self.zoom_in_action.triggered.connect(self.zoom_in_requested)
+        menu.addAction(self.zoom_in_action)
 
-        # 参照模式切换（独立放在外面）
-        self.align_ref_button = QToolButton()
-        self.align_ref_button.setText(self._t("Selection"))
-        self.align_ref_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-        self.align_ref_button.setObjectName("editor_align_ref_button")
-        self.align_ref_button.setToolTip(self._t("Align reference: selection (bounding box) / canvas (whole image)"))
-        self._align_ref = "selection"
-        self._last_selection_count = 0
-        self.align_ref_button.clicked.connect(self._toggle_align_ref)
-        layout.addWidget(self.align_ref_button)
-        layout.addWidget(self._create_separator())
+        self.zoom_out_action = Action(FIF.ZOOM_OUT, self._t("Zoom Out (-)"))
+        self.zoom_out_action.triggered.connect(self.zoom_out_requested)
+        menu.addAction(self.zoom_out_action)
 
-        # 图标按钮用一个独立容器，内部间距统一为 2px，竖线分隔符嵌在其中
-        icon_container = QWidget()
-        icon_container.setObjectName("editor_align_icon_container")
-        icon_layout = QHBoxLayout(icon_container)
-        icon_layout.setContentsMargins(0, 0, 0, 0)
-        icon_layout.setSpacing(10)
+        menu.addSeparator()
+        self.snap_action = Action(
+            themed_fluent_svg_icon("ic_fluent_target_arrow_24_regular.svg"),
+            self._t("Enable Editor Snapping"),
+        )
+        self.snap_action.setCheckable(True)
+        self.snap_action.setChecked(self._snap_enabled)
+        self.snap_action.triggered.connect(self._on_snap_action_triggered)
+        menu.addAction(self.snap_action)
 
-        # ── 第 1 组: 左对齐 / 水平居中 / 右对齐 / 垂直间距分布 ──
-        self.align_buttons: dict[str, QToolButton] = {}
-        group1 = [
-            ("left", self._t("Align Left")),
-            ("horizontal_center", self._t("Align Horizontal Center")),
-            ("right", self._t("Align Right")),
-        ]
-        for mode, tip in group1:
-            icon = self._themed_icon(f"align_{mode}.svg")
-            btn = _make_icon_btn(icon, f"editor_align_{mode}", tip)
-            btn.clicked.connect(lambda checked, m=mode: self.align_requested.emit(m))
-            self.align_buttons[mode] = btn
-            icon_layout.addWidget(btn)
+        self.center_scale_action = Action(
+            FIF.ZOOM_IN,
+            self._t("Scale Text Boxes from Center"),
+        )
+        self.center_scale_action.setCheckable(True)
+        self.center_scale_action.setChecked(self._center_scale_enabled)
+        self.center_scale_action.triggered.connect(
+            self._on_center_scale_action_triggered
+        )
+        menu.addAction(self.center_scale_action)
 
-        icon = self._themed_icon("distribute_spacing_v.svg")
-        btn = _make_icon_btn(icon, "editor_dist_vertical_spacing", self._t("Distribute Vertical Spacing"))
-        btn.clicked.connect(lambda: self._on_dist_spacing("vertical"))
-        self._dist_v_btn = btn
-        icon_layout.addWidget(btn)
+        self.rich_text_popup_action = Action(
+            themed_fluent_svg_icon("ic_fluent_text_edit_style_24_regular.svg"),
+            self._t("Show Rich Text Editor Popup") + " (Ctrl+Shift+R)",
+        )
+        self.rich_text_popup_action.setCheckable(True)
+        self.rich_text_popup_action.setChecked(self._rich_text_popup_enabled)
+        self.rich_text_popup_action.triggered.connect(
+            self._on_rich_text_popup_action_triggered
+        )
+        menu.addAction(self.rich_text_popup_action)
+        self.rich_text_popup_pinned_action = Action(
+            self._t("Pin Rich Text Editor Popup")
+        )
+        self.rich_text_popup_pinned_action.setCheckable(True)
+        self.rich_text_popup_pinned_action.setChecked(self._rich_text_popup_pinned)
+        self.rich_text_popup_pinned_action.triggered.connect(
+            self._on_rich_text_popup_pinned_action_triggered
+        )
+        menu.addAction(self.rich_text_popup_pinned_action)
 
-        # ── 第 2 组: 顶对齐 / 垂直居中 / 底对齐 / 水平间距分布 ──
-        group2 = [
-            ("top", self._t("Align Top")),
-            ("vertical_center", self._t("Align Vertical Center")),
-            ("bottom", self._t("Align Bottom")),
-        ]
-        for mode, tip in group2:
-            icon = self._themed_icon(f"align_{mode}.svg")
-            btn = _make_icon_btn(icon, f"editor_align_{mode}", tip)
-            btn.clicked.connect(lambda checked, m=mode: self.align_requested.emit(m))
-            self.align_buttons[mode] = btn
-            icon_layout.addWidget(btn)
+        self.auto_rich_text_rules_action = Action(
+            FIF.FONT,
+            self._t("Auto Apply Rich Text Rules While Editing"),
+        )
+        self.auto_rich_text_rules_action.setCheckable(True)
+        self.auto_rich_text_rules_action.setChecked(self._auto_rich_text_rules)
+        self.auto_rich_text_rules_action.triggered.connect(
+            self._on_auto_rich_text_rules_action_triggered
+        )
+        menu.addAction(self.auto_rich_text_rules_action)
 
-        icon = self._themed_icon("distribute_spacing_h.svg")
-        btn = _make_icon_btn(icon, "editor_dist_horizontal_spacing", self._t("Distribute Horizontal Spacing"))
-        btn.clicked.connect(lambda: self._on_dist_spacing("horizontal"))
-        self._dist_h_btn = btn
-        icon_layout.addWidget(btn)
+        self.auto_save_action = Action(
+            FIF.SAVE,
+            self._t("Auto Save on Image Switch"),
+        )
+        self.auto_save_action.setCheckable(True)
+        self.auto_save_action.setChecked(self._auto_save_on_switch)
+        self.auto_save_action.triggered.connect(self._on_auto_save_action_triggered)
+        menu.addAction(self.auto_save_action)
 
-        # 将图标容器挂到主布局
-        layout.addWidget(icon_container)
+        self.auto_export_action = Action(
+            FIF.IMAGE_EXPORT,
+            self._t("Auto Export on Image Switch"),
+        )
+        self.auto_export_action.setCheckable(True)
+        self.auto_export_action.setChecked(self._auto_export_on_switch)
+        self.auto_export_action.triggered.connect(self._on_auto_export_action_triggered)
+        menu.addAction(self.auto_export_action)
 
-    def _on_dist_spacing(self, orientation: str):
-        """处理间距分布按钮点击（垂直/水平空白间隙均分）。"""
-        if orientation == "vertical":
-            self.distribute_requested.emit("spacing_v")
-        else:
-            self.distribute_requested.emit("spacing_h")
+        self.suppress_unsaved_warning_action = Action(
+            FIF.INFO,
+            self._t("Do Not Warn About Unsaved Changes"),
+        )
+        self.suppress_unsaved_warning_action.setCheckable(True)
+        self.suppress_unsaved_warning_action.setChecked(self._suppress_unsaved_warning)
+        self.suppress_unsaved_warning_action.triggered.connect(
+            self._on_suppress_unsaved_warning_action_triggered
+        )
+        menu.addAction(self.suppress_unsaved_warning_action)
 
-    def _toggle_align_ref(self):
-        """切换对齐参照模式：选区 ↔ 画布。同时更新按钮启用状态。"""
-        if self._align_ref == "selection":
-            self._align_ref = "canvas"
-            self.align_ref_button.setText(self._t("Canvas"))
-        else:
-            self._align_ref = "selection"
-            self.align_ref_button.setText(self._t("Selection"))
-        self.update_align_distribute_buttons(self._last_selection_count)
+        self.delete_and_recover_action = Action(
+            FIF.DELETE,
+            self._t("Delete and Recover Removed Text"),
+        )
+        self.delete_and_recover_action.setCheckable(True)
+        self.delete_and_recover_action.setChecked(self._delete_and_recover)
+        self.delete_and_recover_action.triggered.connect(
+            self._on_delete_and_recover_action_triggered
+        )
+        menu.addAction(self.delete_and_recover_action)
 
-    def get_align_reference(self) -> str:
-        return self._align_ref
+        self.main_menu = menu
+        self.menu_button.setMenu(menu)
 
-    def update_align_distribute_buttons(self, selection_count: int):
-        """根据选中数量和参照模式更新按钮启用状态。更多按钮始终可用。"""
-        self._last_selection_count = selection_count
-        align_enabled = (selection_count >= 1 and self._align_ref == "canvas") or (selection_count >= 2)
-        dist_enabled = selection_count >= 3
-        for btn in self.align_buttons.values():
-            btn.setEnabled(align_enabled)
-        self._dist_v_btn.setEnabled(dist_enabled)
-        self._dist_h_btn.setEnabled(dist_enabled)
+        # --- 显示模式菜单：五种画布显示状态单选 ---
+        display_menu = _ScreenBoundCheckableMenu(
+            parent=menu_parent,
+            indicatorType=MenuIndicatorType.RADIO,
+        )
+        display_group = QActionGroup(display_menu)
+        display_group.setExclusive(True)
+        self.display_mode_actions: dict[str, Action] = {}
+        for mode, text_key in self._display_mode_definitions():
+            action = Action(self._t(text_key))
+            action.setCheckable(True)
+            action.setChecked(mode == self._display_mode)
+            action.triggered.connect(
+                lambda checked, m=mode: self._on_display_mode_selected(m)
+            )
+            display_group.addAction(action)
+            display_menu.addAction(action)
+            self.display_mode_actions[mode] = action
 
-    def _create_separator(self):
-        separator = QFrame()
-        separator.setObjectName("editor_toolbar_separator")
-        separator.setFrameShape(QFrame.Shape.VLine)
-        separator.setFrameShadow(QFrame.Shadow.Sunken)
-        separator.setLineWidth(1)
-        separator.setMidLineWidth(0)
-        separator.setFixedWidth(2)
-        separator.setMinimumHeight(20)
-        return separator
+        self.display_menu = display_menu
+        self.display_mode_button.setMenu(display_menu)
 
-    def _connect_signals(self):
-        self.back_button.clicked.connect(self.back_requested)
-        self.export_button.clicked.connect(self.export_requested)
-        self.undo_button.clicked.connect(self.undo_requested)
-        self.redo_button.clicked.connect(self.redo_requested)
-        self.zoom_in_button.clicked.connect(self.zoom_in_requested)
-        self.zoom_out_button.clicked.connect(self.zoom_out_requested)
-        self.fit_window_button.clicked.connect(self.fit_window_requested)
-        self.display_mode_combo.currentIndexChanged.connect(self._emit_display_mode_changed)
-        self.original_image_alpha_slider.valueChanged.connect(self.original_image_alpha_changed)
+        # --- 排列菜单：参照单选 + 对齐/分布选项（文字+图标，点击不关闭） ---
+        arrange_menu = _StayOpenCheckableMenu(
+            parent=menu_parent, indicatorType=MenuIndicatorType.RADIO
+        )
+        ref_group = QActionGroup(arrange_menu)
+        ref_group.setExclusive(True)
+        self.align_ref_actions: dict[str, Action] = {}
+        for reference, icon_file, text_key in (
+            (
+                "selection",
+                "ic_fluent_select_object_24_regular.svg",
+                "Reference: Selection",
+            ),
+            ("canvas", "ic_fluent_image_24_regular.svg", "Reference: Canvas"),
+        ):
+            action = Action(themed_fluent_svg_icon(icon_file), self._t(text_key))
+            action.setCheckable(True)
+            action.setChecked(reference == self._align_ref)
+            action.triggered.connect(
+                lambda checked, r=reference: self._on_align_ref_selected(r)
+            )
+            ref_group.addAction(action)
+            arrange_menu.addAction(action)
+            self.align_ref_actions[reference] = action
+
+        arrange_menu.addSeparator()
+        self.align_actions: dict[str, Action] = {}
+        for mode, icon_file, text_key in (
+            ("left", "align_left.svg", "Align Left"),
+            (
+                "horizontal_center",
+                "align_horizontal_center.svg",
+                "Align Horizontal Center",
+            ),
+            ("right", "align_right.svg", "Align Right"),
+            ("top", "align_top.svg", "Align Top"),
+            ("vertical_center", "align_vertical_center.svg", "Align Vertical Center"),
+            ("bottom", "align_bottom.svg", "Align Bottom"),
+        ):
+            action = Action(themed_fluent_svg_icon(icon_file), self._t(text_key))
+            action.setEnabled(False)
+            action.triggered.connect(
+                lambda checked, m=mode: self.align_requested.emit(m)
+            )
+            arrange_menu.addAction(action)
+            self.align_actions[mode] = action
+
+        arrange_menu.addSeparator()
+        self._dist_v_action = Action(
+            themed_fluent_svg_icon("distribute_spacing_v.svg"),
+            self._t("Distribute Vertical Spacing"),
+        )
+        self._dist_v_action.setEnabled(False)
+        self._dist_v_action.triggered.connect(
+            lambda: self.distribute_requested.emit("spacing_v")
+        )
+        arrange_menu.addAction(self._dist_v_action)
+
+        self._dist_h_action = Action(
+            themed_fluent_svg_icon("distribute_spacing_h.svg"),
+            self._t("Distribute Horizontal Spacing"),
+        )
+        self._dist_h_action.setEnabled(False)
+        self._dist_h_action.triggered.connect(
+            lambda: self.distribute_requested.emit("spacing_h")
+        )
+        arrange_menu.addAction(self._dist_h_action)
+
+        # 重建（语言切换）后按当前选区数恢复启停状态
+        self._apply_align_button_states()
+
+        self.arrange_menu = arrange_menu
+        self.arrange_button.setMenu(arrange_menu)
+
+        for old in old_menus:
+            if old is not None:
+                old.deleteLater()
 
     def _display_mode_definitions(self):
         return [
@@ -331,26 +539,283 @@ class EditorToolbar(QWidget):
             ("compare_original_split", "Compare with Original (Two Panels)"),
         ]
 
-    def _populate_display_mode_items(self, selected_mode: str | None = None):
-        self.display_mode_combo.clear()
-        for mode, text_key in self._display_mode_definitions():
-            self.display_mode_combo.addItem(self._t(text_key), mode)
+    def _on_display_mode_selected(self, mode: str):
+        if mode == self._display_mode:
+            return
+        self._display_mode = mode
+        self.display_mode_changed.emit(mode)
 
-        target_mode = selected_mode or "full"
-        mode_index = self.display_mode_combo.findData(target_mode)
-        if mode_index < 0:
-            mode_index = 0
-        self.display_mode_combo.setCurrentIndex(mode_index)
+    def _on_snap_action_triggered(self, checked: bool = False):
+        self.set_snap_enabled(checked, emit=True)
 
-    def _emit_display_mode_changed(self, index: int):
-        mode = self.display_mode_combo.itemData(index)
-        if mode:
-            self.display_mode_changed.emit(str(mode))
+    def set_snap_enabled(self, enabled: bool, emit: bool = False):
+        """同步编辑器吸附开关；外部同步配置时默认不回发信号。"""
+        enabled = bool(enabled)
+        changed = enabled != self._snap_enabled
+        self._snap_enabled = enabled
+
+        action = getattr(self, "snap_action", None)
+        if action is not None and action.isChecked() != enabled:
+            action.blockSignals(True)
+            action.setChecked(enabled)
+            action.blockSignals(False)
+
+        if emit and changed:
+            self.snap_enabled_changed.emit(enabled)
+
+    def is_snap_enabled(self) -> bool:
+        return self._snap_enabled
+
+    def _on_center_scale_action_triggered(self, checked: bool = False):
+        self.set_center_scale_enabled(checked, emit=True)
+
+    def set_center_scale_enabled(self, enabled: bool, emit: bool = False):
+        """同步中心点缩放开关；外部配置同步时默认不回发信号。"""
+        enabled = bool(enabled)
+        changed = enabled != self._center_scale_enabled
+        self._center_scale_enabled = enabled
+
+        action = getattr(self, "center_scale_action", None)
+        if action is not None and action.isChecked() != enabled:
+            action.blockSignals(True)
+            action.setChecked(enabled)
+            action.blockSignals(False)
+
+        if emit and changed:
+            self.center_scale_enabled_changed.emit(enabled)
+
+    def is_center_scale_enabled(self) -> bool:
+        return self._center_scale_enabled
+
+    def _on_rich_text_popup_action_triggered(self, checked: bool = False):
+        if not checked:
+            self.set_rich_text_popup_pinned(False, emit=True)
+        self.set_rich_text_popup_enabled(checked, emit=True)
+
+    def set_rich_text_popup_enabled(self, enabled: bool, emit: bool = False):
+        """同步富文本浮动编辑器开关；外部配置同步时默认不回发信号。"""
+        enabled = bool(enabled)
+        if not enabled and self._rich_text_popup_pinned:
+            self.set_rich_text_popup_pinned(False, emit=emit)
+        changed = enabled != self._rich_text_popup_enabled
+        self._rich_text_popup_enabled = enabled
+
+        action = getattr(self, "rich_text_popup_action", None)
+        if action is not None and action.isChecked() != enabled:
+            action.blockSignals(True)
+            action.setChecked(enabled)
+            action.blockSignals(False)
+
+        if emit and changed:
+            self.rich_text_popup_enabled_changed.emit(enabled)
+
+    def is_rich_text_popup_enabled(self) -> bool:
+        return self._rich_text_popup_enabled
+
+    def _on_rich_text_popup_pinned_action_triggered(self, checked: bool = False):
+        if checked and not self._rich_text_popup_enabled:
+            self.set_rich_text_popup_enabled(True, emit=True)
+        self.set_rich_text_popup_pinned(checked, emit=True)
+
+    def set_rich_text_popup_pinned(self, pinned: bool, emit: bool = False):
+        """同步富文本浮窗固定开关；该状态仅在当前运行期间保留。"""
+        pinned = bool(pinned)
+        changed = pinned != self._rich_text_popup_pinned
+        self._rich_text_popup_pinned = pinned
+
+        action = getattr(self, "rich_text_popup_pinned_action", None)
+        if action is not None and action.isChecked() != pinned:
+            action.blockSignals(True)
+            action.setChecked(pinned)
+            action.blockSignals(False)
+
+        if emit and changed:
+            self.rich_text_popup_pinned_changed.emit(pinned)
+
+    def is_rich_text_popup_pinned(self) -> bool:
+        return self._rich_text_popup_pinned
+
+    def _on_auto_rich_text_rules_action_triggered(self, checked: bool = False):
+        self.set_auto_rich_text_rules(checked, emit=True)
+
+    def set_auto_rich_text_rules(self, enabled: bool, emit: bool = False):
+        """同步编辑时自动应用富文本规则开关；外部配置同步时默认不回发信号。"""
+        enabled = bool(enabled)
+        changed = enabled != self._auto_rich_text_rules
+        self._auto_rich_text_rules = enabled
+
+        action = getattr(self, "auto_rich_text_rules_action", None)
+        if action is not None and action.isChecked() != enabled:
+            action.blockSignals(True)
+            action.setChecked(enabled)
+            action.blockSignals(False)
+
+        if emit and changed:
+            self.auto_rich_text_rules_changed.emit(enabled)
+
+    def is_auto_rich_text_rules(self) -> bool:
+        return self._auto_rich_text_rules
+
+    def _on_auto_save_action_triggered(self, checked: bool = False):
+        self.set_auto_save_on_switch(checked, emit=True)
+
+    def set_auto_save_on_switch(self, enabled: bool, emit: bool = False):
+        """同步切图自动保存开关。"""
+        enabled = bool(enabled)
+        changed = enabled != self._auto_save_on_switch
+        self._auto_save_on_switch = enabled
+
+        action = getattr(self, "auto_save_action", None)
+        if action is not None and action.isChecked() != enabled:
+            action.blockSignals(True)
+            action.setChecked(enabled)
+            action.blockSignals(False)
+
+        if emit and changed:
+            self.auto_save_on_switch_changed.emit(enabled)
+
+    def is_auto_save_on_switch(self) -> bool:
+        return self._auto_save_on_switch
+
+    def _on_auto_export_action_triggered(self, checked: bool = False):
+        self.set_auto_export_on_switch(checked, emit=True)
+
+    def set_auto_export_on_switch(self, enabled: bool, emit: bool = False):
+        """同步切图自动导出开关。"""
+        enabled = bool(enabled)
+        changed = enabled != self._auto_export_on_switch
+        self._auto_export_on_switch = enabled
+
+        action = getattr(self, "auto_export_action", None)
+        if action is not None and action.isChecked() != enabled:
+            action.blockSignals(True)
+            action.setChecked(enabled)
+            action.blockSignals(False)
+
+        if emit and changed:
+            self.auto_export_on_switch_changed.emit(enabled)
+
+    def is_auto_export_on_switch(self) -> bool:
+        return self._auto_export_on_switch
+
+    def _on_suppress_unsaved_warning_action_triggered(self, checked: bool = False):
+        self.set_suppress_unsaved_warning(checked, emit=True)
+
+    def set_suppress_unsaved_warning(self, enabled: bool, emit: bool = False):
+        """同步切图时不再提醒未保存编辑的开关。"""
+        enabled = bool(enabled)
+        changed = enabled != self._suppress_unsaved_warning
+        self._suppress_unsaved_warning = enabled
+
+        action = getattr(self, "suppress_unsaved_warning_action", None)
+        if action is not None and action.isChecked() != enabled:
+            action.blockSignals(True)
+            action.setChecked(enabled)
+            action.blockSignals(False)
+
+        if emit and changed:
+            self.suppress_unsaved_warning_changed.emit(enabled)
+
+    def is_suppress_unsaved_warning(self) -> bool:
+        return self._suppress_unsaved_warning
+
+    def _on_delete_and_recover_action_triggered(self, checked: bool = False):
+        self.set_delete_and_recover(checked, emit=True)
+
+    def set_delete_and_recover(self, enabled: bool, emit: bool = False):
+        """同步删除文本框时恢复原图的持久化开关。"""
+        enabled = bool(enabled)
+        changed = enabled != self._delete_and_recover
+        self._delete_and_recover = enabled
+
+        action = getattr(self, "delete_and_recover_action", None)
+        if action is not None and action.isChecked() != enabled:
+            action.blockSignals(True)
+            action.setChecked(enabled)
+            action.blockSignals(False)
+
+        if emit and changed:
+            self.delete_and_recover_changed.emit(enabled)
+
+    def is_delete_and_recover(self) -> bool:
+        return self._delete_and_recover
+
+    def _on_align_ref_selected(self, reference: str):
+        if reference == self._align_ref:
+            return
+        self._align_ref = reference
+        self._apply_align_button_states()
+
+    def get_align_reference(self) -> str:
+        return self._align_ref
+
+    def update_align_distribute_buttons(self, selection_count: int):
+        """根据选中数量和参照模式更新对齐/分布选项的启用状态。"""
+        self._last_selection_count = selection_count
+        self._apply_align_button_states()
+
+    def _apply_align_button_states(self):
+        count = self._last_selection_count
+        align_enabled = (count >= 1 and self._align_ref == "canvas") or (count >= 2)
+        dist_enabled = count >= 3
+        for action in self.align_actions.values():
+            action.setEnabled(align_enabled)
+        self._dist_v_action.setEnabled(dist_enabled)
+        self._dist_h_action.setEnabled(dist_enabled)
+
+    # ------------------------------------------------------------------
+    # 布局辅助
+    # ------------------------------------------------------------------
+
+    def _create_separator(self):
+        separator = VerticalSeparator()
+        separator.setFixedHeight(24)
+        return separator
+
+    def _sync_content_width(self):
+        """Keep the scroll area's inner widget as wide as its controls need."""
+        if self.content_widget is None:
+            return
+
+        content_layout = self.content_widget.layout()
+        if content_layout is not None:
+            content_layout.activate()
+            content_width = content_layout.sizeHint().width()
+        else:
+            content_width = self.content_widget.sizeHint().width()
+
+        self.content_widget.setMinimumWidth(content_width)
+        viewport_width = (
+            self.scroll_area.viewport().width() if hasattr(self, "scroll_area") else 0
+        )
+        self.content_widget.resize(
+            max(content_width, viewport_width),
+            max(
+                self.content_widget.sizeHint().height(),
+                self.scroll_area.viewport().height(),
+            ),
+        )
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self._sync_content_width)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._sync_content_width()
+
+    def _connect_signals(self):
+        self.fit_window_button.clicked.connect(self.fit_window_requested)
+        self.original_image_alpha_slider.valueChanged.connect(
+            self.original_image_alpha_changed
+        )
 
     # --- Public Slots ---
     def update_undo_redo_state(self, can_undo: bool, can_redo: bool):
-        self.undo_button.setEnabled(can_undo)
-        self.redo_button.setEnabled(can_redo)
+        self._can_undo = bool(can_undo)
+        self._can_redo = bool(can_redo)
+        self.undo_action.setEnabled(self._can_undo)
+        self.redo_action.setEnabled(self._can_redo)
 
     def set_original_image_alpha_slider(self, alpha: float):
         """同步滑块值（alpha: 0.0-1.0）"""
@@ -360,36 +825,24 @@ class EditorToolbar(QWidget):
         self.original_image_alpha_slider.setValue(slider_value)
         self.original_image_alpha_slider.blockSignals(False)
 
-    def update_zoom_level(self, zoom_level: float):
-        self.zoom_label.setText(f"{zoom_level:.0%}")
-    
     def set_export_enabled(self, enabled: bool):
-        """设置导出按钮的启用状态"""
-        self.export_button.setEnabled(enabled)
-    
+        """设置保存和导出按钮的启用状态。"""
+        self._export_enabled = bool(enabled)
+        self.save_button.setEnabled(self._export_enabled)
+        self.export_button.setEnabled(self._export_enabled)
+
     def refresh_ui_texts(self):
-        """刷新所有UI文本（用于语言切换）"""
-        # 刷新按钮文本
-        self.back_button.setText(self._t("Back"))
-        set_hover_hint(self.back_button, self._t("Back to Main"))
+        """刷新所有UI文本（用于语言切换）。菜单整体重建，状态从字段恢复。"""
+        self.menu_button.setText(self._t("Menu"))
+        self.display_mode_button.setText(self._t("Display Mode"))
+        self.arrange_button.setText(self._t("Arrange"))
+        self.save_button.setText(self._t("Save"))
         self.export_button.setText(self._t("Export Image"))
-        set_hover_hint(self.export_button, self._t("Export current rendered image") + " (Ctrl+Q)")
-        self.undo_button.setText(self._t("Undo"))
-        set_hover_hint(self.undo_button, self._t("Undo last operation") + " (Ctrl+Z)")
-        self.redo_button.setText(self._t("Redo"))
-        set_hover_hint(self.redo_button, self._t("Redo last undone operation") + " (Ctrl+Y)")
-        self.zoom_out_button.setText(self._t("Zoom Out (-)"))
-        self.zoom_in_button.setText(self._t("Zoom In (+)"))
-        self.fit_window_button.setText(self._t("Fit to Window"))
-        
-        # 刷新下拉菜单
-        current_mode = self.display_mode_combo.currentData()
-        self.display_mode_combo.blockSignals(True)
-        self._populate_display_mode_items(current_mode)
-        self.display_mode_combo.blockSignals(False)
-        
-        # 刷新标签
-        if hasattr(self, 'display_mode_label'):
-            self.display_mode_label.setText(self._t("Display Mode:"))
-        if hasattr(self, 'opacity_label'):
-            self.opacity_label.setText(self._t("Original Image Opacity:"))
+        set_hover_hint(self.fit_window_button, self._t("Fit to Window"))
+        self.opacity_label.setText(self._t("Original Image Opacity:"))
+        self._build_menus()
+        self._sync_content_width()
+
+    def refresh_theme(self):
+        for button, icon_file in self._themed_icon_buttons:
+            button.setIcon(themed_fluent_svg_icon(icon_file))

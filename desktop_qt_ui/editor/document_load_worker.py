@@ -12,7 +12,6 @@ from manga_translator.utils.path_manager import (
     find_json_path,
     find_paint_overlay_path,
 )
-
 from .session import DocumentLoadFailure, DocumentSnapshot
 
 if TYPE_CHECKING:
@@ -24,10 +23,16 @@ class DocumentLoadWorker:
 
     AUX_WORKERS = 4
 
-    def __init__(self, service: "EditorControllerDocumentService", image_path: str):
+    def __init__(
+        self,
+        service: "EditorControllerDocumentService",
+        image_path: str,
+        aux_executor: concurrent.futures.ThreadPoolExecutor,
+    ):
         self.service = service
         self.controller = service.controller
         self.image_path = image_path
+        self.aux_executor = aux_executor
 
     @property
     def logger(self):
@@ -53,26 +58,37 @@ class DocumentLoadWorker:
             "paint_overlay": find_paint_overlay_path(source_path),
         }
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.AUX_WORKERS) as executor:
-            futures = self._submit_aux_loads(
-                executor,
-                source_path,
-                display_image_path,
-                image,
-                image_size,
-                aux_paths,
-            )
-
+        futures = self._submit_aux_loads(
+            self.aux_executor,
+            source_path,
+            display_image_path,
+            image,
+            image_size,
+            aux_paths,
+        )
+        try:
             # 后台预转 QImage 到 ImageResource(走 LRU);命中缓存时跳过
             self._ensure_qimage(image_resource, image)
 
             compare_image = futures["compare"].result()
 
-            regions, raw_mask = futures["json"].result()
+            regions, raw_mask, json_overlays = futures["json"].result()
 
             inpainted_path, inpainted_image = futures["inpainted"].result()
 
-            paint_overlay_path, paint_overlay_image = futures["paint_overlay"].result()
+            paint_overlay_path, legacy_paint_overlay = futures["paint_overlay"].result()
+        finally:
+            for future in futures.values():
+                if not future.done():
+                    future.cancel()
+
+        # JSON 内的 base64 图层优先；旧版单文件 PNG 仅作画笔层兜底
+        paint_overlay_image = self._align_overlay_array(json_overlays.get("paint"), image_size)
+        if paint_overlay_image is None:
+            paint_overlay_image = legacy_paint_overlay
+        else:
+            paint_overlay_path = None
+        stamp_overlay_image = self._align_overlay_array(json_overlays.get("stamp"), image_size)
 
         return DocumentSnapshot(
             source_path=source_path,
@@ -84,6 +100,7 @@ class DocumentLoadWorker:
             inpainted_image=inpainted_image,
             paint_overlay_path=paint_overlay_path,
             paint_overlay_image=paint_overlay_image,
+            stamp_overlay_image=stamp_overlay_image,
         )
 
     def _submit_aux_loads(
@@ -136,11 +153,17 @@ class DocumentLoadWorker:
 
     def _load_regions_and_mask(self, source_path: str, json_path: str | None):
         if not json_path:
-            return [], None
-        regions, raw_mask, _ = self.service.file_service.load_translation_json(source_path)
-        return regions, raw_mask
+            return [], None, {}
+        regions, raw_mask, _, overlays = self.service.file_service.load_translation_json(source_path)
+        return regions, raw_mask, overlays or {}
 
     def _load_inpainted_image(self, inpainted_path: str | None, image_size):
+        """没有修复图时返回 None，不拿底图冒充。
+
+        画布上修复图是 z=1 底层、原图是 z=2 覆盖层，"有没有修复图"决定
+        original_image_alpha 取 0（看修复图）还是 1（看原图）；用底图冒充会让
+        这个判断恒真。需要"修复图否则底图"的地方各自显式兜底。
+        """
         if not inpainted_path:
             return None, None
         try:
@@ -156,6 +179,25 @@ class DocumentLoadWorker:
         if overlay_image is None:
             return None, None
         return paint_overlay_path, overlay_image
+
+    def _align_overlay_array(self, overlay, target_size):
+        """把 JSON 解码出的 RGBA 图层数组对齐到底图尺寸（W, H）。"""
+        if overlay is None:
+            return None
+        try:
+            arr = np.asarray(overlay)
+            if arr.ndim != 3 or arr.shape[2] != 4:
+                return None
+            if target_size is not None:
+                target_w, target_h = target_size
+                if arr.shape[:2] != (target_h, target_w):
+                    import cv2
+
+                    arr = cv2.resize(arr, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+            return arr.astype(np.uint8, copy=False)
+        except Exception as e:
+            self.logger.error(f"Failed to align overlay layer: {e}")
+            return None
 
     def _load_paint_overlay_array(self, overlay_path: str, target_size):
         """加载 paint overlay 图层并对齐到底图尺寸，返回 RGBA uint8 numpy 数组。"""

@@ -9,8 +9,10 @@ from typing import Any, Dict, List
 from google.genai import types
 from PIL import Image
 
+from ..api_request_params import apply_gemini_sdk_generation_params
 from ..api_key_rotation import APIRotationExhaustedError, run_with_api_candidates
 from ..runtime_api_resolver import resolve_runtime_api_config
+from ..utils.dotenv_utils import load_app_dotenv
 from ..utils.image_modes import normalize_rgb_image
 from .common import (
     VALID_LANGUAGES,
@@ -56,8 +58,6 @@ def encode_image_for_gemini(image, max_size=1024):
     return image_bytes, 'image/jpeg'
 
 
-
-
 class GeminiHighQualityTranslator(CommonTranslator):
     """
     Gemini高质量翻译器
@@ -84,8 +84,7 @@ class GeminiHighQualityTranslator(CommonTranslator):
         # 只在非Web环境下重新加载.env文件
         is_web_server = os.getenv('MANGA_TRANSLATOR_WEB_SERVER', 'false').lower() == 'true'
         if not is_web_server:
-            from dotenv import load_dotenv
-            load_dotenv(override=True)
+            load_app_dotenv(override=True)
         
         self.api_key = os.getenv(self.API_KEY_ENV, '')
         self.base_url = os.getenv(self.API_BASE_ENV, self.DEFAULT_BASE_URL) if self.API_BASE_ENV else self.DEFAULT_BASE_URL
@@ -366,9 +365,7 @@ class GeminiHighQualityTranslator(CommonTranslator):
             text_order = data.get('text_order', [])
             upscaled_size = data.get('upscaled_size')
             if text_regions and text_order:
-                image_array = draw_text_boxes_on_image(image, text_regions, text_order, upscaled_size)
-                from PIL import Image as PILImage
-                image = PILImage.fromarray(image_array)
+                image = draw_text_boxes_on_image(image, text_regions, text_order, upscaled_size)
                 self.logger.debug(f"已在图片上绘制 {len(text_regions)} 个带编号的文本框")
             
             # 使用新版 SDK 的格式
@@ -439,8 +436,10 @@ class GeminiHighQualityTranslator(CommonTranslator):
                 self._setup_client(system_instruction=None)
             
             if not self.client:
-                self.logger.error(f"{self._log_provider_name()}客户端初始化失败")
-                return texts
+                raise RuntimeError(
+                    f"{self._log_provider_name()}客户端初始化失败：请检查 "
+                    f"{self.API_KEY_ENV} / {self.API_BASE_ENV} / {self.MODEL_ENV} 配置"
+                )
             
             # 构建用户提示词（包含重试信息以避免缓存）
             user_prompt = self._build_user_prompt(batch_data, ctx, retry_attempt=retry_attempt, retry_reason=retry_reason)
@@ -464,15 +463,6 @@ class GeminiHighQualityTranslator(CommonTranslator):
             if self.max_tokens is not None:
                 config_params["max_output_tokens"] = self.max_tokens
             
-            generation_config = types.GenerateContentConfig(**config_params)
-            generation_config.system_instruction = system_instruction
-            
-            # 合并自定义API参数
-            if self._custom_api_params:
-                for key, value in self._custom_api_params.items():
-                    if hasattr(generation_config, key):
-                        setattr(generation_config, key, value)
-
             try:
                 # RPM限制
                 if self._MAX_REQUESTS_PER_MINUTE > 0:
@@ -504,6 +494,12 @@ class GeminiHighQualityTranslator(CommonTranslator):
                     streamed_text = None
                     streamed_finish_reason = None
                     streamed_diagnostics = None
+                    generation_config = types.GenerateContentConfig(**config_params)
+                    generation_config.system_instruction = system_instruction
+                    custom_api_params = self._resolve_translator_custom_api_params(self.model_name)
+                    apply_gemini_sdk_generation_params(generation_config, custom_api_params)
+                    if custom_api_params:
+                        self.logger.debug(f"使用翻译模型预设参数: {custom_api_params}")
                     if use_streaming:
                         try:
                             self._reset_stream_json_preview()
@@ -781,7 +777,9 @@ class GeminiHighQualityTranslator(CommonTranslator):
                 
                 await self._sleep_with_cancel_polling(1)
         
-        return texts # Fallback in case loop finishes unexpectedly
+        raise last_exception if last_exception else RuntimeError(
+            f"{self._log_provider_name()} translation failed without a response"
+        )
 
     async def _translate(self, from_lang: str, to_lang: str, queries: List[str], ctx=None) -> List[str]:
         """主翻译方法"""

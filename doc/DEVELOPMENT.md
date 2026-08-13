@@ -10,28 +10,48 @@
 - `packaging/launch.py` 和 GitHub Actions 也都按 Python 3.12 运行。
 - 可以使用 `venv`、Conda 或项目安装脚本创建环境，不强制要求环境名必须叫 `manga-env`。
 
+### 依赖声明方式
+
+依赖现在统一声明在仓库根目录的 `pyproject.toml`：
+
+- 公共依赖写在 `[project] dependencies`。
+- 五种后端是互斥的 dependency groups：`cpu` / `cuda13.0` / `cuda12.6` / `rocm7.2.1` / `metal`（`[tool.uv] conflicts` 保证互斥）。Docker 内部保留 `gpu` 兼容别名，不用于安装器或发行附件命名。
+- 默认组是 `cuda13.0` + `packaging` + `test`，所以裸 `uv sync` / `uv run` 使用 NVIDIA CUDA 13.0；CUDA 12.6 直接使用同一分支中的 `cuda12.6` 组。安装器使用 `--no-default-groups`，不会检查或安装 `test` 组。
+- PyTorch 源通过 `[tool.uv.sources]` + `[[tool.uv.index]]` 绑定：`cuda13.0` 使用 `whl/cu130`，`cuda12.6` 使用 `whl/cu126`，`cpu` 使用 `whl/cpu`，Linux `rocm7.2.1` 使用 `whl/rocm7.2`，`metal` 走默认 PyPI。
+- `uv.lock` 是锁定文件，已提交在仓库里，请勿手改。
+
+旧的 `requirements_cpu.txt` / `requirements_gpu.txt` / `requirements_amd.txt` / `requirements_metal.txt` 已删除。
+
 ### 依赖安装
 
-按你的运行目标只安装一套依赖即可：
+推荐使用 uv，按你的运行目标只装一套 dependency group：
 
 ```bash
-# CPU
-pip install -r requirements_cpu.txt
+# NVIDIA CUDA 13.0（默认）
+uv sync
 
-# NVIDIA GPU（CUDA 12.x）
-pip install -r requirements_gpu.txt
+# NVIDIA CUDA 12.6
+uv sync --no-default-groups --group cuda12.6
 
-# AMD GPU（实验性）
-pip install -r requirements_amd.txt
+# 其他后端关闭默认组后显式选择
+uv sync --no-default-groups --group cpu
+uv sync --no-default-groups --group metal
 
-# Apple Silicon / Metal
-pip install -r requirements_metal.txt
+# AMD（Linux）：使用 PyTorch 官方 ROCm 7.2 索引
+uv sync --no-default-groups --group rocm7.2.1
+# Windows AMD 由 Windows 安装脚本按 Radeon ROCm 7.2.1 SDK -> PyTorch 顺序处理
 ```
 
-如果你要做 PyInstaller 打包，还需要：
+源码仓库中的 `uv sync` 会自动创建 `.venv` 并按 `uv.lock` 复现依赖；Windows 便携安装包使用自带的 `packaging\python`，不会创建 `.venv`。如果想把源码依赖装进已有环境，也可以：
 
 ```bash
-pip install pyinstaller
+uv sync --active
+```
+
+默认 GPU 环境已经包含 `packaging` 与 `test` 组。其他后端做 PyInstaller 打包时加上：
+
+```bash
+uv sync --no-default-groups --group cpu --group packaging
 ```
 
 ## 2. 仓库结构
@@ -69,7 +89,7 @@ manga-translator-ui-package/
 │  ├─ utils/                   # 通用工具与中间格式
 │  └─ server/                  # FastAPI 服务端、静态页面、管理后台
 ├─ packaging/                  # 启动脚本、更新脚本、PyInstaller、Docker
-├─ examples/                   # 默认配置、模板、翻译器注册表
+├─ config/                     # 默认配置、模板、翻译器注册表
 ├─ .github/                    # CI/CD、Issue 模板
 ├─ doc/                        # 用户文档与 changelog
 ├─ fonts/                      # 默认字体资源
@@ -161,13 +181,13 @@ python -m manga_translator local -i path/to/image.png -o path/to/output
 
 ### 开发环境常用的已跟踪资源
 
-- 默认配置模板：`examples/config-example.json`
-- 翻译器注册表：`examples/config/translators.json`
+- 默认配置模板：`config/config-example.json`
+- 翻译器注册表：`config/config/translators.json`
 - 资源目录：`fonts/`、`dict/`、`doc/`、`desktop_qt_ui/locales/`
 
 ### 打包时需要关注的已跟踪资源
 
-- `examples/`
+- `config/`
 - `fonts/`
 - `dict/`
 - `doc/`
@@ -183,14 +203,11 @@ python -m manga_translator local -i path/to/image.png -o path/to/output
 ### 5.1 推荐启动顺序
 
 ```bash
-# 1. 创建并激活环境
-python -m venv .venv
+# 1. 安装默认 GPU 依赖（会自动创建 .venv 并按 uv.lock 复现）
+uv sync
 
-# Windows PowerShell
+# 2. 激活环境（Windows PowerShell）
 .venv\Scripts\Activate.ps1
-
-# 2. 安装依赖（示例：CPU）
-pip install -r requirements_cpu.txt
 
 # 3. 启动桌面端
 python -m desktop_qt_ui.main
@@ -212,7 +229,7 @@ python -m manga_translator web --host 127.0.0.1 --port 8000 -v
    定义字段、默认值、类型、校验和兼容迁移。
 2. `manga_translator/config.py`
    如果这个设置会进入核心翻译流水线、CLI、Web 服务或底层模块配置，还要同步这里的核心配置模型和相关枚举；否则桌面端存下来了，后端实际运行时可能根本读不到。
-3. `examples/config-example.json`
+3. `config/config-example.json`
    同步默认配置模板，保证新字段能写入导出配置和首次启动配置。
 4. `desktop_qt_ui/ui/main_page/settings_tab_layout.json`
    如果这个设置要出现在设置页，需要把 `section.key` 放进对应 tab 的 `items`。
@@ -234,7 +251,7 @@ python -m manga_translator web --host 127.0.0.1 --port 8000 -v
 - 如果设置也要影响命令行或 Web 运行：
   检查 `manga_translator/config.py`、`manga_translator/args.py`、相关 mode/service 的参数合并逻辑，以及后端实际消费点。
 - 如果设置引入新的 API 依赖或环境变量：
-  检查 `examples/config/translators.json` 和 `desktop_qt_ui/services/config_service.py` 里的校验逻辑。
+  检查 `config/config/translators.json` 和 `desktop_qt_ui/services/config_service.py` 里的校验逻辑。
 - 如果设置属于导入导出时应排除的临时状态：
   检查 `desktop_qt_ui/app_logic.py` 的 `export_config()` / `import_config()`。
 - 如果设置会影响编辑器侧展示或编辑行为：
@@ -246,7 +263,7 @@ python -m manga_translator web --host 127.0.0.1 --port 8000 -v
 
 1. 在 `manga_translator/<对应模块>/` 新增实现
 2. 更新配置/枚举入口
-3. 如果涉及 API 环境变量，更新 `examples/config/translators.json`
+3. 如果涉及 API 环境变量，更新 `config/config/translators.json`
 4. 必要时补 UI 选项、文档说明和测试
 
 #### 修改编辑器行为
@@ -274,7 +291,7 @@ ruff check desktop_qt_ui manga_translator --config desktop_qt_ui/ruff.toml
 
 这个结论的边界是：
 
-- 仓库中没有其他已跟踪的 `pyproject.toml`、`setup.cfg`、`tox.ini`、`.flake8`、第二份 `ruff.toml` 等配置文件。
+- 仓库根目录的 `pyproject.toml` 只负责依赖声明，不包含 lint 配置；此外没有其他已跟踪的 `setup.cfg`、`tox.ini`、`.flake8`、第二份 `ruff.toml` 等配置文件。
 - 当前 GitHub Actions 里也没有显式执行 lint 步骤。
 - 所以上面的命令更适合作为本地自检入口，不表示仓库 CI 当前已经把它当成必过步骤。
 
@@ -308,23 +325,21 @@ python packaging/build_packages.py <version> --build both
 
 面向最终用户的脚本主要在仓库根目录：
 
-- `步骤1-首次安装.bat`
-- `步骤2-启动Qt界面.bat`
-- `步骤3-检查更新并启动.bat`
-- `步骤4-更新维护.bat`
-- `macOS_*.sh`
+- `Win-Start.bat`（启动）
+- `Win-Install-or-Update.bat`（安装或更新维护菜单）
+- `Unix-Install-or-Update.sh` / `Unix-Start.sh`（Linux/macOS）
 
 这些脚本的实际逻辑集中在 `packaging/launch.py`、`packaging/git_update.py` 等文件里。修改安装/更新行为时，不要只改 `.bat` 或 `.sh` 外壳。
 
 ### CI/CD
 
 - `.github/workflows/build-and-release.yml`
-  - Windows 上构建 CPU/GPU PyInstaller 包
-  - Ubuntu 上整理 `_internal` 资源并发布 Release
+  - Windows 上基于便携基础包构建 CPU、NVIDIA CUDA 13.0 GPU、NVIDIA CUDA 12.6 GPU、AMD 四种运行时，安装锁定依赖和模型后生成 7z 分卷
+  - Ubuntu 上汇总四个构建产物，并发布 GitHub Release
 - `.github/workflows/docker-build-push.yml`
   - 基于 `packaging/Dockerfile` 构建 CPU/GPU Docker 镜像
 
-如果你新增了打包必须资源，请同步更新 workflow 中复制 `_internal` 的步骤。
+如果你新增了打包必须资源，请同步更新 workflow 中复制到可执行文件同级的步骤。
 
 ## 8. 开发建议
 
@@ -339,4 +354,3 @@ python packaging/build_packages.py <version> --build both
 - [命令行模式](CLI_USAGE.md)
 - [调试指南](DEBUGGING.md)
 - [设置说明](SETTINGS.md)
-

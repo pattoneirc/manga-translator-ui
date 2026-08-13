@@ -1,3 +1,6 @@
+from contextlib import redirect_stdout
+from io import StringIO
+
 import logging
 import os
 import sys
@@ -7,6 +10,7 @@ import warnings
 warnings.filterwarnings('ignore', message='.*Triton.*')
 warnings.filterwarnings('ignore', message='.*triton.*')
 warnings.filterwarnings('ignore', message='.*pkg_resources.*')
+warnings.filterwarnings('ignore', message='.*pynvml package is deprecated.*', category=FutureWarning)
 warnings.filterwarnings('ignore', category=DeprecationWarning, module='ctranslate2')
 warnings.filterwarnings('ignore', module='xformers')
 
@@ -14,12 +18,23 @@ warnings.filterwarnings('ignore', module='xformers')
 # expandable_segments 可以减少显存碎片，避免 OOM 错误
 os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 
+# 允许桌面端加载解码后超过 Qt 默认 256 MiB 限制的长图。
+os.environ.setdefault('QT_IMAGEIO_MAXALLOC', '1024')
+
 # 修复便携版Python的路径问题：将脚本所在目录添加到sys.path开头
 # 便携版Python使用._pth文件会禁用自动添加脚本目录的默认行为
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # 将项目根目录添加到 sys.path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(project_root)
+
+# 让运行时模块在导入阶段也读取桌面端实际使用的 .env。
+if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+    env_dir = os.path.dirname(sys.executable)
+else:
+    env_dir = project_root
+os.environ.setdefault('MANGA_TRANSLATOR_ENV_PATH', os.path.join(env_dir, '.env'))
 
 # 修复PyInstaller打包后onnxruntime的DLL加载问题
 if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
@@ -39,7 +54,12 @@ try:
 except ImportError:
     pass
 
+# qfluentwidgets 会在导入时无条件打印推广信息，桌面入口只静默这一次导入。
+with redirect_stdout(StringIO()):
+    import qfluentwidgets  # noqa: F401
+
 from ui.main_window import MainWindow
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
 from services import init_services
 from utils.app_version import get_app_version
@@ -85,17 +105,16 @@ def _set_windows_app_user_model_id():
     except Exception:
         logging.exception("设置 Windows AppUserModelID 失败")
 
+def _apply_windows_window_class_icon(window, icon_path: str):
+    """在首次显示前设置窗口类图标，供任务栏初始化时读取。"""
+    if not icon_path:
+        return False
 
-def _apply_windows_native_window_icon(window, icon_path: str):
-    """为 Windows 原生窗口句柄设置大小图标，覆盖 python.exe 默认图标。"""
     try:
         import ctypes
         from ctypes import wintypes
 
-        hwnd = wintypes.HWND(int(window.winId()))
         user32 = ctypes.windll.user32
-        user32.GetSystemMetrics.argtypes = [ctypes.c_int]
-        user32.GetSystemMetrics.restype = ctypes.c_int
         user32.LoadImageW.argtypes = [
             wintypes.HINSTANCE,
             wintypes.LPCWSTR,
@@ -105,55 +124,36 @@ def _apply_windows_native_window_icon(window, icon_path: str):
             wintypes.UINT,
         ]
         user32.LoadImageW.restype = wintypes.HANDLE
-        user32.SendMessageW.argtypes = [
+        user32.SetClassLongPtrW.argtypes = [
             wintypes.HWND,
-            wintypes.UINT,
-            wintypes.WPARAM,
-            wintypes.LPARAM,
+            ctypes.c_int,
+            ctypes.c_void_p,
         ]
-        user32.SendMessageW.restype = ctypes.c_ssize_t
+        user32.SetClassLongPtrW.restype = ctypes.c_ssize_t
 
         image_icon = 1
-        wm_seticon = 0x0080
-        icon_small = 0
-        icon_big = 1
         lr_loadfromfile = 0x0010
-
-        sm_cxicon = 11
-        sm_cyicon = 12
-        sm_cxsmicon = 49
-        sm_cysmicon = 50
-
-        big_icon_handle = user32.LoadImageW(
-            None,
-            icon_path,
-            image_icon,
-            user32.GetSystemMetrics(sm_cxicon),
-            user32.GetSystemMetrics(sm_cyicon),
-            lr_loadfromfile,
+        big_icon = user32.LoadImageW(
+            None, icon_path, image_icon, 256, 256, lr_loadfromfile
         )
-        small_icon_handle = user32.LoadImageW(
-            None,
-            icon_path,
-            image_icon,
-            user32.GetSystemMetrics(sm_cxsmicon),
-            user32.GetSystemMetrics(sm_cysmicon),
-            lr_loadfromfile,
+        small_icon = user32.LoadImageW(
+            None, icon_path, image_icon, 32, 32, lr_loadfromfile
         )
 
-        if big_icon_handle:
-            user32.SendMessageW(hwnd, wm_seticon, icon_big, big_icon_handle)
-        if small_icon_handle:
-            user32.SendMessageW(hwnd, wm_seticon, icon_small, small_icon_handle)
+        hwnd = wintypes.HWND(int(window.winId()))
+        if big_icon:
+            user32.SetClassLongPtrW(hwnd, -14, big_icon)  # GCLP_HICON
+        if small_icon:
+            user32.SetClassLongPtrW(hwnd, -34, small_icon)  # GCLP_HICONSM
 
-        if big_icon_handle or small_icon_handle:
-            window._native_icon_handles = (big_icon_handle, small_icon_handle)
-            logging.info(f"Windows 原生窗口图标已设置: {icon_path}")
+        if big_icon or small_icon:
+            # Keep the native handles alive for the whole window lifetime.
+            window._native_class_icon_handles = (big_icon, small_icon)
             return True
 
-        logging.warning(f"Windows 原生窗口图标加载失败: {icon_path}")
+        logging.warning(f"Windows窗口类图标加载失败: {icon_path}")
     except Exception:
-        logging.exception("设置 Windows 原生窗口图标失败")
+        logging.exception("设置Windows窗口类图标失败")
     return False
 
 
@@ -184,108 +184,42 @@ def main():
     """
     应用主入口
     """
-    # --- 日志配置（异步优化）---
+    # --- 日志配置：所有格式化/控制台/文件/recent 写入都在监听线程 ---
     import atexit
-    import queue
-    import threading
-    
-    # 创建异步日志处理器
-    class AsyncStreamHandler(logging.Handler):
-        """异步日志处理器，避免阻塞主线程"""
-        def __init__(self, stream=sys.stdout):
-            super().__init__()
-            self.stream = stream
-            # 限制队列大小为1000，避免日志过多导致内存占用
-            self.log_queue = queue.Queue(maxsize=1000)
-            self.running = True
-            self.thread = threading.Thread(target=self._worker, daemon=True)
-            self.thread.start()
-        
-        def _worker(self):
-            while self.running:
-                try:
-                    # ✅ 减少超时时间，更快处理日志
-                    record = self.log_queue.get(timeout=0.01)
-                    if record is None:
-                        break
-                    msg = self.format(record)
-                    self.stream.write(msg + '\n')
-                    # ✅ 每条日志立即刷新
-                    self.stream.flush()
-                except queue.Empty:
-                    # ✅ 即使队列为空也刷新一次，确保之前的输出显示
-                    try:
-                        self.stream.flush()
-                    except Exception:
-                        pass
-                    continue
-                except Exception:
-                    pass
-        
-        def emit(self, record):
-            try:
-                self.log_queue.put_nowait(record)
-            except queue.Full:
-                pass  # 队列满时丢弃日志，避免阻塞
-        
-        def close(self):
-            self.running = False
-            self.log_queue.put(None)
-            self.thread.join(timeout=1)
-            super().close()
-    
-    # 配置异步日志（控制台）
-    async_handler = AsyncStreamHandler(sys.stdout)
+    from services.log_service import configure_queue_logging, shutdown_queue_logging
+
     log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(name)s] - %(message)s')
-    async_handler.setFormatter(log_formatter)
-    
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)  # 根日志器设为 DEBUG 以允许所有日志通过
-    root_logger.addHandler(async_handler)
-    
-    # 确保程序退出时正确关闭日志处理器
-    atexit.register(async_handler.close)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(log_formatter)
     
     # --- 日志文件配置 ---
     from datetime import datetime
     
-    # 创建强制刷新的文件处理器类（确保日志立即写入磁盘，防止丢失）
-    class FlushingFileHandler(logging.FileHandler):
-        """每次写入后立即刷新到磁盘的文件处理器"""
-        def emit(self, record):
-            super().emit(record)
-            self.flush()  # 强制刷新缓冲区
-    
-    # 日志目录放在 result/ 下
+    # 日志目录放在 app.exe 同级的 result/ 下
     if getattr(sys, 'frozen', False):
-        log_dir = os.path.join(os.path.dirname(sys.executable), '_internal', 'result')
+        log_dir = os.path.join(os.path.dirname(sys.executable), 'result')
     else:
         log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'result')
+    log_dir = os.path.normpath(os.path.abspath(log_dir))
     os.makedirs(log_dir, exist_ok=True)
     
     # 生成带时间戳的日志文件名
     timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-    log_file_path = os.path.join(log_dir, f'log_{timestamp}.txt')
+    log_file_path = os.path.normpath(os.path.abspath(os.path.join(log_dir, f'log_{timestamp}.txt')))
     
-    # 使用强制刷新的文件处理器
-    file_handler = FlushingFileHandler(log_file_path, encoding='utf-8', delay=False)
+    file_handler = logging.FileHandler(log_file_path, encoding='utf-8', delay=False)
     file_handler.setLevel(logging.DEBUG)  # 始终为 DEBUG 级别
     file_handler.setFormatter(log_formatter)
-    root_logger.addHandler(file_handler)
-    
-    # 确保程序退出时关闭文件处理器
-    atexit.register(file_handler.close)
+    configure_queue_logging((console_handler, file_handler), queue_size=10_000)
+    atexit.register(shutdown_queue_logging)
     
     logging.info(f"UI日志文件: {log_file_path}")
     
     # --- 确保配置文件存在 ---
     try:
-        from manga_translator.utils.text_filter import ensure_filter_list_exists
-        ensure_filter_list_exists()
-        from manga_translator.rendering.text_replacements import ensure_text_replacements_exists
-        ensure_text_replacements_exists()
-        from manga_translator.utils.translation_template import ensure_translation_template_exists
-        ensure_translation_template_exists()
+        from manga_translator.runtime_files import ensure_runtime_files
+        ensure_runtime_files(logging.getLogger("manga_translator"))
     except Exception as e:
         logging.warning(f"创建配置文件失败: {e}")
     
@@ -294,18 +228,28 @@ def main():
     # 将崩溃信息直接写入同一个日志文件
     import faulthandler
     # 使用 file_handler 的流对象
-    faulthandler.enable(file=file_handler.stream, all_threads=True)
-    logging.info("已启用崩溃捕获 (faulthandler)，崩溃信息将记录在此文件中")
+    # all_threads=False：原生文件对话框打开时 Windows 会高频抛出无害的
+    # 0x8001010e (RPC_E_WRONG_THREAD)，faulthandler 每次都无锁遍历所有
+    # 运行中线程的帧栈，与 OCR/修复线程竞态最终产生 access violation 导致闪退
+    faulthandler.enable(file=file_handler.stream, all_threads=False)
 
     # --- 环境设置 ---
     # Windows特殊处理：必须在创建QApplication之前设置AppUserModelID
     if sys.platform == 'win32':
         _set_windows_app_user_model_id()
+
+        # qframelesswindow#185: opening a FramelessDialog must not force its
+        # sibling widgets to become native, or maximize/restore can duplicate
+        # and offset their rendered surfaces.
+        QApplication.setAttribute(
+            Qt.ApplicationAttribute.AA_DontCreateNativeWidgetSiblings,
+            True,
+        )
     
     # 1. 创建 QApplication 实例
     app = QApplication(sys.argv)
-    app.setApplicationName("Manga Translator")
-    app.setOrganizationName("Manga Translator")
+    app.setApplicationName("Manga Translator UI")
+    app.setOrganizationName("Manga Translator UI")
     app_version = get_app_version()
     if app_version != "unknown":
         app.setApplicationVersion(app_version)
@@ -329,29 +273,20 @@ def main():
     from PyQt6.QtCore import qInstallMessageHandler
     qInstallMessageHandler(qt_message_handler)
     
-    app_icon = None
-    native_windows_icon_path = None
-    native_macos_icon_path = None
-
-    icon_candidates = []
     if sys.platform == 'darwin':
-        icon_candidates.extend([
-            os.path.join('doc', 'images', 'icon.icns'),
-            os.path.join('doc', 'images', 'icon.png'),
-            os.path.join('doc', 'images', 'icon.ico'),
-        ])
+        icon_relative_path = os.path.join('doc', 'images', 'icon.icns')
+    elif sys.platform == 'win32':
+        icon_relative_path = os.path.join('desktop_qt_ui', 'ui', 'icons', 'icon.ico')
     else:
-        icon_candidates.extend([
-            os.path.join('doc', 'images', 'icon.ico'),
-            os.path.join('doc', 'images', 'icon.png'),
-        ])
+        icon_relative_path = os.path.join('doc', 'images', 'icon.png')
 
-    app_icon, icon_source = load_icon_from_resources(icon_candidates)
+    # 单一图标源；Qt 应用图标和 Windows 窗口类图标都使用它。
+    app_icon, icon_source = load_icon_from_resources([icon_relative_path])
     if app_icon and not app_icon.isNull():
         app.setWindowIcon(app_icon)
-        logging.info(f"UI 图标加载成功: {icon_source}")
+        logging.info(f"UI 图标已设置: {icon_source}")
     else:
-        logging.warning("UI 图标加载失败：未找到可用的 icon.ico/icon.png/icon.icns")
+        logging.warning(f"UI 图标加载失败: {icon_relative_path}")
 
     if sys.platform == 'darwin':
         native_macos_icon_path = next(
@@ -363,19 +298,11 @@ def main():
         else:
             logging.warning("macOS 原生应用图标未找到：doc/images/icon.icns")
 
-    if sys.platform == 'win32':
-        native_windows_icon_path = next(
-            iter_existing_resource_paths([os.path.join('doc', 'images', 'icon.ico')]),
-            None,
-        )
-        if not native_windows_icon_path:
-            logging.warning("Windows 原生窗口图标未找到：doc/images/icon.ico")
 
     # 2. 初始化所有服务
-    # 设置正确的根目录：打包后指向_internal，开发时指向项目根目录
-    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-        # PyInstaller打包环境：所有资源在_internal目录
-        root_dir = sys._MEIPASS
+    # 打包后资源根目录为 app.exe 所在目录；_internal 只保留依赖。
+    if getattr(sys, 'frozen', False):
+        root_dir = os.path.dirname(os.path.abspath(sys.executable))
     else:
         # 开发环境：资源在项目根目录
         root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -386,21 +313,30 @@ def main():
 
     # 3. 创建并显示主窗口
     main_window = MainWindow()
-    
-    # 确保主窗口也设置了图标
+
+    # FluentTitleBar 只监听 windowIconChanged，不会读取已继承的应用图标。
     if app_icon and not app_icon.isNull():
         main_window.setWindowIcon(app_icon)
-    
-    main_window.show()
 
-    if sys.platform == 'win32' and native_windows_icon_path:
-        _apply_windows_native_window_icon(main_window, native_windows_icon_path)
+    # Windows 任务栏在首次显示时可能读取窗口类图标，而不是 WM_GETICON。
+    if sys.platform == 'win32':
+        _apply_windows_window_class_icon(main_window, icon_relative_path)
+    
+
+    main_window.show()
 
     # 避免在 Windows 初始 show 流程内同步处理事件。
     # 这会触发 Qt/Windows 的重入消息处理，可能导致 RPC_E_CANTCALLOUT_ININPUTSYNCCALL。
     from PyQt6.QtCore import QTimer
 
     def finalize_window_activation():
+        """启动置前的最小集合。
+
+        Windows 上普通进程直接调 SetForegroundWindow 常被系统拒绝
+        （前台锁定），因此保留 AttachThreadInput 技巧：临时挂接到当前
+        前台窗口所在线程的输入队列后再置前。TOPMOST/NOTOPMOST 往返、
+        重复 ShowWindow、SetActiveWindow/SetFocus 等冗余调用已移除——
+        它们对已完成首帧的窗口只产生一轮 z-order 抖动（启动闪烁）。"""
         try:
             if main_window.isMinimized():
                 main_window.showNormal()
@@ -421,38 +357,14 @@ def main():
                     user32.GetWindowThreadProcessId.restype = wintypes.DWORD
                     user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
                     user32.AttachThreadInput.restype = wintypes.BOOL
-                    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
-                    user32.ShowWindow.restype = wintypes.BOOL
-                    user32.SetWindowPos.argtypes = [
-                        wintypes.HWND,
-                        wintypes.HWND,
-                        ctypes.c_int,
-                        ctypes.c_int,
-                        ctypes.c_int,
-                        ctypes.c_int,
-                        ctypes.c_uint,
-                    ]
-                    user32.SetWindowPos.restype = wintypes.BOOL
                     user32.BringWindowToTop.argtypes = [wintypes.HWND]
                     user32.BringWindowToTop.restype = wintypes.BOOL
                     user32.SetForegroundWindow.argtypes = [wintypes.HWND]
                     user32.SetForegroundWindow.restype = wintypes.BOOL
-                    user32.SetActiveWindow.argtypes = [wintypes.HWND]
-                    user32.SetActiveWindow.restype = wintypes.HWND
-                    user32.SetFocus.argtypes = [wintypes.HWND]
-                    user32.SetFocus.restype = wintypes.HWND
                     kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 
                     hwnd = int(main_window.winId())
                     if hwnd:
-                        SW_RESTORE = 9
-                        SW_SHOW = 5
-                        SWP_NOMOVE = 0x0002
-                        SWP_NOSIZE = 0x0001
-                        SWP_SHOWWINDOW = 0x0040
-                        HWND_TOPMOST = -1
-                        HWND_NOTOPMOST = -2
-
                         foreground_hwnd = user32.GetForegroundWindow()
                         current_thread_id = kernel32.GetCurrentThreadId()
                         foreground_thread_id = 0
@@ -473,30 +385,8 @@ def main():
                             )
 
                         try:
-                            user32.ShowWindow(wintypes.HWND(hwnd), SW_RESTORE)
-                            user32.ShowWindow(wintypes.HWND(hwnd), SW_SHOW)
-                            user32.SetWindowPos(
-                                wintypes.HWND(hwnd),
-                                wintypes.HWND(HWND_TOPMOST),
-                                0,
-                                0,
-                                0,
-                                0,
-                                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
-                            )
-                            user32.SetWindowPos(
-                                wintypes.HWND(hwnd),
-                                wintypes.HWND(HWND_NOTOPMOST),
-                                0,
-                                0,
-                                0,
-                                0,
-                                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
-                            )
                             user32.BringWindowToTop(wintypes.HWND(hwnd))
                             user32.SetForegroundWindow(wintypes.HWND(hwnd))
-                            user32.SetActiveWindow(wintypes.HWND(hwnd))
-                            user32.SetFocus(wintypes.HWND(hwnd))
                         finally:
                             if attached:
                                 user32.AttachThreadInput(
@@ -509,44 +399,37 @@ def main():
         except Exception as exc:
             logging.debug(f"激活主窗口失败: {exc}")
 
-    if sys.platform == 'win32':
-        QTimer.singleShot(0, finalize_window_activation)
-        QTimer.singleShot(250, finalize_window_activation)
-    else:
-        QTimer.singleShot(0, finalize_window_activation)
+    # 只调度一次：250ms 后的第二轮完整激活序列对已显示窗口毫无必要，
+    # 且是启动阶段窗口闪烁的来源
+    QTimer.singleShot(0, finalize_window_activation)
 
     # 4. 启动事件循环
     ret = app.exec()
-    logging.info("Exiting application...")
+
+    # Persist the latest coalesced config/.env snapshots before services vanish.
+    try:
+        from services import get_config_service
+        config_service = get_config_service()
+        if config_service is not None and not config_service.shutdown():
+            logging.error("配置服务关闭前未能保存全部待处理写入")
+    except Exception as e:
+        logging.error(f"关闭配置服务时出错: {e}", exc_info=True)
 
     try:
         from services import shutdown_services
         shutdown_services()
     except Exception as e:
         logging.error(f"关闭服务时出错: {e}", exc_info=True)
-    
-    # 确保所有日志都写入文件
+
     try:
-        # 刷新所有日志处理器
-        for handler in logging.root.handlers:
-            handler.flush()
-        
-        # 关闭异步日志处理器
-        if 'async_handler' in locals():
-            async_handler.close()
-        
-        # 关闭文件日志处理器
-        if 'file_handler' in locals():
-            file_handler.flush()
-            file_handler.close()
+        faulthandler.disable()
+        shutdown_queue_logging()
     except Exception as e:
         print(f"关闭日志处理器时出错: {e}", file=sys.stderr)
-    
-    # 使用 os._exit 强制退出，防止守护线程阻塞
-    os._exit(ret)
+    return ret
 
 if __name__ == '__main__':
     # 在创建QApplication之前设置DPI策略，这是解决DPI问题的另一种稳妥方式
     os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
     os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
-    main()
+    raise SystemExit(main())

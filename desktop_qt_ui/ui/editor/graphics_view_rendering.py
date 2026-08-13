@@ -3,14 +3,13 @@ from __future__ import annotations
 import copy
 
 import numpy as np
-from PyQt6.QtCore import QTimer, pyqtSlot
+from PyQt6.QtCore import QTimer
 from editor import text_renderer_backend
 from editor.region_geometry_state import RegionGeometryState
 from editor.region_render_snapshot import RegionRenderSnapshot
 from editor.render_layout_pipeline import (
-    build_region_specific_params,
     calculate_region_dst_points,
-    prepare_layout_context,
+    resolve_region_layout_parameters,
 )
 from editor.text_render_pipeline import (
     build_region_render_params as pipeline_build_region_render_params,
@@ -20,7 +19,6 @@ from editor.text_render_pipeline import (
 )
 from editor.text_render_pipeline import (
     clear_region_text,
-    make_text_render_cache_key,
     render_region_text,
 )
 from services import get_render_parameter_service
@@ -30,37 +28,91 @@ from .graphics_items import RegionTextItem
 
 class GraphicsViewRenderingMixin:
     def _schedule_render_update(self) -> None:
-        if getattr(self, "_render_update_immediate_once", False):
-            self._render_update_immediate_once = False
+        # 场景里还没有 region item 时（切图/清空后的首次重建）立即执行，避免防抖延迟出现空白帧；
+        # 已有内容时用防抖合并连续的整批重建请求。
+        immediate = not self._region_items
+        if immediate:
             if self.render_debounce_timer.isActive():
                 self.render_debounce_timer.stop()
             if not self._immediate_render_update_pending:
                 self._immediate_render_update_pending = True
                 QTimer.singleShot(0, self._perform_render_update)
             return
-
+        if self._immediate_render_update_pending:
+            return
         self.render_debounce_timer.start()
 
-    def on_regions_changed(self, regions):
-        same_item_count = len(regions) == len(self._region_items)
-        pending_indices = list(self._pending_geometry_edit_kinds.keys())
-        handled = False
-        if same_item_count:
-            for region_index in pending_indices:
-                edit_kind = self._consume_pending_geometry_edit(region_index)
-                if edit_kind is None:
-                    continue
+    def on_regions_changed(self, change):
+        self.clear_region_style_preview()
+        if change.kind == "updated":
+            for region_index in change.indices:
                 if 0 <= region_index < len(self._region_items):
-                    self._perform_single_item_update(region_index, edit_kind=edit_kind)
-                    handled = True
+                    self._perform_single_item_update(
+                        region_index,
+                        edit_kind=self._consume_pending_geometry_edit(region_index),
+                    )
+        elif change.kind == "inserted":
+            self._handle_regions_inserted(change.indices)
+        elif change.kind == "removed":
+            self._handle_regions_removed(change.indices)
+        else:
+            self._clear_pending_geometry_edits()
+            self.render_coordinator.clear_render_snapshots()
+            self._schedule_render_update()
 
-        if handled:
+    def _renumber_region_items_from(self, start_index: int) -> None:
+        for region_index in range(max(0, int(start_index)), len(self._region_items)):
+            item = self._region_items[region_index]
+            if item is not None:
+                item.region_index = region_index
+
+    def _handle_regions_inserted(self, indices) -> None:
+        regions = self.model.get_regions()
+        if self._image_item is None:
+            self._schedule_render_update()
             return
 
+        first_changed = len(self._region_items)
+        for index in sorted(indices):
+            if not (0 <= index < len(regions)):
+                continue
+            item = RegionTextItem(
+                regions[index],
+                index,
+                geometry_callback=self._on_region_geometry_changed,
+            )
+            item.set_snap_enabled(getattr(self, "_snap_enabled", False))
+            item.set_image_item(self._image_item)
+            item.setZValue(100)
+            self.scene.addItem(item)
+            insert_at = max(0, min(index, len(self._region_items)))
+            self._region_items.insert(insert_at, item)
+            self.render_coordinator.insert_region(insert_at)
+            first_changed = min(first_changed, insert_at)
+
+        self._renumber_region_items_from(first_changed)
+        for index in sorted(indices):
+            if 0 <= index < len(self._region_items):
+                self._perform_single_item_update(index)
+        self.scene.update()
+
+    def _handle_regions_removed(self, indices) -> None:
+        first_changed = len(self._region_items)
+        for index in sorted(indices, reverse=True):
+            if not (0 <= index < len(self._region_items)):
+                continue
+            item = self._region_items.pop(index)
+            try:
+                if item and hasattr(item, "scene") and item.scene():
+                    self.scene.removeItem(item)
+            except (RuntimeError, AttributeError):
+                pass
+            self.render_coordinator.remove_region(index)
+            first_changed = min(first_changed, index)
+
+        self._renumber_region_items_from(first_changed)
         self._clear_pending_geometry_edits()
-        self.render_coordinator.clear_text_render_cache()
-        self.render_coordinator.clear_render_snapshots()
-        self._schedule_render_update()
+        self.scene.update()
 
     def _log_layout_failure(
         self,
@@ -201,64 +253,46 @@ class GraphicsViewRenderingMixin:
         geo_state.set_render_box(dst_points)
         return geo_state.to_render_box_patch()
 
-    def _persist_single_render_box(self, index: int, dst_points):
-        regions = self.model.get_regions()
-        if not (0 <= index < len(regions)):
-            return
+    def _build_derived_region(self, region_data: dict, dst_points) -> dict | None:
+        """基于渲染结果计算 region 的派生字段写回；无实际变化时返回 None。
 
-        region_data = copy.deepcopy(regions[index])
-        if not isinstance(region_data, dict):
-            return
-
+        不修改传入的 region_data；有变化时返回携带新 render_box 的深拷贝。
+        """
         patch = self._build_render_box_patch(region_data, dst_points)
         new_render_box = patch.get("render_box_rect_local")
-        needs_legacy_clear = (
-            not region_data.get("has_custom_white_frame", False)
-            and region_data.get("white_frame_rect_local") is not None
-        )
-        if self._values_equal(region_data.get("render_box_rect_local"), new_render_box) and not needs_legacy_clear:
+        if self._values_equal(region_data.get("render_box_rect_local"), new_render_box):
+            return None
+        updated = copy.deepcopy(region_data)
+        updated.update(patch)
+        return updated
+
+    def _persist_single_render_box(self, index: int, dst_points):
+        region_data = self.model.get_region_by_index(index)
+        if not isinstance(region_data, dict):
             return
-
-        region_data.update(patch)
-        if not region_data.get("has_custom_white_frame", False):
-            region_data.pop("white_frame_rect_local", None)
-
-        updated_regions = list(regions)
-        updated_regions[index] = region_data
-        self.model.set_regions_silent(updated_regions)
+        updated = self._build_derived_region(region_data, dst_points)
+        if updated is not None:
+            self.model.store_derived_regions({index: updated})
 
     def _persist_render_boxes(self, regions: list[dict], dst_points_list: list):
-        if not regions:
-            return
-
-        updated_regions = [copy.deepcopy(region) for region in regions]
-        changed = False
-
+        updates: dict[int, dict] = {}
         for index, dst_points in enumerate(dst_points_list):
-            if not (0 <= index < len(updated_regions)):
+            if not (0 <= index < len(regions)):
                 continue
-            region_data = updated_regions[index]
+            region_data = regions[index]
             if not isinstance(region_data, dict):
                 continue
-
-            patch = self._build_render_box_patch(region_data, dst_points)
-            new_render_box = patch.get("render_box_rect_local")
-            needs_legacy_clear = (
-                not region_data.get("has_custom_white_frame", False)
-                and region_data.get("white_frame_rect_local") is not None
-            )
-            if self._values_equal(region_data.get("render_box_rect_local"), new_render_box) and not needs_legacy_clear:
-                continue
-
-            region_data.update(patch)
-            if not region_data.get("has_custom_white_frame", False):
-                region_data.pop("white_frame_rect_local", None)
-            changed = True
-
-        if changed:
-            self.model.set_regions_silent(updated_regions)
+            updated = self._build_derived_region(region_data, dst_points)
+            if updated is not None:
+                updates[index] = updated
+        if updates:
+            self.model.store_derived_regions(updates)
 
     def _build_render_snapshot(self, index: int, region_data: dict, item: RegionTextItem | None) -> RegionRenderSnapshot:
+        preview_patch = getattr(self, "_font_preview_overrides", {}).get(index)
+        if preview_patch:
+            region_data = copy.deepcopy(region_data)
+            region_data.update(preview_patch)
         geo_state = item.geo if (item is not None and hasattr(item, "geo")) else None
         return RegionRenderSnapshot.from_sources(
             region_index=index,
@@ -266,7 +300,7 @@ class GraphicsViewRenderingMixin:
             geo_state=geo_state,
         )
 
-    def _render_region_text_visual(self, index: int, use_cache: bool):
+    def _render_region_text_visual(self, index: int):
         if not (0 <= index < len(self._region_items)):
             return
         item = self._region_items[index]
@@ -316,26 +350,23 @@ class GraphicsViewRenderingMixin:
             unrotated_text_block,
         )
 
-        cache_key = None
-        if use_cache:
-            cache_key = make_text_render_cache_key(unrotated_text_block, dst_points, render_params)
+        render_result = render_region_text(
+            text_renderer_backend,
+            unrotated_text_block,
+            dst_points,
+            render_params,
+            len(self._text_blocks_cache),
+        )
 
-        cached_result = self.render_coordinator.get_text_render(cache_key) if cache_key is not None else None
-        if cached_result is None:
-            render_result = render_region_text(
-                text_renderer_backend,
-                unrotated_text_block,
-                dst_points,
-                render_params,
-                len(self._text_blocks_cache),
-            )
-            if render_result and cache_key is not None:
-                self.render_coordinator.store_text_render(cache_key, render_result)
-            cached_result = render_result
-
-        if cached_result:
-            pixmap, pos = cached_result
-            item.set_dst_points(dst_points)
+        if render_result:
+            if len(render_result) >= 3:
+                pixmap, pos, actual_dst_points = render_result[:3]
+            else:
+                pixmap, pos = render_result
+                actual_dst_points = dst_points
+            item.set_dst_points(actual_dst_points)
+            if index not in getattr(self, "_font_preview_overrides", {}):
+                self._persist_single_render_box(index, actual_dst_points)
             item.update_text_pixmap(
                 pixmap,
                 pos,
@@ -345,6 +376,38 @@ class GraphicsViewRenderingMixin:
             )
         else:
             clear_region_text(item)
+
+    def preview_region_style(self, region_indices, patch: dict) -> None:
+        """Render a temporary style preview without changing model data or history."""
+        if not isinstance(patch, dict) or not patch:
+            return
+        regions = self.model.get_regions()
+        overrides = {}
+        for raw_index in region_indices or []:
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < len(regions):
+                overrides[index] = copy.deepcopy(patch)
+        if not overrides:
+            return
+        self._font_preview_overrides = overrides
+        for index in overrides:
+            self._recalculate_single_region_render_data(index)
+            self._update_single_region_text_visual(index)
+        self.scene.update()
+
+    def clear_region_style_preview(self) -> None:
+        """Restore model-backed rendering after a temporary style preview."""
+        if not getattr(self, "_font_preview_overrides", None):
+            return
+        indices = list(self._font_preview_overrides)
+        self._font_preview_overrides = {}
+        for index in indices:
+            self._recalculate_single_region_render_data(index)
+            self._update_single_region_text_visual(index)
+        self.scene.update()
 
     def _perform_render_update(self):
         self._immediate_render_update_pending = False
@@ -371,6 +434,7 @@ class GraphicsViewRenderingMixin:
                     i,
                     geometry_callback=self._on_region_geometry_changed,
                 )
+                item.set_snap_enabled(getattr(self, "_snap_enabled", False))
                 item.set_image_item(self._image_item)
                 item.setZValue(100)
                 self.scene.addItem(item)
@@ -403,7 +467,7 @@ class GraphicsViewRenderingMixin:
                 return
 
             for i in range(min(len(self._region_items), len(self._text_blocks_cache), len(self._dst_points_cache))):
-                self._render_region_text_visual(i, use_cache=True)
+                self._render_region_text_visual(i)
 
         except (RuntimeError, AttributeError) as e:
             self.logger.warning("Text visuals update failed: %s", e)
@@ -427,39 +491,33 @@ class GraphicsViewRenderingMixin:
             return
 
         render_parameter_service = get_render_parameter_service()
-        global_params_dict, config_obj = prepare_layout_context(
-            render_parameter_service,
-            text_renderer_backend,
-        )
-        region_specific_params = build_region_specific_params(global_params_dict, text_block)
-        if region_dict.get("line_spacing") is not None:
-            region_specific_params["line_spacing"] = region_dict.get("line_spacing")
-        if region_dict.get("letter_spacing") is not None:
-            region_specific_params["letter_spacing"] = region_dict.get("letter_spacing")
-
+        layout_params = None
         try:
+            layout_params = resolve_region_layout_parameters(
+                render_parameter_service,
+                index,
+                snapshot.style_input(),
+                text_block,
+            )
             self._dst_points_cache[index] = calculate_region_dst_points(
                 text_block,
-                region_specific_params,
-                config_obj,
+                layout_params,
                 override_dst_points=override_dst_points,
             )
         except Exception as e:
             self._log_layout_failure(
                 index,
                 text_block,
-                region_specific_params.get("line_spacing"),
-                region_specific_params.get("letter_spacing"),
+                getattr(layout_params, "line_spacing", None),
+                getattr(layout_params, "letter_spacing", None),
                 region_dict.get("angle"),
                 e,
             )
             self._dst_points_cache[index] = None
 
-        self._persist_single_render_box(index, self._dst_points_cache[index])
-
-    def _update_single_region_text_visual(self, index, use_cache=False):
+    def _update_single_region_text_visual(self, index):
         try:
-            self._render_region_text_visual(index, use_cache=use_cache)
+            self._render_region_text_visual(index)
         except (RuntimeError, AttributeError) as e:
             self.logger.warning("Text visual update failed for region %s: %s", index, e)
         except Exception as e:
@@ -483,10 +541,6 @@ class GraphicsViewRenderingMixin:
         ]
 
         render_parameter_service = get_render_parameter_service()
-        global_params_dict, config_obj = prepare_layout_context(
-            render_parameter_service,
-            text_renderer_backend,
-        )
 
         dst_points_list = []
         for i, text_block in enumerate(self._text_blocks_cache):
@@ -495,44 +549,35 @@ class GraphicsViewRenderingMixin:
                 continue
 
             snapshot = snapshots[i] if i < len(snapshots) else None
+            layout_params = None
             try:
                 region_dict = snapshot.region_data if snapshot is not None else {}
-                region_params = build_region_specific_params(global_params_dict, text_block)
-                if region_dict.get("line_spacing") is not None:
-                    region_params["line_spacing"] = region_dict.get("line_spacing")
-                if region_dict.get("letter_spacing") is not None:
-                    region_params["letter_spacing"] = region_dict.get("letter_spacing")
+                layout_params = resolve_region_layout_parameters(
+                    render_parameter_service,
+                    i,
+                    region_dict,
+                    text_block,
+                )
                 dst_points_list.append(
                     calculate_region_dst_points(
                         text_block,
-                        region_params,
-                        config_obj,
+                        layout_params,
                     )
                 )
             except Exception as e:
                 self._log_layout_failure(
                     i,
                     text_block,
-                    global_params_dict.get("line_spacing"),
-                    global_params_dict.get("letter_spacing"),
+                    getattr(layout_params, "line_spacing", None),
+                    getattr(layout_params, "letter_spacing", None),
                     regions[i].get("angle") if i < len(regions) else "N/A",
                     e,
                 )
                 dst_points_list.append(None)
 
         self._dst_points_cache = dst_points_list
-        self._persist_render_boxes(regions, dst_points_list)
         self._update_text_visuals()
         self.scene.update()
-
-    @pyqtSlot(list)
-    def _apply_layout_result(self, dst_points_cache):
-        try:
-            self._dst_points_cache = dst_points_cache
-            self._update_text_visuals()
-            self.scene.update()
-        except Exception as e:
-            self.logger.error("Error applying layout result: %s", e, exc_info=True)
 
     def _on_region_geometry_changed(self, region_index, new_region_data):
         self._set_pending_geometry_edit(

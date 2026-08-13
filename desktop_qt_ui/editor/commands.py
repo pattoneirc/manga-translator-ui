@@ -15,14 +15,7 @@ class _PatchDeleteMarker:
 
 
 _PATCH_DELETE = _PatchDeleteMarker()
-_GEOMETRY_KEYS = {
-    "center",
-    "lines",
-    "angle",
-    "white_frame_rect_local",
-    "has_custom_white_frame",
-    "render_box_rect_local",
-}
+_NO_MASK_CHANGE = object()
 
 
 def _values_equal(left: Any, right: Any) -> bool:
@@ -53,7 +46,7 @@ def _stable_command_id(key: str) -> int:
 
 
 class UpdateRegionCommand(QUndoCommand):
-    """用于更新单个区域数据的通用命令。"""
+    """更新单个区域数据：只做 undo/redo 状态转换，通知由 EditorModel 发出。"""
 
     def __init__(
         self,
@@ -68,12 +61,10 @@ class UpdateRegionCommand(QUndoCommand):
         self._model = model
         self._index = region_index
         self._merge_key = merge_key
+        self._old_data = copy.deepcopy(old_data)
+        self._new_data = copy.deepcopy(new_data)
         self._old_patch = _build_region_patch(new_data, old_data)
         self._new_patch = _build_region_patch(old_data, new_data)
-        self._changed_keys = set(self._old_patch.keys()) | set(self._new_patch.keys())
-        self._requires_full_update = bool(self._changed_keys & _GEOMETRY_KEYS)
-        self._old_data = copy.deepcopy(old_data) if self._requires_full_update else None
-        self._new_data = copy.deepcopy(new_data) if self._requires_full_update else None
 
     def id(self) -> int:
         if not self._merge_key:
@@ -87,9 +78,9 @@ class UpdateRegionCommand(QUndoCommand):
             return False
         if self._index != other._index or self._merge_key != other._merge_key:
             return False
-        self._new_patch = copy.deepcopy(other._new_patch)
-        self._changed_keys |= other._changed_keys
-        self._requires_full_update = bool(self._changed_keys & _GEOMETRY_KEYS)
+        self._new_data = copy.deepcopy(other._new_data)
+        self._old_patch = _build_region_patch(self._new_data, self._old_data)
+        self._new_patch = _build_region_patch(self._old_data, self._new_data)
         self.setText(other.text())
         return True
 
@@ -104,53 +95,15 @@ class UpdateRegionCommand(QUndoCommand):
         return updated
 
     def _apply_patch(self, patch: Dict[str, Any]):
-        """将给定 patch 应用到模型中的区域。"""
-        regions = self._model.get_regions()
-        if not (0 <= self._index < len(regions)):
+        region_data = self._model.get_region_by_index(self._index)
+        if region_data is None:
             return
-
-        regions[self._index] = self._apply_patch_to_region(regions[self._index], patch)
-        self._model.set_regions_silent(regions)
-
-        if self._requires_full_update:
-            old_selection = self._model.get_selection()
-            self._model.regions_changed.emit(self._model.get_regions())
-            if old_selection:
-                current_regions = self._model.get_regions()
-                valid_selection = [idx for idx in old_selection if 0 <= idx < len(current_regions)]
-                if valid_selection:
-                    self._model.set_selection(valid_selection)
-        else:
-            self._model.region_style_updated.emit(self._index)
-
-    def _apply_full_data(self, data: Dict[str, Any]) -> None:
-        regions = self._model.get_regions()
-        if not (0 <= self._index < len(regions)):
-            return
-
-        regions[self._index] = copy.deepcopy(data)
-        self._model.set_regions_silent(regions)
-
-        old_selection = self._model.get_selection()
-        self._model.regions_changed.emit(self._model.get_regions())
-        if old_selection:
-            current_regions = self._model.get_regions()
-            valid_selection = [idx for idx in old_selection if 0 <= idx < len(current_regions)]
-            if valid_selection:
-                self._model.set_selection(valid_selection)
+        self._model.update_region(self._index, self._apply_patch_to_region(region_data, patch))
 
     def redo(self):
-        """执行操作：应用新 patch。"""
-        if self._requires_full_update and self._new_data is not None:
-            self._apply_full_data(self._new_data)
-            return
         self._apply_patch(self._new_patch)
 
     def undo(self):
-        """撤销操作：应用旧 patch。"""
-        if self._requires_full_update and self._old_data is not None:
-            self._apply_full_data(self._old_data)
-            return
         self._apply_patch(self._old_patch)
 
 
@@ -165,19 +118,13 @@ class AddRegionCommand(QUndoCommand):
 
     def redo(self):
         """执行添加操作。"""
-        regions = self._model.get_regions()
-        if self._index is None or self._index > len(regions):
-            self._index = len(regions)
-        regions.insert(self._index, copy.deepcopy(self._region_data))
-        self._model.set_regions(regions)
+        target_index = self._index if self._index is not None else len(self._model.get_regions())
+        self._index = self._model.insert_region(target_index, copy.deepcopy(self._region_data))
 
     def undo(self):
         """撤销添加操作。"""
-        regions = self._model.get_regions()
-        if self._index is not None and 0 <= self._index < len(regions):
-            regions.pop(self._index)
-            self._model.set_regions(regions)
-            self._model.set_selection([])
+        if self._index is not None:
+            self._model.remove_region(self._index)
 
 
 class DeleteRegionCommand(QUndoCommand):
@@ -189,27 +136,64 @@ class DeleteRegionCommand(QUndoCommand):
         region_index: int,
         region_data: Dict[str, Any],
         description: str = "Delete Region",
+        old_raw_mask: Any = _NO_MASK_CHANGE,
+        new_raw_mask: Any = _NO_MASK_CHANGE,
+        old_refined_mask: Any = _NO_MASK_CHANGE,
+        new_refined_mask: Any = _NO_MASK_CHANGE,
     ):
         super().__init__(description)
         self._model = model
         self._index = region_index
         self._deleted_data = copy.deepcopy(region_data)
+        self._old_raw_mask = self._copy_mask_value(old_raw_mask)
+        self._new_raw_mask = self._copy_mask_value(new_raw_mask)
+        self._old_refined_mask = self._copy_mask_value(old_refined_mask)
+        self._new_refined_mask = self._copy_mask_value(new_refined_mask)
+
+    @staticmethod
+    def _copy_mask_value(value):
+        if value is _NO_MASK_CHANGE:
+            return value
+        return None if value is None else np.array(value, copy=True)
+
+    def _apply_masks(self, raw_mask, refined_mask) -> None:
+        if raw_mask is not _NO_MASK_CHANGE and hasattr(self._model, "set_raw_mask"):
+            self._model.set_raw_mask(self._copy_mask_value(raw_mask))
+        if refined_mask is not _NO_MASK_CHANGE and hasattr(self._model, "set_refined_mask"):
+            self._model.set_refined_mask(self._copy_mask_value(refined_mask))
 
     def redo(self):
         """执行删除操作。"""
-        regions = self._model.get_regions()
-        if 0 <= self._index < len(regions):
-            regions.pop(self._index)
-            self._model.set_regions(regions)
-            self._model.set_selection([])
+        self._model.remove_region(self._index)
+        self._apply_masks(self._new_raw_mask, self._new_refined_mask)
 
     def undo(self):
         """撤销删除操作。"""
-        regions = self._model.get_regions()
-        if 0 <= self._index <= len(regions):
-            regions.insert(self._index, copy.deepcopy(self._deleted_data))
-            self._model.set_regions(regions)
-            self._model.set_selection([self._index])
+        self._index = self._model.insert_region(self._index, copy.deepcopy(self._deleted_data))
+        self._apply_masks(self._old_raw_mask, self._old_refined_mask)
+        self._model.set_selection([self._index])
+
+
+class MoveRegionCommand(QUndoCommand):
+    """调整区域顺序，同时支持撤销和重做。"""
+
+    def __init__(
+        self,
+        model: "EditorModel",
+        source_index: int,
+        target_index: int,
+        description: str = "Move Region",
+    ):
+        super().__init__(description)
+        self._model = model
+        self._source_index = int(source_index)
+        self._target_index = int(target_index)
+
+    def redo(self):
+        self._model.move_region(self._source_index, self._target_index)
+
+    def undo(self):
+        self._model.move_region(self._target_index, self._source_index)
 
 
 class MaskEditCommand(QUndoCommand):
@@ -301,9 +285,10 @@ class MaskEditCommand(QUndoCommand):
 
 
 class PaintOverlayEditCommand(QUndoCommand):
-    """用于彩色画笔图层编辑的撤销/重做命令。
+    """用于彩色画笔/印章图层编辑的撤销/重做命令。
 
     图层为 RGBA uint8 数组（H, W, 4）。为了减少内存，只记录变化包围盒内的像素。
+    layer='paint' 作用于画笔层，layer='stamp' 作用于印章层。
     """
 
     def __init__(
@@ -311,9 +296,11 @@ class PaintOverlayEditCommand(QUndoCommand):
         model: "EditorModel",
         old_overlay: Optional[np.ndarray],
         new_overlay: Optional[np.ndarray],
+        layer: str = "paint",
     ):
-        super().__init__("Paint Overlay Edit")
+        super().__init__("Stamp Overlay Edit" if layer == "stamp" else "Paint Overlay Edit")
         self._model = model
+        self._layer = layer
         self._shape: Optional[tuple[int, int, int]] = None
         self._bounds: Optional[tuple[int, int, int, int]] = None
         self._old_patch: Optional[np.ndarray] = None
@@ -372,16 +359,27 @@ class PaintOverlayEditCommand(QUndoCommand):
             return arr.astype(np.uint8, copy=False)
         return None
 
+    def _set_layer_image(self, image: Optional[np.ndarray]) -> None:
+        if self._layer == "stamp":
+            self._model.set_stamp_overlay_image(image)
+        else:
+            self._model.set_paint_overlay_image(image)
+
+    def _get_layer_image(self):
+        if self._layer == "stamp":
+            return self._model.get_stamp_overlay_image()
+        return self._model.get_paint_overlay_image()
+
     def _apply(self, full: Optional[np.ndarray], patch: Optional[np.ndarray]) -> None:
         if full is not None:
-            self._model.set_paint_overlay_image(full.copy())
+            self._set_layer_image(full.copy())
             return
 
         if self._shape is None:
-            self._model.set_paint_overlay_image(None)
+            self._set_layer_image(None)
             return
 
-        current = self._normalize_overlay(self._model.get_paint_overlay_image())
+        current = self._normalize_overlay(self._get_layer_image())
         if current is None or current.shape != self._shape:
             current = np.zeros(self._shape, dtype=np.uint8)
         else:
@@ -393,9 +391,9 @@ class PaintOverlayEditCommand(QUndoCommand):
 
         # 如果图层全透明，降级为 None 以节省内存
         if not np.any(current[..., 3]):
-            self._model.set_paint_overlay_image(None)
+            self._set_layer_image(None)
         else:
-            self._model.set_paint_overlay_image(current)
+            self._set_layer_image(current)
 
     def redo(self):
         self._apply(self._full_new, self._new_patch)
@@ -405,10 +403,7 @@ class PaintOverlayEditCommand(QUndoCommand):
 
 
 class MultiRegionUpdateCommand(QUndoCommand):
-    """批量更新多条 region 数据，一次性 set_regions_silent + emit 一次信号。
-
-    避免逐条 UpdateRegionCommand 因 clear_regions() 导致的跨命令索引失效。
-    """
+    """批量更新多条 region：构造时按索引提取 patch，redo/undo 经 update_regions 一次通知。"""
 
     def __init__(
         self,
@@ -416,26 +411,38 @@ class MultiRegionUpdateCommand(QUndoCommand):
         old_regions: list[dict],
         new_regions: list[dict],
         description: str = "Batch Update Regions",
+        fields: Optional[list[str]] = None,
+        source: str = "",
     ):
         super().__init__(description)
+        if len(old_regions) != len(new_regions):
+            raise ValueError("MultiRegionUpdateCommand requires old_regions and new_regions to have the same length")
         self._model = model
-        # Defensive copies prevent in-place mutations from corrupting undo/redo.
-        self._old_regions = copy.deepcopy(old_regions)
-        self._new_regions = copy.deepcopy(new_regions)
+        self._fields = fields
+        self._source = source
+        # index → (old_patch, new_patch)，只保存有实际差异的条目
+        self._patches: Dict[int, tuple[Dict[str, Any], Dict[str, Any]]] = {}
+        for index, (old_data, new_data) in enumerate(zip(old_regions, new_regions)):
+            new_patch = _build_region_patch(old_data, new_data)
+            if not new_patch:
+                continue
+            self._patches[index] = (_build_region_patch(new_data, old_data), new_patch)
 
-    def _apply(self, regions: list[dict]) -> None:
-        self._model.set_regions_silent(regions)
-        # Capture selection before emitting — slots may modify regions.
-        old_selection = self._model.get_selection()
-        self._model.regions_changed.emit(self._model.get_regions())
-        if old_selection:
-            current = self._model.get_regions()
-            valid = [i for i in old_selection if 0 <= i < len(current)]
-            if valid:
-                self._model.set_selection(valid)
+    def has_changes(self) -> bool:
+        return bool(self._patches)
+
+    def _apply(self, patch_slot: int) -> None:
+        updates: Dict[int, Dict[str, Any]] = {}
+        for index, patches in self._patches.items():
+            region_data = self._model.get_region_by_index(index)
+            if region_data is None:
+                continue
+            updates[index] = UpdateRegionCommand._apply_patch_to_region(region_data, patches[patch_slot])
+        if updates:
+            self._model.update_regions(updates, fields=self._fields, source=self._source)
 
     def redo(self):
-        self._apply(self._new_regions)
+        self._apply(1)
 
     def undo(self):
-        self._apply(self._old_regions)
+        self._apply(0)

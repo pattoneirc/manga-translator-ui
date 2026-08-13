@@ -491,28 +491,35 @@ class ModelPaddleOCR(OfflineOCR):
         indices = np.argmax(pred, axis=1)
         confidences = np.max(pred, axis=1)
 
-        # Remove blanks and duplicates, handle special characters
-        chars = []
-        prev_idx = -1
+        # Match PaddleOCR's CTCLabelDecode confidence: remove CTC blanks
+        # and duplicate timesteps before averaging kept character scores.
+        selection = np.ones(len(indices), dtype=bool)
+        if len(indices) > 1:
+            selection[1:] = indices[1:] != indices[:-1]
+        selection &= indices != 0  # 0 is <blank>
 
-        for idx in indices:
-            if idx != 0 and idx != prev_idx:  # 0 is <blank>
-                if idx < len(self.char_dict):
-                    ch = self.char_dict[idx]
-                    
-                    # Special character handling (similar to model_48px)
-                    if ch == '<S>':      # Start token
-                        continue
-                    if ch == '</S>':     # End token
-                        break
-                    if ch == '<SP>':     # Space token
-                        ch = ' '
-                    
-                    chars.append(ch)
-            prev_idx = idx
+        chars = []
+        kept_confidences = []
+
+        for idx, confidence in zip(indices[selection], confidences[selection]):
+            if idx >= len(self.char_dict):
+                continue
+
+            ch = self.char_dict[idx]
+
+            # Special character handling (similar to model_48px)
+            if ch == '<S>':      # Start token
+                continue
+            if ch == '</S>':     # End token
+                break
+            if ch == '<SP>':     # Space token
+                ch = ' '
+
+            chars.append(ch)
+            kept_confidences.append(confidence)
 
         text = ''.join(chars)
-        confidence = float(np.mean(confidences))
+        confidence = float(np.mean(kept_confidences)) if kept_confidences else 0.0
 
         return text, confidence
 
@@ -574,7 +581,7 @@ class ModelPaddleOCR(OfflineOCR):
                 
                 # 批量推理
                 with torch.no_grad():
-                    ret = self.color_model.infer_beam_batch(image_tensor, widths, beams_k=5, max_seq_length=255)
+                    ret = self.color_model.infer_beam_batch_tensor(image_tensor, widths, beams_k=5, max_seq_length=255)
                 
                 # 处理结果（与 mocr 完全相同的逻辑）
                 for i, (pred_chars_index, prob, fg_pred, bg_pred, fg_ind_pred, bg_ind_pred) in enumerate(ret):
@@ -664,9 +671,9 @@ class ModelPaddleOCR(OfflineOCR):
             if self.use_gpu:
                 image_tensor = image_tensor.to(self.device)
             
-            # 使用 48px 模型推理 - 使用 infer_beam_batch 而不是 infer_beam_batch_tensor
+            # 使用 48px 模型推理
             with torch.no_grad():
-                ret = self.color_model.infer_beam_batch(image_tensor, [new_w], beams_k=5, max_seq_length=255)
+                ret = self.color_model.infer_beam_batch_tensor(image_tensor, [new_w], beams_k=5, max_seq_length=255)
             
             if ret and len(ret) > 0:
                 pred_chars_index, prob, fg_pred, bg_pred, fg_ind_pred, bg_ind_pred = ret[0]
@@ -828,4 +835,3 @@ class ModelPaddleOCRThai(ModelPaddleOCR):
     """Thai OCR"""
     def __init__(self, *args, **kwargs):
         super().__init__(model_type='thai', *args, **kwargs)
-

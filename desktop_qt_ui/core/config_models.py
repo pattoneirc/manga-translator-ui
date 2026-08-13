@@ -1,10 +1,10 @@
 from typing import Any, Dict, List, Optional, Union
 
+from manga_translator.custom_api_params import migrate_legacy_custom_api_params_config
 from pydantic import BaseModel, Field, model_validator
+
 from theme_registry import VALID_THEME_PREFERENCES as REGISTERED_THEME_PREFERENCES
 from theme_registry import VALID_THEMES as REGISTERED_THEMES
-
-from manga_translator.custom_api_params import migrate_legacy_custom_api_params_config
 
 VALID_LAYOUT_MODES = {"smart_scaling", "strict", "balloon_fill"}
 
@@ -15,13 +15,14 @@ class TranslatorSettings(BaseModel):
     keep_lang: str = "none"
     enable_streaming: bool = True
     no_text_lang_skip: bool = False
-    # 相对路径，后端会用BASE_PATH拼接（打包后=_internal，开发时=项目根目录）
+    # 相对路径，后端会用 BASE_PATH 拼接（打包后=app.exe 同级，开发时=项目根目录）
     high_quality_prompt_path: Optional[str] = "dict/prompt_example.yaml"
     extract_glossary: bool = False
     max_requests_per_minute: int = 0
     remove_trailing_period: bool = False
     convert_to_traditional: bool = False
     convert_to_simplified: bool = False
+
 
 class OcrSettings(BaseModel):
     ocr: str = "48px"
@@ -43,23 +44,33 @@ class OcrSettings(BaseModel):
     ai_ocr_concurrency: int = 1
     ai_ocr_custom_prompt: Optional[str] = None
 
+
 class DetectorSettings(BaseModel):
     detector: str = "default"
     detection_size: int = 2048
+    det_rearrange_min_effective_short_side: int = 341
     text_threshold: float = 0.5
     box_threshold: float = 0.5
     unclip_ratio: float = 2.5
     import_yolo_labels: bool = False
     use_yolo_obb: bool = False
+    use_sfx_filter: bool = False
+    sfx_filter_include_bubble_text: bool = False
     yolo_obb_conf: float = 0.4
     yolo_obb_overlap_threshold: float = 0.1
-    min_box_area_ratio: float = 0.0009  # 最小检测框面积占比（相对图片总像素），默认0.09%
+    min_box_area_ratio: float = (
+        0.0009  # 最小检测框面积占比（相对图片总像素），默认0.09%
+    )
+
 
 class InpainterSettings(BaseModel):
     inpainter: str = "lama_mpe"
     inpainting_size: int = 2048
     inpainting_precision: str = "fp32"
     force_use_torch_inpainting: bool = False
+    solid_fill_pure_bubbles: bool = False
+    per_block_inpainting: bool = False
+
 
 class RenderSettings(BaseModel):
     renderer: str = "default"
@@ -71,24 +82,28 @@ class RenderSettings(BaseModel):
     direction: str = "auto"
     uppercase: bool = False
     lowercase: bool = False
-    font_path: str = "Arial-Unicode-Regular.ttf"
+    font_family: str = ""
+    disable_system_fonts: bool = False
     no_hyphenation: bool = False
     bubble_layout_english: bool = False
     font_color: Optional[str] = None
     line_spacing: Optional[float] = 1.0  # 行间距倍率，默认1.0
     letter_spacing: Optional[float] = 1.0  # 字间距倍率，默认1.0
     font_size: Optional[int] = None
-    auto_rotate_symbols: bool = True
     rtl: bool = True
     layout_mode: str = "smart_scaling"
     max_font_size: int = 0
     font_scale_ratio: float = 1.0
     center_text_in_bubble: bool = False
     optimize_line_breaks: bool = False
+    semantic_linebreak: bool = False
+    remove_linebreak_punctuation: bool = False
     check_br_and_retry: bool = False
     strict_smart_scaling: bool = False
     stroke_width: float = 0.07
-    enable_template_alignment: bool = False  # 启用模板匹配对齐（替换翻译模式）- 直接提取翻译图文字
+    enable_template_alignment: bool = (
+        False  # 启用模板匹配对齐（替换翻译模式）- 直接提取翻译图文字
+    )
     paste_mask_dilation_pixels: int = 10  # 粘贴模式蒙版膨胀大小（像素），设为0禁用膨胀
     ai_renderer_concurrency: int = 1
 
@@ -101,18 +116,23 @@ class RenderSettings(BaseModel):
             )
         return self
 
+
 class UpscaleSettings(BaseModel):
     upscaler: str = "esrgan"
-    upscale_ratio: Optional[Union[int, str]] = None  # 可以是数字或字符串(mangajanai: x2, x4, DAT2 x4)
+    upscale_ratio: Optional[Union[int, str]] = (
+        None  # 可以是数字或字符串(mangajanai: x2, x4, DAT2 x4)
+    )
     realcugan_model: Optional[str] = None
     tile_size: Optional[int] = None
     revert_upscaling: bool = False
+
 
 class ColorizerSettings(BaseModel):
     colorization_size: int = 576
     denoise_sigma: int = 30
     colorizer: str = "none"
     ai_colorizer_history_pages: int = 0
+
 
 class CliSettings(BaseModel):
     verbose: bool = False  # 默认关闭详细日志
@@ -135,11 +155,14 @@ class CliSettings(BaseModel):
     colorize_only: bool = False
     upscale_only: bool = False  # 仅超分模式
     inpaint_only: bool = False  # 仅输出修复图片模式
-    save_to_source_dir: bool = False  # 输出到原图目录的 manga_translator_work/result 子目录
+    save_to_source_dir: bool = (
+        False  # 输出到原图目录的 manga_translator_work/result 子目录
+    )
     export_editable_psd: bool = False  # 导出可编辑的PSD文件（需要Photoshop）
-    psd_font: Optional[str] = None  # PSD导出使用的字体名称 (PostScript名称)
     psd_script_only: bool = False  # 仅生成JSX脚本而不执行Photoshop
-    replace_translation: bool = False  # 替换翻译模式：将一张图的翻译应用到另一张生肉图上
+    replace_translation: bool = (
+        False  # 替换翻译模式：将一张图的翻译应用到另一张生肉图上
+    )
 
 
 _LEGACY_THEME_MIGRATIONS = {
@@ -161,16 +184,37 @@ _VALID_THEME_PREFERENCES = set(REGISTERED_THEME_PREFERENCES)
 
 
 class AppSection(BaseModel):
-    last_open_dir: str = '.'
+    last_open_dir: str = "."
     last_output_path: str = ""
     favorite_folders: Optional[List[str]] = None
+    folder_dialog_sort: str = "name_ascending"
     theme: str = "light"  # 主题选项由 theme_registry.py 统一定义
     theme_user_preference: str = "light"
     ui_language: str = "auto"  # UI语言：auto(自动检测), zh_CN, en_US, ja_JP, ko_KR 等
+    auto_check_updates: bool = True  # 启动时是否自动检查新版本
+    use_system_proxy: bool = False  # 网络请求是否使用操作系统代理配置
     current_preset: str = "默认"  # 当前使用的预设名称
-    unload_models_after_translation: bool = False  # 翻译完成后卸载模型（释放内存更彻底，但下次使用需要重新加载）
+    editor_snap_enabled: bool = False  # 编辑器文本框移动/旋转时是否启用吸附
+    editor_center_scale_enabled: bool = False  # 拖动文本框边/角时是否围绕中心对称缩放
+    editor_rich_text_popup_enabled: bool = True  # 是否显示编辑器富文本浮动弹窗
+    editor_rich_text_popup_pinned: bool = False  # 是否固定富文本浮窗位置并阻止自动隐藏
+    editor_auto_save_on_switch: bool = True  # 切图时自动保存工程数据
+    editor_auto_export_on_switch: bool = True  # 切图时自动导出渲染图片
+    editor_suppress_unsaved_warning: bool = False  # 切图时不再提醒未保存编辑
+    editor_auto_rich_text_rules: bool = (
+        True  # 编辑译文时自动应用富文本规则（命中已带手工富文本则整段跳过）
+    )
+    editor_delete_and_recover: bool = False  # 删除文本框时同时移除其蒙版并恢复原图
+    unload_models_after_translation: bool = (
+        False  # 翻译完成后卸载模型（释放内存更彻底，但下次使用需要重新加载）
+    )
     saved_colors: Optional[List[str]] = None  # 保存的常用颜色列表
-    saved_style_presets: Optional[Dict[str, Dict[str, Any]]] = None  # 编辑器保存的样式组合
+    saved_style_presets: Optional[Dict[str, Dict[str, Any]]] = (
+        None  # 编辑器保存的样式组合
+    )
+    saved_rich_text_presets: Optional[Dict[str, Dict[str, Any]]] = (
+        None  # 富文本片段样式预设
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -184,16 +228,26 @@ class AppSection(BaseModel):
         theme_user_preference = normalized.get("theme_user_preference")
 
         if theme_value == "system":
-            mapped_user_pref = _LEGACY_THEME_MIGRATIONS.get((theme_user_preference, theme_accent))
+            mapped_user_pref = _LEGACY_THEME_MIGRATIONS.get(
+                (theme_user_preference, theme_accent)
+            )
             if mapped_user_pref:
                 normalized["theme_user_preference"] = mapped_user_pref
-            elif theme_user_preference not in _VALID_THEME_PREFERENCES and theme_accent in _ACCENT_ONLY_THEME_FALLBACKS:
-                normalized["theme_user_preference"] = _ACCENT_ONLY_THEME_FALLBACKS[theme_accent]
+            elif (
+                theme_user_preference not in _VALID_THEME_PREFERENCES
+                and theme_accent in _ACCENT_ONLY_THEME_FALLBACKS
+            ):
+                normalized["theme_user_preference"] = _ACCENT_ONLY_THEME_FALLBACKS[
+                    theme_accent
+                ]
         else:
             mapped_theme = _LEGACY_THEME_MIGRATIONS.get((theme_value, theme_accent))
             if mapped_theme:
                 normalized["theme"] = mapped_theme
-            elif theme_value not in _VALID_THEMES and theme_accent in _ACCENT_ONLY_THEME_FALLBACKS:
+            elif (
+                theme_value not in _VALID_THEMES
+                and theme_accent in _ACCENT_ONLY_THEME_FALLBACKS
+            ):
                 normalized["theme"] = _ACCENT_ONLY_THEME_FALLBACKS[theme_accent]
 
             if normalized.get("theme_user_preference") not in _VALID_THEME_PREFERENCES:
@@ -204,6 +258,7 @@ class AppSection(BaseModel):
         if normalized.get("theme_user_preference") not in _VALID_THEME_PREFERENCES:
             normalized["theme_user_preference"] = "light"
         return normalized
+
 
 class AppSettings(BaseModel):
     app: AppSection = Field(default_factory=AppSection)

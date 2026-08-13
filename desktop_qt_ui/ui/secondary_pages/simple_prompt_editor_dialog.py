@@ -1,25 +1,17 @@
 import os
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QFontDatabase
 from PyQt6.QtWidgets import (
-    QDialog,
-    QFrame,
     QHBoxLayout,
-    QLabel,
-    QMessageBox,
-    QPlainTextEdit,
-    QPushButton,
     QVBoxLayout,
-    QWidget,
 )
-from ui.styles import (
-    monospace_font as _monospace_font,
-    secondary_editor_dialog_stylesheet as _dialog_stylesheet,
-)
-from ui.theme import apply_widget_stylesheet
+from qfluentwidgets import BodyLabel, CaptionLabel, FluentIcon as FIF, PlainTextEdit, PrimaryPushButton, PushButton, SimpleCardWidget, TitleLabel
+from ui.secondary_pages.fluent_dialog import FluentSecondaryDialog
+from ui.secondary_pages.themed_message_box import themed_critical
 
 
-class SimplePromptEditorDialog(QDialog):
+class SimplePromptEditorDialog(FluentSecondaryDialog):
     def __init__(
         self,
         file_path: str,
@@ -53,61 +45,50 @@ class SimplePromptEditorDialog(QDialog):
 
     def _setup_ui(self):
         self.setWindowTitle(self._t("Edit") + f": {os.path.basename(self._file_path)}")
-        self.setMinimumSize(880, 620)
+        self.setMinimumSize(680, 480)
         self.resize(980, 720)
         self.setModal(True)
-        apply_widget_stylesheet(self, _dialog_stylesheet())
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 14, 16, 14)
         root.setSpacing(10)
 
-        title = QLabel(self._title_text)
-        title.setObjectName("dialog_title")
-        subtitle = QLabel(self._description_text)
-        subtitle.setObjectName("dialog_subtitle")
+        title = TitleLabel(self._title_text)
+        subtitle = BodyLabel(self._description_text)
         subtitle.setWordWrap(True)
         root.addWidget(title)
         root.addWidget(subtitle)
 
-        divider = QFrame()
-        divider.setObjectName("divider")
-        divider.setFrameShape(QFrame.Shape.HLine)
-        root.addWidget(divider)
-
-        card = QWidget()
-        card.setObjectName("section_card")
+        card = SimpleCardWidget(self)
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(14, 14, 14, 14)
         card_layout.setSpacing(8)
 
-        section = QLabel(self._section_text)
-        section.setObjectName("section_label")
+        section = BodyLabel(self._section_text)
         card_layout.addWidget(section)
 
-        hint = QLabel(self._hint_text)
-        hint.setObjectName("hint_label")
+        hint = CaptionLabel(self._hint_text)
         hint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         card_layout.addWidget(hint)
 
-        self.editor = QPlainTextEdit(self)
-        self.editor.setFont(_monospace_font())
+        self.editor = PlainTextEdit(card)
+        self.editor.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
         card_layout.addWidget(self.editor, 1)
 
         root.addWidget(card, 1)
 
-        self._status_label = QLabel("")
-        self._status_label.setObjectName("hint_label")
+        self._status_label = CaptionLabel("")
         root.addWidget(self._status_label)
 
         button_row = QHBoxLayout()
         button_row.addStretch(1)
 
-        self.cancel_button = QPushButton(self._t("Cancel"))
+        self.cancel_button = PushButton(self._t("Cancel"))
+        self.cancel_button.setIcon(FIF.CANCEL)
         self.cancel_button.clicked.connect(self.reject)
 
-        self.save_button = QPushButton(self._t("Save"))
-        self.save_button.setProperty("variant", "accent")
+        self.save_button = PrimaryPushButton(self._t("Save"))
+        self.save_button.setIcon(FIF.SAVE)
         self.save_button.clicked.connect(self._save)
 
         button_row.addWidget(self.cancel_button)
@@ -125,7 +106,7 @@ class SimplePromptEditorDialog(QDialog):
             self._was_modified = True
             self.accept()
         except Exception as e:
-            QMessageBox.critical(self, self._t("Error"), str(e))
+            themed_critical(self, self._t("Error"), str(e))
 
     def get_was_modified(self) -> bool:
         return self._was_modified

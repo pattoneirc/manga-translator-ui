@@ -15,7 +15,6 @@ To stay aligned with the current desktop UI, this English version uses the actua
   - `Mode Specific`
 - `API Management`
 - `Prompt Management`
-- `Font Management`
 
 Where older documentation used legacy UI wording, this version keeps the full explanation but updates the visible button names and locations to match the current UI.
 
@@ -84,7 +83,7 @@ Older versions grouped the interface into broad settings tabs. In the current de
   - Later translations reuse those terms to keep wording consistent.
   - This is especially useful for long manga series, where character names and terminology should remain stable.
 
-- **`Auto Remove Final Period` (`remove_trailing_period`)**: when the source text has no ending punctuation, automatically remove an extra period added to the translation.
+- **`Auto Remove Final Period/Comma` (`remove_trailing_period`)**: when the source text has no ending punctuation, automatically remove an extra final period or comma added to the translation; enumeration commas are kept.
   - Current UI location: `Settings` -> `Translation` -> `Auto Remove Final Period`
   - Applies to: the main translation flow
   - Coverage: normal batch mode, high-quality batch mode, and the `batch_concurrent` concurrent pipeline
@@ -109,51 +108,45 @@ Older versions grouped the interface into broad settings tabs. In the current de
 - **`Use Custom API Params` (`use_custom_api_params`)**: enable custom API parameters.
   - Current UI location: `Settings` -> `General` -> `Use Custom API Params`
   - Applies to: translation, AI OCR, AI rendering, and AI colorization
-  - When enabled, the app reads custom parameters from `examples/custom_api_params.json` and passes them to enabled AI APIs
-  - Click the `Edit` button to create and open the config file automatically
-  - The file uses standard JSON format and takes effect dynamically because it is reloaded when translation runs
+  - When enabled, each API channel reads the preset for its current model from `config/custom_api_params.json`
+  - Click `Edit` to open the unified model-preset editor; presets can be added, deleted, renamed, and switched from the selector at the top
+  - At runtime, the current model name is matched exactly; if no preset exists, the app falls back to `通用` (`General`)
+  - Every preset contains `common`, `translator`, `ocr`, `colorizer`, and `render`
+  - Each request merges only `common` and the current module section, then lets that API channel filter and convert the parameters; sections are never forwarded across modules
+  - Upscaling is local processing and is not part of custom API parameters
+  - The file uses standard JSON and is reloaded before requests
   - Typical use cases:
     - control special parameters for local models such as Ollama, for example disabling thinking mode
     - adjust temperature, max tokens, and similar API parameters
     - pass provider-specific options for a specific model
-  - Recommended grouped structure:
+  - Model preset example:
     ```json
     {
-      "translator": {
-        "thinking": {"type": "disabled"}
+      "通用": {
+        "common": {},
+        "translator": {
+          "temperature": 0.3,
+          "top_p": 0.95
+        },
+        "ocr": {
+          "temperature": 0.0
+        },
+        "colorizer": {},
+        "render": {}
       },
-      "ocr": {
-        "response_format": {"type": "json_object"}
-      },
-      "render": {
-        "quality": "high"
-      },
-      "colorizer": {
-        "size": "1536x1536"
+      "qwen2.5:7b": {
+        "common": {},
+        "translator": {
+          "thinking": {"type": "disabled"},
+          "thinking_budget": 0
+        },
+        "ocr": {},
+        "colorizer": {},
+        "render": {}
       }
     }
     ```
-  - If a parameter should be sent to every AI backend, place it under `common`:
-    ```json
-    {
-      "common": {
-        "timeout": 120
-      },
-      "translator": {
-        "thinking": {"type": "disabled"}
-      }
-    }
-    ```
-  - Legacy compatibility: if keys are written directly at the top level, the app treats them as `common`
-  - Example for disabling translator thinking mode:
-    ```json
-    {
-      "translator": {
-        "thinking": {"type": "disabled"},
-        "thinking_budget": 0
-      }
-    }
-    ```
+  - Legacy top-level parameters and existing standard sections are migrated once into the `通用` preset; new files should not use the legacy layout
 
 - **`Max Requests Per Minute` (`max_requests_per_minute`)**: maximum number of requests per minute.
   - Current UI location: `Settings` -> `Translation` -> `Max Requests Per Minute`
@@ -197,7 +190,7 @@ Older versions grouped the interface into broad settings tabs. In the current de
 
 - **`Output Format` (`format`)**: output image format.
   - Current UI location: `Settings` -> `General` -> `Output Format`
-  - Choices: `PNG`, `JPEG`, `WEBP`, `Not Specified` to keep the original format
+  - Choices: `PNG`, `JPG/JPEG/JFIF`, `WebP`, `AVIF`, `BMP`, `TIFF/TIF`, `HEIC/HEIF`, or `Not Specified` to keep the original format
 
 - **`Overwrite Existing Files` (`overwrite`)**: overwrite existing translated files.
   - Current UI location: `Settings` -> `General` -> `Overwrite Existing Files`
@@ -224,12 +217,12 @@ Older versions grouped the interface into broad settings tabs. In the current de
   - Requires matching JSON data to already exist
   - Does not run detection, OCR, inpainting, or rendering
   - Good for workflows where original text was exported earlier and only the translation content needs updating
-  - After the JSON is written successfully, the matching `_original.txt` file is deleted
+  - After the JSON is written successfully, the matching `_original.<output_format>` file is deleted
 
 - **`Export Original Text` (`template`)**: export original text to a text file for manual translation.
   - Current UI entry: `Translation Workflow Mode:` -> `Export Original Text`
 
-- **`Image Save Quality` (`save_quality`)**: JPEG save quality from `0` to `100`.
+- **`Image Save Quality` (`save_quality`)**: JPEG/JFIF, WebP, AVIF, and HEIC/HEIF save quality from `0` to `100`.
   - Current UI location: `Settings` -> `General` -> `Image Save Quality`
 
 - **`Batch Size` (`batch_size`)**: batch processing size.
@@ -253,10 +246,7 @@ Older versions grouped the interface into broad settings tabs. In the current de
   - The inpainted layer prefers the current-session inpainted image, then falls back to `manga_translator_work/inpainted/`
   - Export path: `source_image_dir/manga_translator_work/psd/`
 
-- **`PSD Default Font` (`psd_font`)**: font used for text layers in Photoshop.
-  - Current UI location: `Settings` -> `General` -> `PSD Default Font`
-  - Supports either the display name or the PostScript name
-  - If left empty, Photoshop uses its own default font
+- **PSD text layer font**: automatically reuses the system font selected under `Render Settings` -> `Font`; no separate Photoshop/PostScript font name is required.
 
 - **`Generate PSD Script Only` (`psd_script_only`)**: only generate the `.jsx` script and do not launch Photoshop automatically.
   - Current UI location: `Settings` -> `General` -> `Generate PSD Script Only`
@@ -295,7 +285,7 @@ Older versions grouped the interface into broad settings tabs. In the current de
   - Supports many-to-one matching, where multiple raw boxes can map to one translated box
   - Automatically saves optimized masks so the Qt editor can skip mask optimization later
   - Supports editable PSD export
-  - Does not support parallel processing and automatically uses sequential processing
+  - Does not support the concurrent pipeline and uses the standard backend batch path
   - How to use it:
     1. prepare raw pages and their matching translated pages
     2. put the translated pages in `source_image_dir/manga_translator_work/translated_images/`
@@ -319,6 +309,13 @@ Older versions grouped the interface into broad settings tabs. In the current de
   - Current UI location: `Settings` -> `Detection` -> `Detection Size`
   - Default is usually `2048`
   - Larger values are more accurate but slower
+
+- **`Long Image Rearrange Min Short Side` (`det_rearrange_min_effective_short_side`)**: minimum effective short-side resolution preserved after long-image detection rearrange.
+  - Current UI location: `Settings` -> `Detection` -> `Long Image Rearrange Min Short Side`
+  - Default: `341`
+  - Only affects images that trigger long-image detection rearrange; it does not change normal image detection size
+  - Higher values keep text clearer after rearrange, but make detection slower
+  - Lower values are faster, but small text in narrow long images is more likely to blur and be missed
 
 - **`Text Threshold` (`text_threshold`)**: text detection confidence threshold.
   - Current UI location: `Settings` -> `Detection` -> `Text Threshold`
@@ -351,6 +348,12 @@ Older versions grouped the interface into broad settings tabs. In the current de
 - **`Enable YOLO Detection` (`use_yolo_obb`)**: use YOLO oriented bounding boxes as assisted detection.
   - Current UI location: `Settings` -> `Detection` -> `Enable YOLO Detection`
   - Helps improve detection accuracy
+
+- **`SFX Filter` (`use_sfx_filter`)**: filter main-detector boxes that lack YOLO support. Disabled by default.
+  - Keep a main box when it is fully wrapped by a YOLO `other` box
+  - Keep a main box when its overlap with another YOLO OBB box reaches `yolo_obb_overlap_threshold`
+  - Filter it when neither condition is met, reducing false detections from sound effects and decorative text
+  - Requires `use_yolo_obb`
 
 - **`YOLO Confidence Threshold` (`yolo_obb_conf`)**: confidence threshold for YOLO-assisted detection.
   - Current UI location: `Settings` -> `Detection` -> `YOLO Confidence Threshold`
@@ -388,6 +391,26 @@ Older versions grouped the interface into broad settings tabs. In the current de
   - When enabled, the app always uses the PyTorch engine for inpainting
   - Use case: ONNX has problems or higher precision is needed
   - This option does not matter in GPU mode because GPU already uses PyTorch
+
+- **`Solid Fill Pure Bubbles` (`solid_fill_pure_bubbles`)**: use the bubble model to identify solid-color bubbles and skip inpainting for them.
+  - Current UI location: `Settings` -> `Inpainting` -> `Solid Fill Pure Bubbles`
+  - Reuses the model bubble overlap threshold to decide whether text is inside a bubble, then reuses the layout component matcher to select the complete corresponding bubble component
+  - Shrinks each model bubble mask inward by 2% of its shorter side (at least 1px) so model overshoot does not cross the real bubble border
+  - Subtracts the roughly 2px-dilated `mask_raw` and checks only the remaining background pixels for near-solid color
+  - A matching solid bubble is filled with its median background color and removed from the repair mask; model misses and non-solid backgrounds are left for inpainting
+  - The old Canny closed-contour detector is no longer used as a fallback
+  - Disabled by default
+
+- **`Per-Block Inpainting` (`per_block_inpainting`)**: split the refined mask into isolated connected components and inpaint them separately instead of processing the whole page.
+  - Current UI location: `Settings` -> `Inpainting` -> `Per-Block Inpainting`
+  - Each remaining refined-mask component is cropped in a 2x window around its bounding box, padded to square with reflection, inpainted, and pasted back
+  - Only the current component is included in each mask, even when neighboring crop windows overlap
+  - The square crop has an aspect ratio of 1, so it does not enter the long-image splitting path
+  - This can avoid text ghosts from page-wide masks, but reduced context can worsen results on complex backgrounds
+  - Smaller crops may improve CPU inference speed; with many components, fixed overhead from repeated model calls can offset the gain
+  - All remaining refined-mask components are processed without relying on text regions or text-line boxes
+  - Disabled by default; when off, the original whole-page inpainting behavior is unchanged
+  - The two switches combine freely; turning both off fully restores the old behavior
 
 ### Renderer Settings
 
@@ -433,12 +456,11 @@ Older versions grouped the interface into broad settings tabs. In the current de
   - `horizontal`: horizontal layout
   - `vertical`: vertical layout
 
-- **`Font Path` (`font_path`)**: font file path for a custom font.
-  - Internal config key: `render.font_path`
-  - The app can load new `.ttf`, `.otf`, or `.ttc` files from the `fonts` directory
-  - The font list is rescanned whenever the font selection UI is opened
-  - New fonts appear without restarting
-  - Current UI note: in the current desktop UI, default font selection is mainly handled in `Font Management`, then applied with `Apply Selected Font`
+- **`Font` (`font_family`)**: font family used for rendering and editable PSD text layers.
+  - Current UI location: `Settings` -> `Typesetting` -> `Font`
+  - The list combines fonts installed in the operating system with font files from the project `fonts` directory
+  - Click `Open Directory` beside the selector to open the project font directory
+  - Add a `.ttf`, `.otf`, or `.ttc` file there, then reopen the dropdown to refresh the list; no restart is required
 
 - **`Disable Font Border` (`disable_font_border`)**: disable text border / stroke.
   - Current UI location: `Settings` -> `Typesetting` -> `Disable Font Border`
@@ -451,6 +473,8 @@ Older versions grouped the interface into broad settings tabs. In the current de
   - Suggested range: `0.05-0.15` (`5%-15%`)
   - Larger values make a thicker border, smaller values make a thinner one
 
+- **`Chinese Semantic Line Break` (`semantic_linebreak`)**: use local HanLP coarse tokenization + constituency parsing models to line-break Chinese translations by semantic phrases. Currently supports Chinese target text only; if models are missing or fail to load, rendering falls back to normal wrapping.
+- **`Trim Around Line Breaks` (`remove_linebreak_punctuation`)**: remove commas and periods around line break markers. It only cleans punctuation at line-break edges and keeps enumeration commas, question marks, exclamation marks, and ellipses.
 - **`AI Line Breaking` (`disable_auto_wrap`)**: disable normal auto-wrap when AI line breaking is being used.
   - Current UI location: `Settings` -> `Typesetting` -> `AI Line Breaking`
   - Enabling this turns off the standard auto-wrap behavior
@@ -485,7 +509,9 @@ Older versions grouped the interface into broad settings tabs. In the current de
 - **`Font Color` (`font_color`)**: font color in hexadecimal, for example `#FFFFFF`.
   - Current UI location: `Settings` -> `Typesetting` -> `Font Color`
 
-- **`Line Spacing` (`line_spacing`)**: line spacing multiplier.
+- **`Line Spacing` (`line_spacing`)**: line spacing multiplier. Horizontal text
+  first separates adjacent real ink envelopes, then adds a visible
+  `0.1em × line_spacing` gap; vertical text keeps its column-spacing formula.
   - Current UI location: `Settings` -> `Typesetting` -> `Line Spacing`
   - Default: `1.0`
   - Range: `0.1-5.0`
@@ -500,15 +526,6 @@ Older versions grouped the interface into broad settings tabs. In the current de
 
 - **`Font Size` (`font_size`)**: fixed font size override.
   - Current UI location: `Settings` -> `Typesetting` -> `Font Size`
-
-- **`Auto Rotate Symbols` (`auto_rotate_symbols`, legacy wording)**: the original Chinese document also described this setting as automatic symbol rotation.
-  - Legacy meaning: automatically rotate punctuation such as `！？` inside vertical text so it displays correctly
-  - Current UI note: in the current desktop UI, the same option is labeled `Horizontal in Vertical`
-
-- **`Horizontal in Vertical` (`auto_rotate_symbols`)**: current UI label for the same vertical-text symbol handling option.
-  - Current UI location: `Settings` -> `Typesetting` -> `Horizontal in Vertical`
-  - Automatically keeps short horizontal symbols and fragments readable inside vertical text
-  - This covers punctuation such as `！？` and similar symbols
 
 - **`Right to Left` (`rtl`)**: enable right-to-left layout.
   - Current UI location: `Settings` -> `Typesetting` -> `Right to Left`
@@ -717,7 +734,7 @@ Older versions grouped the interface into broad settings tabs. In the current de
 - **`Keep Dilation Inside Bubble Mask` (`limit_mask_dilation_to_bubble_mask`)**: keep mask dilation from growing outside the bubble area.
   - Current UI location: `Settings` -> `Inpainting` -> `Keep Dilation Inside Bubble Mask`
   - Default: `false`
-  - When enabled: the post-processing stage constrains the final repair mask using the model bubble area, preventing repair from spilling outside the bubble
+  - When enabled: the post-processing stage constrains the final repair mask using each model bubble component shrunk by 1% of its shorter side, preventing repair from spilling outside the bubble
   - Use case: protect bubble borders and avoid unwanted repair outside the dialogue box
 
 - **`Text Region Min Probability` (`prob`)**: OCR recognition probability threshold.
@@ -759,7 +776,7 @@ Older versions grouped the interface into broad settings tabs. In the current de
 
 The program supports skipping specific text regions through a filter list, for example watermarks or ad text.
 
-- **File Path**: `examples/filter_list.json`
+- **File Path**: `config/filter_list.json`
 - Note: In CLI mode, if this file cannot be found, please start the application once first, and it will be generated automatically from a built-in template.
 - **Format**: JSON object with `contains` and `exact` arrays
 - **Working Principle**: if the OCR original text matches the filter, that region is skipped completely and is not translated, erased, or rendered
@@ -786,7 +803,7 @@ Example:
 
 ### Relative path base
 
-- **Packaged Build**: relative to the `_internal` directory
+- **Packaged Build**: relative to the directory containing `app.exe`
 - **Development Build**: relative to the project root
 
 ### Common paths
@@ -871,24 +888,26 @@ Lazy shortcut:
 
 **Export original text template path**:
 
-- Default: `examples/translation_template.json`
+- Default: `config/translation_template.json`
 - Note: In CLI mode, if this file cannot be found, please start the application once first, and it will be generated automatically from a built-in template.
 - Used to customize the exported original-text format
 - Defines a text-box structure that the program repeats automatically
+- The first line, `"output_format": "json",`, controls the exported extension and defaults to `json`
+- Any safe extension is accepted; this directive is removed and never appears in exported content
 
 **Filter list path**:
 
-- Default: `examples/filter_list.json`
-- Legacy compatibility: `examples/filter_list.txt` is migrated automatically to JSON
+- Default: `config/filter_list.json`
+- Legacy compatibility: `config/filter_list.txt` is migrated automatically to JSON
 - Used to skip watermarks, ads, and other text that should not be translated
 
 **Text replacement rules path**:
 
-- Default: `examples/text_replacements.yaml`
+- Default: `config/text_replacements.yaml`
 - Note: In CLI mode, if this file cannot be found, please start the application once first, and it will be generated automatically from a built-in template.
 - Used for custom text replacements applied after translation and before rendering
-- Supports three groups: `common` (all directions), `horizontal` (horizontal text only), `vertical` (vertical text only)
-- **Execution order**: The `common` group runs first, followed by either `horizontal` or `vertical` depending on the text direction.
+- Supports three UI groups: `Common (Always)` (YAML key `common`), `Horizontal` (`horizontal`), and `Vertical` (`vertical`).
+- **Execution order**: `Common (Always)` runs first, followed by either `Horizontal` or `Vertical` depending on the text direction.
 - **Cascading mechanism**: Rules execute from top to bottom. Text generated by an earlier replacement can be replaced again by subsequent matching rules.
 - Each rule format:
   ```yaml
@@ -901,32 +920,33 @@ Lazy shortcut:
 - Replacement results are written into JSON; the editor export skips them automatically
 - Can be edited visually in the Qt UI under `Data Management` -> `Replacement Rules`
 
+**Rich text rules path**:
+
+- Default: `config/rich_text_rules.yaml`
+- Note: In CLI mode, if this file cannot be found, please start the application once first, and it will be generated automatically from a built-in template.
+- Rich text rules match the translated text after text replacements; they do not match the pre-replacement `translation_raw` value.
+- **Execution order**: the Replacement Rules UI runs `Common (Always)` first (YAML key `common`), then `Horizontal` or `Vertical` (YAML key `horizontal`/`vertical`), and `rich_text_rules.yaml` runs afterward to add rich-text styles.
+- Rich text rules are additive, not overwriting: existing color, font size, font family, stroke, rotation, TCY/Ruby, and other matching styles are preserved; a rule only fills style fields that are not already set for the matched characters.
+- When a rule matches part of a larger existing rich-text run, the run is split by character while its original styles are retained. A match that adds no new style does not create duplicate rich text.
+- `[BR]`, `【BR】`, `<br>`, `<br/>`, and real line breaks are protected as paragraph boundaries and are never wrapped in a styled run.
+- Rich text rules can be edited with the controls under `Data Management` -> `Rich Text Rules`, or directly in YAML.
+
 **Custom API params path**:
 
-- Default: `examples/custom_api_params.json`
+- Default: `config/custom_api_params.json`
 - Note: In CLI mode, if this file cannot be found, please start the application once first, and it will be generated automatically from a built-in template.
 - Used for extra request parameters for translation, AI OCR, AI rendering, and AI colorization
-- Recommended groups: `translator`, `ocr`, `render`, `colorizer`
-- Optional shared group: `common`
-- Legacy compatibility: top-level JSON keys are treated as `common`
+- Top-level keys are model names, for example `通用`, `gpt-4o`, or `qwen2.5:7b`
+- Every model preset contains `common`, `translator`, `ocr`, `colorizer`, and `render`
+- Runtime lookup matches the current model name exactly and falls back to `通用`; each module reads only its own section
+- Legacy top-level parameters and existing standard sections are migrated automatically into the `通用` preset
 
-**Font path**:
+**How to select a font**
 
-- Default: the `fonts` directory
-- You can also point to a specific font file such as `fonts/my_font.ttf`
-- Supports `.ttf`, `.otf`, and `.ttc`
-
-**How to add a custom font**
-
-Current UI method:
-
-1. Open `Font Management`
-2. Either:
-   - click `Import`, or
-   - click `Open Directory` and copy the font file into `fonts/`
-3. Font filenames are best kept in English if possible
-4. Select the new font in `Font Management`
-5. Click `Apply Selected Font`
+1. Install the font in the operating system
+   or copy a `.ttf`, `.otf`, or `.ttc` file into the project `fonts` directory
+2. Open `Settings` -> `Typesetting` -> `Font`; use `Open Directory` if you need direct access to the project font directory
+3. Reopen the dropdown to refresh it, then select the font family
 
 **Output folder**:
 

@@ -2,22 +2,31 @@ import json
 from typing import Any, Callable
 
 from PyQt6.QtWidgets import (
-    QDialog,
-    QFrame,
     QHBoxLayout,
-    QLabel,
-    QPlainTextEdit,
-    QPushButton,
-    QTabWidget,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
-from ui.styles import (
-    monospace_font as _monospace_font,
-    secondary_editor_dialog_stylesheet as _dialog_stylesheet,
-    status_stylesheet as _status_stylesheet,
+from qfluentwidgets import (
+    BodyLabel,
+    CardWidget,
+    CaptionLabel,
+    FluentIcon as FIF,
+    HorizontalSeparator,
+    PlainTextEdit,
+    PopUpAniStackedWidget,
+    PrimaryPushButton,
+    PushButton,
+    ScrollArea,
+    SegmentedWidget,
+    SimpleCardWidget,
+    StrongBodyLabel,
+    TitleLabel,
 )
-from ui.theme import apply_widget_stylesheet
+from ui.secondary_pages.fluent_dialog import FluentSecondaryDialog
+from ui.theme import (
+    monospace_font as _monospace_font,
+)
 
 from manga_translator.utils.text_filter import (
     ensure_filter_list_exists,
@@ -45,7 +54,7 @@ def _sanitize_rule_values(values: Any) -> list[str]:
     return rules
 
 
-class FilterListEditorDialog(QDialog):
+class FilterListEditorDialog(FluentSecondaryDialog):
     def __init__(self, file_path: str | None = None, t_func: Callable[[str], str] | None = None, parent=None):
         super().__init__(parent)
         self._t = t_func or (lambda text, **kwargs: text.format(**kwargs) if kwargs else text)
@@ -57,48 +66,49 @@ class FilterListEditorDialog(QDialog):
 
     def _setup_ui(self):
         self.setWindowTitle(self._t("Edit Filter List"))
-        self.setMinimumSize(880, 620)
+        self.setMinimumSize(680, 480)
         self.resize(980, 720)
-        apply_widget_stylesheet(self, _dialog_stylesheet())
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 14, 16, 14)
         root.setSpacing(10)
 
-        title = QLabel(self._t("Edit Filter List"))
-        title.setObjectName("dialog_title")
-        subtitle = QLabel(self._t("Edit OCR text filter rules skipped during translation."))
-        subtitle.setObjectName("dialog_subtitle")
+        header_card = CardWidget(self)
+        header_layout = QVBoxLayout(header_card)
+        header_layout.setContentsMargins(16, 12, 16, 12)
+        header_layout.setSpacing(4)
+
+        title = TitleLabel(self._t("Edit Filter List"), header_card)
+        subtitle = BodyLabel(self._t("Edit OCR text filter rules skipped during translation."), header_card)
         subtitle.setWordWrap(True)
-        root.addWidget(title)
-        root.addWidget(subtitle)
+        header_layout.addWidget(title)
+        header_layout.addWidget(subtitle)
+        root.addWidget(header_card)
 
-        divider = QFrame()
-        divider.setObjectName("divider")
-        divider.setFrameShape(QFrame.Shape.HLine)
-        root.addWidget(divider)
-
-        self.tabs = QTabWidget()
-        root.addWidget(self.tabs, 1)
+        self.tab_segmented = SegmentedWidget(self)
+        self.tab_stack = PopUpAniStackedWidget(self)
+        root.addWidget(self.tab_segmented)
+        root.addWidget(self.tab_stack, 1)
 
         self._build_rules_tab()
         self._build_raw_tab()
 
-        self.status_label = QLabel("")
-        self.status_label.setObjectName("hint_label")
+        self.status_label = CaptionLabel("")
         root.addWidget(self.status_label)
 
         button_row = QHBoxLayout()
         button_row.addStretch(1)
 
-        self.refresh_button = QPushButton(self._t("Refresh"))
+        self.refresh_button = PushButton(self._t("Refresh"))
+        self.refresh_button.setIcon(FIF.SYNC)
         self.refresh_button.clicked.connect(self._load_from_disk)
 
-        self.cancel_button = QPushButton(self._t("Cancel"))
+        self.cancel_button = PushButton(self._t("Cancel"))
+        self.cancel_button.setIcon(FIF.CANCEL)
         self.cancel_button.clicked.connect(self.reject)
 
-        self.save_button = QPushButton(self._t("Save"))
-        self.save_button.setProperty("variant", "accent")
+        self.save_button = PrimaryPushButton(self._t("Save"))
+        self.save_button.setIcon(FIF.SAVE)
         self.save_button.clicked.connect(self._save)
 
         button_row.addWidget(self.refresh_button)
@@ -107,72 +117,113 @@ class FilterListEditorDialog(QDialog):
         root.addLayout(button_row)
 
     def _build_rules_tab(self):
-        page = QWidget()
-        page_layout = QVBoxLayout(page)
-        page_layout.setContentsMargins(8, 8, 8, 8)
+        page = ScrollArea(self.tab_stack)
+        page.setWidgetResizable(True)
+        page.setFrameShape(ScrollArea.Shape.NoFrame)
+        page.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        host = QWidget(page)
+        host_layout = QVBoxLayout(host)
+        host_layout.setContentsMargins(0, 0, 0, 0)
+        host_layout.setSpacing(0)
+
+        card = SimpleCardWidget(host)
+        page_layout = QVBoxLayout(card)
+        page_layout.setContentsMargins(16, 14, 16, 14)
         page_layout.setSpacing(10)
 
-        page_layout.addWidget(self._build_rules_card(
-            self._t("Contains Filter"),
-            self._t("Skip when OCR text contains any of these rules."),
-            "contains",
-        ))
-        page_layout.addWidget(self._build_rules_card(
-            self._t("Exact Filter"),
-            self._t("Skip only when OCR text exactly matches one of these rules."),
-            "exact",
-        ))
-        page_layout.addStretch(1)
+        contains_title = StrongBodyLabel(self._t("Contains Filter"), card)
+        contains_hint = CaptionLabel(self._t("Skip when OCR text contains any of these rules."), card)
+        contains_hint.setWordWrap(True)
 
-        self.tabs.addTab(page, self._t("Filter Rules"))
+        self.contains_editor = PlainTextEdit(card)
+        self.contains_editor.setFont(_monospace_font())
+        self.contains_editor.setTabStopDistance(28)
+        self.contains_editor.setLineWrapMode(PlainTextEdit.LineWrapMode.NoWrap)
+        self.contains_editor.setPlaceholderText(self._t("One rule per line"))
+        self.contains_editor.setMinimumHeight(180)
 
-    def _build_rules_card(self, title_text: str, hint_text: str, mode: str) -> QWidget:
-        card = QWidget()
-        card.setObjectName("section_card")
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(6)
+        exact_title = StrongBodyLabel(self._t("Exact Filter"), card)
+        exact_hint = CaptionLabel(self._t("Skip only when OCR text exactly matches one of these rules."), card)
+        exact_hint.setWordWrap(True)
 
-        title = QLabel(title_text)
-        title.setObjectName("section_label")
-        hint = QLabel(hint_text)
-        hint.setObjectName("hint_label")
-        hint.setWordWrap(True)
+        self.exact_editor = PlainTextEdit(card)
+        self.exact_editor.setFont(_monospace_font())
+        self.exact_editor.setTabStopDistance(28)
+        self.exact_editor.setLineWrapMode(PlainTextEdit.LineWrapMode.NoWrap)
+        self.exact_editor.setPlaceholderText(self._t("One rule per line"))
+        self.exact_editor.setMinimumHeight(180)
 
-        editor = QPlainTextEdit()
-        editor.setFont(_monospace_font())
-        editor.setTabStopDistance(28)
-        editor.setPlaceholderText(self._t("One rule per line"))
+        page_layout.addWidget(contains_title)
+        page_layout.addWidget(contains_hint)
+        page_layout.addWidget(self.contains_editor, 1)
+        page_layout.addWidget(HorizontalSeparator(card))
+        page_layout.addWidget(exact_title)
+        page_layout.addWidget(exact_hint)
+        page_layout.addWidget(self.exact_editor, 1)
+        host_layout.addWidget(card)
+        page.setWidget(host)
+        page.enableTransparentBackground()
 
-        layout.addWidget(title)
-        layout.addWidget(hint)
-        layout.addWidget(editor, 1)
-
-        if mode == "contains":
-            self.contains_editor = editor
-        else:
-            self.exact_editor = editor
-        return card
+        route_key = "filter_rules"
+        page_index = self.tab_stack.count()
+        self.tab_stack.addWidget(page)
+        self.tab_segmented.addItem(
+            route_key,
+            self._t("Filter Rules"),
+            onClick=lambda checked=False: (
+                self.tab_stack.setCurrentIndex(page_index),
+                self.tab_segmented.setCurrentItem(route_key),
+            ),
+        )
+        self.tab_stack.setCurrentIndex(page_index)
+        self.tab_segmented.setCurrentItem(route_key)
 
     def _build_raw_tab(self):
-        page = QWidget()
-        page_layout = QVBoxLayout(page)
-        page_layout.setContentsMargins(8, 8, 8, 8)
+        page = ScrollArea(self.tab_stack)
+        page.setWidgetResizable(True)
+        page.setFrameShape(ScrollArea.Shape.NoFrame)
+        page.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        host = QWidget(page)
+        host_layout = QVBoxLayout(host)
+        host_layout.setContentsMargins(0, 0, 0, 0)
+        host_layout.setSpacing(0)
+
+        card = SimpleCardWidget(host)
+        page_layout = QVBoxLayout(card)
+        page_layout.setContentsMargins(16, 14, 16, 14)
         page_layout.setSpacing(8)
 
-        hint = QLabel(self._t("Edit the raw file content directly"))
-        hint.setObjectName("hint_label")
+        hint = CaptionLabel(self._t("Edit the raw file content directly"), card)
+        hint.setWordWrap(True)
         page_layout.addWidget(hint)
 
-        self.raw_editor = QPlainTextEdit()
+        self.raw_editor = PlainTextEdit(card)
         self.raw_editor.setFont(_monospace_font())
         self.raw_editor.setTabStopDistance(28)
+        self.raw_editor.setLineWrapMode(PlainTextEdit.LineWrapMode.NoWrap)
+        self.raw_editor.setMinimumHeight(360)
         page_layout.addWidget(self.raw_editor, 1)
+        host_layout.addWidget(card)
+        page.setWidget(host)
+        page.enableTransparentBackground()
 
-        self.tabs.addTab(page, self._t("Raw Edit"))
+        route_key = "raw_edit"
+        page_index = self.tab_stack.count()
+        self.tab_stack.addWidget(page)
+        self.tab_segmented.addItem(
+            route_key,
+            self._t("Raw Edit"),
+            onClick=lambda checked=False: (
+                self.tab_stack.setCurrentIndex(page_index),
+                self.tab_segmented.setCurrentItem(route_key),
+            ),
+        )
+        if page_index == 0:
+            self.tab_stack.setCurrentIndex(page_index)
+            self.tab_segmented.setCurrentItem(route_key)
 
     def _set_status(self, message: str, kind: str = "default"):
-        self.status_label.setStyleSheet(_status_stylesheet(kind))
+        del kind
         self.status_label.setText(message)
 
     def _load_from_disk(self):
@@ -223,7 +274,7 @@ class FilterListEditorDialog(QDialog):
 
     def _save(self):
         try:
-            if self.tabs.currentIndex() == 0:
+            if self.tab_stack.currentIndex() == 0:
                 data = self._collect_structured_data()
             else:
                 data = self._collect_raw_data()

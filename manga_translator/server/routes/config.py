@@ -21,6 +21,7 @@ from manga_translator.server.core.middleware import get_services, require_auth
 from manga_translator.server.core.models import Session
 from manga_translator.server.core.response_utils import get_user_preset_env_state
 from manga_translator.server_paths import USER_RESOURCES_RELATIVE_DIR
+from manga_translator.runtime_paths import get_application_dir, get_config_path
 from manga_translator.utils import BASE_PATH
 
 router = APIRouter(tags=["config"])
@@ -70,7 +71,6 @@ SERVER_HIDDEN_CONFIG_KEYS = {
     "render.gimp_font",
     # PSD 相关（Qt UI / Photoshop 专属）
     "cli.export_editable_psd",
-    "cli.psd_font",
     # Qt UI 专属 - 输出到原图目录
     "cli.save_to_source_dir",
     # Qt UI 专属 - 导入固定YOLO框
@@ -108,13 +108,10 @@ WEB_API_ENV_KEYS = {
 
 
 def _load_server_web_env_vars() -> dict:
-    from dotenv import dotenv_values
+    from manga_translator.utils.dotenv_utils import read_dotenv_file
 
-    env_path = os.path.join(os.path.dirname(__file__), '..', '..', '..', '.env')
-    if not os.path.exists(env_path):
-        return {}
-
-    env_vars = dotenv_values(env_path)
+    env_path = os.path.join(get_application_dir(), '.env')
+    env_vars = read_dotenv_file(env_path)
     return {
         key: value for key, value in env_vars.items()
         if key in WEB_API_ENV_KEYS and value
@@ -455,6 +452,10 @@ async def get_config_options(
     """
     from manga_translator.config import Alignment, Direction, InpaintPrecision
     from manga_translator.detection import Detector
+    from manga_translator.image_formats import (
+        OUTPUT_IMAGE_FORMATS,
+        SUPPORTED_IMAGE_EXTENSIONS,
+    )
     from manga_translator.inpainting import Inpainter
     from manga_translator.translators import VALID_LANGUAGES
     from manga_translator.upscaling import Upscaler
@@ -464,11 +465,16 @@ async def get_config_options(
     if os.path.exists(FONTS_DIR):
         fonts = sorted([f for f in os.listdir(FONTS_DIR) if f.lower().endswith(('.ttf', '.otf', '.ttc'))])
     
-    # 服务器字体使用相对路径: fonts/{filename}
-    server_font_paths = [f'fonts/{f}' for f in fonts]
+    from manga_translator.rendering.text_render import load_font_file
+    server_font_families = []
+    for filename in fonts:
+        try:
+            server_font_families.append(load_font_file(os.path.join(FONTS_DIR, filename)))
+        except Exception:
+            pass
     
     # Get user's uploaded fonts if session is provided
-    user_font_paths = []
+    user_font_families = []
     user_prompt_paths = []
     if session_token:
         try:
@@ -478,12 +484,15 @@ async def get_config_options(
             session = session_service.verify_token(session_token)
             if session:
                 resource_service = get_resource_service()
-                # 用户字体使用相对路径: manga_translator/server/data/user_resources/fonts/{username}/{filename}
                 user_font_resources = resource_service.get_user_fonts(session.username)
-                user_font_paths = [
-                    f'{USER_RESOURCES_RELATIVE_DIR}/fonts/{session.username}/{f.filename}'
-                    for f in user_font_resources
-                ]
+                for font_resource in user_font_resources:
+                    try:
+                        user_font_families.append(
+                            load_font_file(str(resource_service.base_path / font_resource.file_path))
+                        )
+                    except Exception:
+                        if font_resource.font_family:
+                            user_font_families.append(font_resource.font_family)
                 # 用户提示词使用相对路径: manga_translator/server/data/user_resources/prompts/{username}/{filename}
                 user_prompt_resources = resource_service.get_user_prompts(session.username)
                 user_prompt_paths = [
@@ -494,8 +503,7 @@ async def get_config_options(
             import logging
             logging.getLogger('manga_translator.server').warning(f"Failed to get user resources: {e}")
     
-    # Combine server fonts and user fonts
-    all_font_paths = server_font_paths + user_font_paths
+    all_font_families = sorted(set(server_font_families + user_font_families), key=str.casefold)
     
     # Get server prompt list
     prompts = []
@@ -530,7 +538,7 @@ async def get_config_options(
             '3x-denoise3x', '3x-denoise3x-pro',
             '4x-conservative', '4x-no-denoise', '4x-denoise3x'
         ],
-        'font_path': all_font_paths,
+        'font_family': all_font_families,
         'high_quality_prompt_path': all_prompt_paths,
         'layout_mode': ['smart_scaling', 'strict', 'balloon_fill'],
         'ocr_vl_language_hint': [
@@ -555,7 +563,8 @@ async def get_config_options(
             'Polish',
             'Ukrainian'
         ],
-        'format': ['png', 'webp', 'jpg', 'avif']  # 移除了 xcf, psd, pdf（使用 export_editable_psd 配置项代替）
+        'format': ['不指定', *OUTPUT_IMAGE_FORMATS],
+        'image_extensions': list(SUPPORTED_IMAGE_EXTENSIONS),
     }
 
     if session_token:
@@ -772,8 +781,7 @@ async def get_workflows(
 @router.get("/translator-config/{translator}")
 async def get_translator_config(translator: str):
     """Get translator configuration (required API keys) - public info only"""
-    config_path = os.path.join(os.path.dirname(__file__), '..', '..', '..', 
-                               'examples', 'config', 'translators.json')
+    config_path = get_config_path('config', 'translators.json')
     
     if os.path.exists(config_path):
         try:
@@ -936,10 +944,10 @@ async def get_effective_user_env_vars(session: Session = Depends(require_auth)):
 @router.post("/env")
 async def save_user_env_vars(env_vars: dict, session: Session = Depends(require_auth)):
     """Save user's environment variables"""
-    from dotenv import load_dotenv
     from fastapi import HTTPException
 
     from manga_translator.server.core.env_service import EnvService
+    from manga_translator.utils.dotenv_utils import APP_DOTENV_PATH_ENV, load_app_dotenv
     
     policy = get_effective_api_key_policy(session.username, admin_settings)
     if not policy.get('show_env_editor', False):
@@ -958,7 +966,8 @@ async def save_user_env_vars(env_vars: dict, session: Session = Depends(require_
         return {"success": True, "saved_to_server": False}
     
     # Save to server .env file using EnvService for consistent formatting
-    env_path = os.path.join(os.path.dirname(__file__), '..', '..', '..', '.env')
+    env_path = os.path.join(get_application_dir(), '.env')
+    os.environ[APP_DOTENV_PATH_ENV] = env_path
     try:
         env_service = EnvService(env_path)
         
@@ -966,7 +975,7 @@ async def save_user_env_vars(env_vars: dict, session: Session = Depends(require_
             env_service.update_env_var(key, value)
         
         # 重新加载 .env 文件确保所有变量都是最新的
-        load_dotenv(env_path, override=True)
+        load_app_dotenv(env_path, override=True)
         
         return {"success": True, "saved_to_server": True}
     except Exception as e:

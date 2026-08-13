@@ -18,6 +18,7 @@ from cryptography.fernet import Fernet
 
 from manga_translator.server.core.env_service import EnvService
 from manga_translator.server.models.config_models import ConfigPreset, UserConfig
+from manga_translator.server_paths import SERVER_DATA_DIR
 from manga_translator.server.repositories.config_repository import (
     ConfigRepository,
     UserConfigRepository,
@@ -29,8 +30,7 @@ logger = logging.getLogger(__name__)
 class ConfigManagementService:
     """Service for managing .env configurations, presets, and user configs."""
     
-    # 使用绝对路径，基于当前文件位置
-    _DATA_DIR = Path(__file__).parent.parent / "data"
+    _DATA_DIR = SERVER_DATA_DIR
     _DEFAULT_PRESETS_FILE = str(_DATA_DIR / "env_presets.json")
     _DEFAULT_USER_CONFIGS_FILE = str(_DATA_DIR / "user_configs.json")
     
@@ -166,7 +166,7 @@ class ConfigManagementService:
             Path to the backup file
         """
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        backup_dir = Path("manga_translator/server/data/backups")
+        backup_dir = SERVER_DATA_DIR / "backups"
         backup_dir.mkdir(parents=True, exist_ok=True)
         
         backup_path = backup_dir / f".env.backup.{timestamp}"
@@ -199,7 +199,16 @@ class ConfigManagementService:
             True if successful, False otherwise
         """
         try:
-            if not os.path.exists(backup_path):
+            backup_dir = os.path.realpath(SERVER_DATA_DIR / "backups")
+            resolved_backup_path = os.path.realpath(backup_path)
+            if not resolved_backup_path.startswith(backup_dir + os.sep):
+                logger.error(f"Invalid backup path: {backup_path}")
+                return False
+            if (
+                os.path.dirname(resolved_backup_path) != backup_dir
+                or not os.path.basename(resolved_backup_path).startswith(".env.backup.")
+                or not os.path.isfile(resolved_backup_path)
+            ):
                 logger.error(f"Backup file not found: {backup_path}")
                 return False
             
@@ -208,12 +217,12 @@ class ConfigManagementService:
             logger.info(f"Created backup of current state: {current_backup}")
             
             # Restore from backup
-            shutil.copy2(backup_path, self.env_file)
+            shutil.copy2(resolved_backup_path, self.env_file)
             
             # Reload environment variables
             self.env_service.reload_env()
             
-            logger.info(f"Restored .env from backup {backup_path} by admin {admin_id}")
+            logger.info(f"Restored .env from backup {resolved_backup_path} by admin {admin_id}")
             return True
         except Exception as e:
             logger.error(f"Failed to restore from backup: {e}")
@@ -226,7 +235,7 @@ class ConfigManagementService:
         Returns:
             List of backup information dictionaries
         """
-        backup_dir = Path("manga_translator/server/data/backups")
+        backup_dir = SERVER_DATA_DIR / "backups"
         if not backup_dir.exists():
             return []
         

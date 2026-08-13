@@ -10,7 +10,11 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-ROOT_DIR = Path(__file__).parent.parent.parent
+ROOT_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, 'frozen', False)
+    else Path(__file__).resolve().parent.parent.parent
+)
 
 # 内存监控阈值
 DEFAULT_MEMORY_THRESHOLD_MB = 0  # 默认不限制绝对内存
@@ -86,13 +90,9 @@ def worker_translate_batch(
         cli_config['overwrite'] = overwrite
         config_dict['cli'] = cli_config
         
-        # 处理 font_path
-        font_filename = config_dict.get('render', {}).get('font_path')
-        if font_filename and not os.path.isabs(font_filename):
-            font_full_path = os.path.join(ROOT_DIR, 'fonts', font_filename)
-            if os.path.exists(font_full_path):
-                config_dict['render']['font_path'] = font_full_path
-        
+        font_family = config_dict.get('render', {}).get('font_family')
+        if font_family:
+            config_dict['font_family'] = font_family
         # 创建翻译器
         translator_params = cli_config.copy()
         translator_params.update(config_dict)
@@ -351,5 +351,3 @@ async def translate_with_subprocess(
         print(f"\n⚠️ 有 {failed_count} 个文件失败")
     
     return success_count, failed_count
-
-

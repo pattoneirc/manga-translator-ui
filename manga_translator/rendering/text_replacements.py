@@ -15,12 +15,12 @@ from typing import Dict, List, Optional, Tuple
 
 import yaml
 
-from ..utils import BASE_PATH
+from manga_translator.runtime_paths import get_config_path
 
 logger = logging.getLogger(__name__)
 
 # 默认配置文件路径
-_DEFAULT_REPLACEMENTS_PATH = os.path.join(BASE_PATH, 'examples', 'text_replacements.yaml')
+_DEFAULT_REPLACEMENTS_PATH = get_config_path('text_replacements.yaml')
 
 # 缓存：(文件路径, mtime) -> 解析后的规则
 _replacements_cache: Dict[str, Tuple[float, dict]] = {}
@@ -52,11 +52,6 @@ common:
     replace: '…'
     regex: true
     comment: "三个英文句号转换为一个省略号"
-
-  - pattern: '\s{2,}'
-    replace: ' '
-    regex: true
-    comment: "多余空格压缩为单个"
 
   # - pattern: '第(\d+)话'
   #   replace: '第\1話'
@@ -143,6 +138,11 @@ horizontal:
 # 竖排替换（direction == 1 时执行，在 common 之后）
 # ═══════════════════════════════════════════════════════════════
 vertical:
+  - pattern: '\s{2,}'
+    replace: ' '
+    regex: true
+    comment: "竖排多余空白压缩为单个"
+
   - pattern: "‥"
     replace: "︰"
   - pattern: "─"
@@ -151,22 +151,50 @@ vertical:
     replace: "┃"
   - pattern: "═"
     replace: "║"
-  - pattern: "—"
-    replace: "︱"
   - pattern: "―"
     replace: "|"
-  - pattern: "–"
-    replace: "︲"
-  - pattern: "_"
-    replace: "︴"
-  - pattern: "("
+  - pattern: "⟨"
+    replace: "︿"
+  - pattern: "⟩"
+    replace: "﹀"
+  - pattern: "⟪"
+    replace: "︿"
+  - pattern: "⟫"
+    replace: "﹀"
+  - pattern: "﹑"
+    replace: "﹅"
+  - pattern: "⦅"
     replace: "︵"
-  - pattern: ")"
+  - pattern: "⦆"
     replace: "︶"
+  - pattern: "❨"
+    replace: "︵"
+  - pattern: "❩"
+    replace: "︶"
+  - pattern: "❪"
+    replace: "︷"
+  - pattern: "❫"
+    replace: "︸"
+  - pattern: "❬"
+    replace: "︿"
+  - pattern: "❭"
+    replace: "﹀"
+  - pattern: "❮"
+    replace: "︿"
+  - pattern: "❯"
+    replace: "﹀"
   - pattern: "（"
     replace: "︵"
   - pattern: "）"
     replace: "︶"
+  - pattern: "("
+    replace: "︵"
+  - pattern: ")"
+    replace: "︶"
+  - pattern: "｛"
+    replace: "︷"
+  - pattern: "｝"
+    replace: "︸"
   - pattern: "{"
     replace: "︷"
   - pattern: "}"
@@ -187,82 +215,15 @@ vertical:
     replace: "︿"
   - pattern: "〉"
     replace: "﹀"
-  - pattern: "⟨"
-    replace: "︿"
-  - pattern: "⟩"
-    replace: "﹀"
-  - pattern: "⟪"
-    replace: "︿"
-  - pattern: "⟫"
-    replace: "﹀"
-  - pattern: "「"
-    replace: "﹁"
-  - pattern: "」"
-    replace: "﹂"
-  - pattern: "『"
-    replace: "﹃"
-  - pattern: "』"
-    replace: "﹄"
-  - pattern: "\""
-    replace: "﹂"
-  - pattern: "'"
-    replace: "﹂"
-  - pattern: "\u201C"
-    replace: "﹁"
-    comment: "左双引号"
-  - pattern: "\u201D"
-    replace: "﹂"
-    comment: "右双引号"
-  - pattern: "﹑"
-    replace: "﹅"
+  - pattern: "﹇"
+    replace: "［"
+    comment: "方块括号竖排形字形覆盖差，归一回全角走旋转"
+  - pattern: "﹈"
+    replace: "］"
   - pattern: "["
-    replace: "﹇"
+    replace: "［"
   - pattern: "]"
-    replace: "﹈"
-  - pattern: "⦅"
-    replace: "︵"
-  - pattern: "⦆"
-    replace: "︶"
-  - pattern: "❨"
-    replace: "︵"
-  - pattern: "❩"
-    replace: "︶"
-  - pattern: "❪"
-    replace: "︷"
-  - pattern: "❫"
-    replace: "︸"
-  - pattern: "❬"
-    replace: "﹇"
-  - pattern: "❭"
-    replace: "﹈"
-  - pattern: "❮"
-    replace: "︿"
-  - pattern: "❯"
-    replace: "﹀"
-  - pattern: "﹆"
-    replace: "﹆"
-    comment: "保持不变"
-  - pattern: "﹉"
-    replace: "﹉"
-    comment: "保持不变"
-  - pattern: "﹊"
-    replace: "﹊"
-    comment: "保持不变"
-  - pattern: "﹋"
-    replace: "﹋"
-    comment: "保持不变"
-  - pattern: "﹌"
-    replace: "﹌"
-    comment: "保持不变"
-  - pattern: "﹍"
-    replace: "﹍"
-    comment: "保持不变"
-  - pattern: "﹎"
-    replace: "﹎"
-    comment: "保持不变"
-  - pattern: "﹏"
-    replace: "﹏"
-    comment: "保持不变"
+    replace: "］"
   - pattern: "……"
     replace: "︙"
     comment: "六点变三点省略号"
@@ -274,55 +235,28 @@ vertical:
     replace: "⋮"
   - pattern: "⋱"
     replace: "⋮"
-  - pattern: "″"
-    replace: "﹂"
-  - pattern: "‴"
-    replace: "﹂"
-  - pattern: "‶"
-    replace: "﹁"
-  - pattern: "ⷷ"
-    replace: "﹁"
   - pattern: "〜"
     replace: "︴"
-  - pattern: "～"
-    replace: "︴"
-  - pattern: "~"
-    replace: "≀"
   - pattern: "〰"
     replace: "︴"
-  - pattern: "!"
-    replace: "︕"
-  - pattern: "?"
-    replace: "︖"
   - pattern: "؟"
     replace: "︖"
   - pattern: "¿"
     replace: "︖"
   - pattern: "¡"
     replace: "︕"
-  - pattern: "."
-    replace: "︒"
-    enabled: false
   - pattern: "。"
     replace: "︒"
-  - pattern: ";"
-    replace: "︔"
   - pattern: "；"
     replace: "︔"
-  - pattern: ":"
-    replace: "︓"
   - pattern: "："
     replace: "︓"
-  - pattern: ","
-    replace: "︐"
   - pattern: "，"
     replace: "︐"
   - pattern: "‚"
     replace: "︐"
   - pattern: "„"
     replace: "︐"
-  - pattern: "-"
-    replace: "︲"
   - pattern: "−"
     replace: "︲"
   - pattern: "・"
@@ -349,7 +283,7 @@ def reset_text_replacements_to_default(file_path: Optional[str] = None) -> str:
 
 
 def ensure_text_replacements_exists() -> str:
-    """确保文本替换规则配置文件存在，如果不存在则使用内置模板创建。"""
+    """确保文本替换规则存在；历史默认文件升级由启动初始化统一处理。"""
     if os.path.exists(_DEFAULT_REPLACEMENTS_PATH):
         return _DEFAULT_REPLACEMENTS_PATH
     
@@ -456,7 +390,7 @@ def apply_replacements(text: str, direction: int, replacements: Optional[dict] =
                        file_path: Optional[str] = None) -> str:
     """
     对译文应用替换规则。
-    自动跳过 [BR]、<br>、<H>...</H>、【BR】 等标记，避免标记内容被误替换。
+    自动跳过 [BR]、<br>、【BR】 等换行标记，避免标记内容被误替换。
 
     参数:
         text: 原始译文
@@ -473,10 +407,9 @@ def apply_replacements(text: str, direction: int, replacements: Optional[dict] =
     if replacements is None:
         replacements = load_replacements(file_path)
 
-    # 保护标记：提取 <H>...</H>、[BR]、<br>、【BR】 等，用占位符替代
+    # 保护标记：提取 [BR]、<br>、【BR】 等，用占位符替代
     _PROTECTED_RE = re.compile(
-        r'<H>.*?</H>'        # <H>...</H> 块
-        r'|\[BR\]'           # [BR]
+        r'\[BR\]'            # [BR]
         r'|【BR】'           # 【BR】
         r'|<br\s*/?>'        # <br> / <br/>
         , re.IGNORECASE | re.DOTALL

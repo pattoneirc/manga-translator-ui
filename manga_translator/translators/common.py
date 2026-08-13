@@ -14,17 +14,18 @@ import cv2
 import numpy as np
 
 from ..utils import InfererModule, ModelWrapper, is_valuable_text, repeating_sequence
+from ..utils.image_modes import normalize_rgb_image
 from ..utils.openai_compat import (
     is_local_openai_compatible_endpoint,
     resolve_openai_compatible_api_key,
 )
-from ..utils.image_modes import normalize_rgb_image
 from ..utils.retry import (
     get_retry_attempts_from_config,
     normalize_retry_attempts,
     resolve_total_attempts,
     summarize_response_text,
 )
+from ..utils.system_proxy import system_proxy_request_kwargs
 
 try:
     import readline
@@ -165,6 +166,22 @@ def _extract_http_error_details(response) -> str:
     return summarize_response_text(raw_json, limit=800, empty_placeholder="(empty response)")
 
 
+def _response_diagnostics(response, *, limit: int = 1200) -> str:
+    """Return safe, bounded HTTP response details for parse errors."""
+    headers = getattr(response, "headers", {}) or {}
+    content_type = ""
+    try:
+        content_type = headers.get("content-type", "") or headers.get("Content-Type", "")
+    except Exception:
+        content_type = ""
+    status_code = getattr(response, "status_code", "unknown")
+    raw_text = summarize_response_text(
+        getattr(response, "text", ""),
+        limit=limit,
+        empty_placeholder="(empty response)",
+    )
+    return f"HTTP {status_code}, Content-Type: {content_type or '(missing)'}, raw response: {raw_text}"
+
 
 class LanguageUnsupportedException(Exception):
     def __init__(self, language_code: str, translator: str = None, supported_languages: List[str] = None):
@@ -244,6 +261,9 @@ class AsyncOpenAICurlCffi:
             data.update(kwargs)
 
             stream_mode = bool(data.get("stream"))
+            # 部分 OpenAI 兼容站点会在缺省 stream 参数时错误地默认返回 SSE。
+            # 普通请求显式传 false，确保响应遵循非流式 JSON 格式。
+            data["stream"] = stream_mode
             if stream_mode:
                 return self._create_stream(url, data, headers)
 
@@ -252,7 +272,8 @@ class AsyncOpenAICurlCffi:
                 url,
                 json=data,
                 headers=headers,
-                timeout=self.parent.timeout
+                timeout=self.parent.timeout,
+                **system_proxy_request_kwargs(url),
             )
 
             if response.status_code != 200:
@@ -265,7 +286,12 @@ class AsyncOpenAICurlCffi:
                 )
                 raise Exception(error_msg)
 
-            result = response.json()
+            try:
+                result = response.json()
+            except Exception as e:
+                raise Exception(
+                    f"无法解析 API 的 JSON 响应: {e}. {_response_diagnostics(response)}"
+                ) from e
 
             # 转换为类似 OpenAI SDK 的响应对象
             return _OpenAIResponse(result)
@@ -279,7 +305,8 @@ class AsyncOpenAICurlCffi:
                     url,
                     json=data,
                     headers=headers,
-                    timeout=self.parent.stream_timeout
+                    timeout=self.parent.stream_timeout,
+                    **system_proxy_request_kwargs(url),
                 ) as response:
                     if response.status_code != 200:
                         text = await response.atext()
@@ -335,7 +362,8 @@ class AsyncOpenAICurlCffi:
             response = await self.parent.session.get(
                 url,
                 headers=headers,
-                timeout=self.parent.timeout
+                timeout=self.parent.timeout,
+                **system_proxy_request_kwargs(url),
             )
 
             if response.status_code != 200:
@@ -352,12 +380,18 @@ class AsyncOpenAICurlCffi:
             content_type = response.headers.get('content-type', '')
             if 'application/json' not in content_type and 'text/json' not in content_type:
                 # 可能返回了 HTML 页面，说明 API 不支持 /models 端点
-                raise Exception("API 不支持获取模型列表（返回了非 JSON 响应）。请手动输入模型名称。")
+                raise Exception(
+                    "API 不支持获取模型列表（返回了非 JSON 响应）。"
+                    f"{_response_diagnostics(response)}。请手动输入模型名称。"
+                )
 
             try:
                 result = response.json()
             except Exception as e:
-                raise Exception(f"无法解析 API 响应: {str(e)}。请手动输入模型名称。")
+                raise Exception(
+                    f"无法解析 API 响应: {str(e)}. "
+                    f"{_response_diagnostics(response)}。请手动输入模型名称。"
+                ) from e
 
             # 转换为类似 OpenAI SDK 的响应对象
             return _ModelsResponse(result)
@@ -654,7 +688,8 @@ class AsyncGeminiCurlCffi:
                 url,
                 json=data,
                 headers=request_headers,
-                timeout=self.parent.timeout
+                timeout=self.parent.timeout,
+                **system_proxy_request_kwargs(url),
             )
 
             if response.status_code != 200:
@@ -711,7 +746,8 @@ class AsyncGeminiCurlCffi:
                     stream_url,
                     json=data,
                     headers=headers,
-                    timeout=self.parent.stream_timeout
+                    timeout=self.parent.stream_timeout,
+                    **system_proxy_request_kwargs(stream_url),
                 ) as response:
                     if response.status_code != 200:
                         text = await response.atext()
@@ -752,7 +788,8 @@ class AsyncGeminiCurlCffi:
             response = await self.parent.session.get(
                 url,
                 headers=headers,
-                timeout=self.parent.timeout
+                timeout=self.parent.timeout,
+                **system_proxy_request_kwargs(url),
             )
 
             if response.status_code != 200:
@@ -1365,12 +1402,12 @@ class CommonTranslator(InfererModule):
         self._global_attempt_count = 0  # 全局尝试计数器
         self._max_total_attempts = -1  # 全局最大尝试次数
         self._cancel_check_callback = None  # 取消检查回调
-        self._custom_api_params = {}  # 存储自定义API参数
+        self._custom_api_params_config = None
         self._enable_streaming = True
         self._stream_inline_last_len = 0
         self._stream_inline_buffer = ""
         self._stream_json_seen: Dict[int, str] = {}
-        self._stream_term_seen: Dict[Tuple[str, str], str] = {}
+        self._stream_term_seen: Dict[Tuple[str, str, str], str] = {}
         self._stream_preview_buffer = ""
         self._stream_preview_scan_pos = 0
         self._stream_preview_object_starts: List[int] = []
@@ -1405,37 +1442,25 @@ class CommonTranslator(InfererModule):
                 return bool(value)
         return bool(getattr(self, '_enable_streaming', True))
     
-    def _load_custom_api_params(self):
-        """从固定目录加载自定义API参数配置文件"""
-        from ..custom_api_params import load_enabled_custom_api_params
-
-        self._custom_api_params = load_enabled_custom_api_params(
-            {"use_custom_api_params": True},
-            self.logger,
-            target="translator",
-        )
-
     def _configure_custom_api_params(self, args) -> bool:
-        """
-        根据配置决定是否加载自定义 API 参数，并统一日志输出格式。
-        返回值表示是否启用。
-        """
-        from ..custom_api_params import (
-            is_custom_api_params_enabled,
-            load_enabled_custom_api_params,
-        )
+        """Remember the runtime config; model matching happens per API request."""
+        from ..custom_api_params import is_custom_api_params_enabled
 
         use_custom_params = is_custom_api_params_enabled(args)
-        if not use_custom_params:
-            self._custom_api_params = {}
-            return False
+        self._custom_api_params_config = args if use_custom_params else None
+        return use_custom_params
 
-        self._custom_api_params = load_enabled_custom_api_params(
-            args,
+    def _resolve_translator_custom_api_params(self, model_name: str | None) -> dict[str, Any]:
+        from ..custom_api_params import resolve_custom_api_params
+
+        if self._custom_api_params_config is None:
+            return {}
+        return resolve_custom_api_params(
+            self._custom_api_params_config,
             self.logger,
-            target="translator",
+            model_name=model_name,
+            section="translator",
         )
-        return True
     
     def set_cancel_check_callback(self, callback):
         """设置取消检查回调"""
@@ -1969,7 +1994,11 @@ class CommonTranslator(InfererModule):
         """
         检查翻译结果是否包含必要的[BR]标记
         Check if translations contain necessary [BR] markers
-        
+
+        同时清理单区域（region_count == 1）翻译中多余的断句标记：
+        该清理只依赖 AI 断句（disable_auto_wrap）开关，与「AI断句检查」
+        （check_br_and_retry）是否开启无关。
+
         Args:
             translations: 翻译结果列表
             queries: 原始查询列表（可选）
@@ -1977,35 +2006,28 @@ class CommonTranslator(InfererModule):
             batch_indices: 批次索引列表（可选，用于定位text_regions）
             batch_data: 批次数据列表（可选，HQ翻译器使用）
             split_level: 分割级别（可选，用于跳过深度分割时的检查）
-            
+
         Returns:
             True if validation passes, False if BR markers are missing
         """
         import re
-        
+
         # 如果分割级别过深（>=3），跳过BR检查以避免无限重试
         if split_level >= 3:
             self.logger.info(f"[AI断句检查] 分割级别过深 (split_level={split_level})，跳过BR标记检查")
             return True
-        
-        # 检查是否启用了BR检查
-        check_enabled = False
-        if ctx and hasattr(ctx, 'config') and hasattr(ctx.config, 'render'):
-            check_enabled = getattr(ctx.config.render, 'check_br_and_retry', False)
-        
-        if not check_enabled:
-            return True  # 检查未启用，直接通过
-        
+
         # 检查是否启用了AI断句
         ai_break_enabled = False
         if ctx and hasattr(ctx, 'config') and hasattr(ctx.config, 'render'):
             ai_break_enabled = getattr(ctx.config.render, 'disable_auto_wrap', False)
-        
+
         if not ai_break_enabled:
-            return True  # AI断句未启用，不需要检查BR
-        
+            return True  # AI断句未启用，不需要处理BR
+
         # 提取每个翻译对应的区域数
         region_counts = []
+        single_region_indices = []  # 已确认是单区域（region_count < 2）的翻译下标
         if ctx and hasattr(ctx, 'text_regions') and ctx.text_regions:
             for idx in range(len(translations)):
                 # 确定实际的region索引
@@ -2013,11 +2035,13 @@ class CommonTranslator(InfererModule):
                     region_idx = batch_indices[idx]
                 else:
                     region_idx = idx
-                
+
                 if region_idx < len(ctx.text_regions):
                     region = ctx.text_regions[region_idx]
                     region_count = len(region.lines) if hasattr(region, 'lines') else 1
                     region_counts.append(region_count)
+                    if region_count < 2:
+                        single_region_indices.append(idx)
                 else:
                     region_counts.append(1)  # 默认为1
         elif batch_data:
@@ -2029,17 +2053,40 @@ class CommonTranslator(InfererModule):
                         region = data['text_regions'][region_idx]
                         region_count = len(region.lines) if hasattr(region, 'lines') else 1
                         region_counts.append(region_count)
+                        if region_count < 2:
+                            single_region_indices.append(idx)
                         break
                 else:
                     region_counts.append(1)
         else:
             region_counts = [1] * len(translations)  # 默认都为1
-        
+
+        # 单区域清理（与「AI断句检查」开关无关，只依赖 AI 断句开启）：
+        # 模型不遵守 N=1 规则返回 [BR]/<br>/【BR】 时，统一清理成单行，
+        # 避免单区域被渲染成多行。
+        for idx in single_region_indices:
+            translation = translations[idx]
+            if translation:
+                cleaned = re.sub(r'\s*(\[BR\]|【BR】|<br\s*/?>)\s*', '', translation, flags=re.IGNORECASE)
+                if cleaned != translation:
+                    self.logger.info(
+                        f"[AI断句] 单区域翻译 #{idx+1} 自动清理多余断句标记: {translation[:50]!r} -> {cleaned[:50]!r}"
+                    )
+                    translations[idx] = cleaned
+
+        # 检查是否启用了BR检查
+        check_enabled = False
+        if ctx and hasattr(ctx, 'config') and hasattr(ctx.config, 'render'):
+            check_enabled = getattr(ctx.config.render, 'check_br_and_retry', False)
+
+        if not check_enabled:
+            return True  # 检查未启用，直接通过
+
         # 检查每个翻译，统计缺失BR的数量
         needs_check_count = 0
         missing_br_count = 0
         missing_indices = []
-        
+
         for idx, (translation, region_count) in enumerate(zip(translations, region_counts)):
             # 只检查区域数≥2的翻译
             if region_count >= 2:
@@ -2052,11 +2099,11 @@ class CommonTranslator(InfererModule):
                     self.logger.warning(
                         f"Translation {idx+1} missing [BR] markers (expected for {region_count} regions): {translation[:50]}..."
                     )
-        
+
         # 计算容忍的错误数量：十分之一，最少1个
         if needs_check_count > 0:
             tolerance = max(1, needs_check_count // 10)
-            
+
             if missing_br_count > tolerance:
                 # 超过容忍度，验证失败
                 self.logger.warning(
@@ -2296,36 +2343,41 @@ class CommonTranslator(InfererModule):
 
         self.logger.info("---------------------------")
 
-    def _emit_terms_from_list(self, new_terms: List[Dict[str, str]]) -> None:
-        """统一输出术语提取结果；按(原文,译文)去重并优先保留带分类版本。"""
+    def _emit_terms_from_list(self, new_terms: List[Dict[str, Any]]) -> None:
+        """统一输出术语提取结果；按正式名称、叫法和译文去重。"""
         if not new_terms:
             return
         for term in new_terms:
             if not isinstance(term, dict):
                 continue
             term_o = str(term.get("original") or term.get("src") or "").strip()
-            term_t = str(term.get("translation") or term.get("dst") or "").strip()
             term_c = str(term.get("category") or "").strip()
-            if not term_o or not term_t:
+            aliases = _auto_alias_deltas(term)
+            if not term_o or not aliases:
                 continue
 
-            key = (term_o, term_t)
-            prev_category = self._stream_term_seen.get(key)
-            if prev_category is not None:
-                if prev_category == term_c:
-                    continue
-                if prev_category and not term_c:
-                    continue
-            # 无分类先缓存，不立即输出；后续若拿到分类再输出，避免重复两条
-            if not term_c and prev_category is None:
-                self._stream_term_seen[key] = ""
-                continue
-            self._stream_term_seen[key] = term_c
+            for alias in aliases:
+                alias_o = alias["original"]
+                for translation in alias["translations"]:
+                    term_t = translation["text"]
+                    key = (term_o, alias_o, term_t)
+                    prev_category = self._stream_term_seen.get(key)
+                    if prev_category is not None:
+                        if prev_category == term_c:
+                            continue
+                        if prev_category and not term_c:
+                            continue
+                    # 无分类先缓存，不立即输出；后续若拿到分类再输出，避免重复两条
+                    if not term_c and prev_category is None:
+                        self._stream_term_seen[key] = ""
+                        continue
+                    self._stream_term_seen[key] = term_c
 
-            if term_c:
-                self.logger.info(f"[TERM] {term_o} -> {term_t} ({term_c})")
-            else:
-                self.logger.info(f"[TERM] {term_o} -> {term_t}")
+                    relation = term_o if term_o == alias_o else f"{term_o} [{alias_o}]"
+                    if term_c:
+                        self.logger.info(f"[TERM] {relation} -> {term_t} ({term_c})")
+                    else:
+                        self.logger.info(f"[TERM] {relation} -> {term_t}")
 
     def _filter_stream_preview_delta(self, delta_text: str) -> str:
         """
@@ -2511,28 +2563,16 @@ class CommonTranslator(InfererModule):
         for tid, translated in translation_items:
             self._emit_stream_preview_translation_item(prefix, tid, translated, source_texts=source_texts)
 
-        term_items: List[Dict[str, str]] = []
-        if "original" in parsed and "translation" in parsed:
-            term_items.append(
-                {
-                    "original": str(parsed.get("original") or ""),
-                    "translation": str(parsed.get("translation") or ""),
-                    "category": str(parsed.get("category") or ""),
-                }
-            )
+        term_items: List[Dict[str, Any]] = []
+        if "original" in parsed and "aliases" in parsed:
+            term_items.append(dict(parsed))
 
         nested_terms = parsed.get("new_terms") or parsed.get("glossary")
         if isinstance(nested_terms, list):
             for item in nested_terms:
                 if not isinstance(item, dict):
                     continue
-                term_items.append(
-                    {
-                        "original": str(item.get("original") or item.get("src") or ""),
-                        "translation": str(item.get("translation") or item.get("dst") or ""),
-                        "category": str(item.get("category") or ""),
-                    }
-                )
+                term_items.append(dict(item))
 
         if term_items:
             if not self._stream_result_header_printed:
@@ -3033,7 +3073,7 @@ def extract_json_payload_from_mixed_text(text: str) -> Tuple[str, bool]:
         return raw, False
     return best_candidate, True
 
-def parse_hq_response(result_text: str) -> Tuple[List[str], List[Dict[str, str]]]:
+def parse_hq_response(result_text: str) -> Tuple[List[str], List[Dict[str, Any]]]:
     """
     专门解析HQ翻译器的响应，支持提取翻译和新术语
     Parse HQ translator response, supporting extraction of translations and new terms
@@ -3209,25 +3249,17 @@ def parse_hq_response(result_text: str) -> Tuple[List[str], List[Dict[str, str]]
     logger.warning("JSON parsing failed, falling back to Regex extraction")
     
     # 3.1 尝试提取带ID的对象: {"id": 1, "translation": "..."}
-    object_pattern = r'\{\s*"id"\s*:\s*(\d+)\s*,\s*"translation"\s*:\s*"([^"]*(?:\\.[^"]*)*)"\s*\}'
+    object_pattern = r'\{\s*"id"\s*:\s*(\d+)\s*,\s*"translation"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}'
     matches = re.findall(object_pattern, result_text)
     
     if matches:
         logger.info(f"Regex extracted {len(matches)} translations with IDs")
         translations = [match[1].replace('\\"', '"').replace('\\n', '\n') for match in matches]
         
-        # 尝试提取术语 (简单正则)
-        # 假设 new_terms 在后面，格式类似 {"original": "...", ...}
-        # 这里的正则很难完美匹配嵌套结构，只能尽力而为
-        term_pattern = r'\{\s*"original"\s*:\s*"([^"]+)"\s*,\s*"translation"\s*:\s*"([^"]+)"\s*,\s*"category"\s*:\s*"([^"]+)"\s*\}'
-        term_matches = re.findall(term_pattern, result_text)
-        for tm in term_matches:
-            new_terms.append({"original": tm[0], "translation": tm[1], "category": tm[2]})
-            
         return translations, new_terms
 
     # 3.2 尝试只提取 translation 字段
-    translation_pattern = r'"translation"\s*:\s*"([^"]*(?:\\.[^"]*)*)"'
+    translation_pattern = r'"translation"\s*:\s*"((?:[^"\\]|\\.)*)"'
     matches = re.findall(translation_pattern, result_text)
     if matches:
          logger.warning(f"Regex extracted {len(matches)} translations (no IDs)")
@@ -3257,7 +3289,106 @@ def parse_json_or_text_response(result_text: str) -> List[str]:
 
 
 
-def merge_glossary_to_file(file_path: str, new_terms: List[Dict[str, str]]) -> bool:
+def _glossary_match_key(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _auto_alias_deltas(term: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Read a sanitized ``aliases[].translations[].text`` AI delta."""
+    grouped: List[Dict[str, Any]] = []
+    indexes: Dict[str, int] = {}
+    raw_aliases = term.get("aliases")
+
+    if isinstance(raw_aliases, list):
+        for raw_alias in raw_aliases:
+            if not isinstance(raw_alias, dict):
+                continue
+            alias_original = str(raw_alias.get("original") or "").strip()
+            raw_translations = raw_alias.get("translations")
+            if (
+                not alias_original
+                or not isinstance(raw_translations, list)
+                or len(raw_translations) != 1
+                or not isinstance(raw_translations[0], dict)
+            ):
+                continue
+
+            text = str(raw_translations[0].get("text") or "").strip()
+            if not text:
+                continue
+
+            alias_key = _glossary_match_key(alias_original)
+            if alias_key in indexes:
+                continue
+            indexes[alias_key] = len(grouped)
+            grouped.append(
+                {"original": alias_original, "translations": [{"text": text}]}
+            )
+
+    return grouped
+
+
+def _merge_auto_glossary_aliases(
+    entry: Dict[str, Any], incoming_aliases: List[Dict[str, Any]]
+) -> bool:
+    """Append AI alias deltas without changing any authored data."""
+    canonical_original = str(entry.get("original") or "").strip()
+    aliases = entry.get("aliases")
+
+    if not isinstance(aliases, list):
+        legacy_translation = str(entry.get("translation") or "").strip()
+        canonical_key = _glossary_match_key(canonical_original)
+        has_new_content = any(
+            _glossary_match_key(alias["original"]) != canonical_key
+            for alias in incoming_aliases
+        )
+        if not has_new_content:
+            return False
+
+        translations = []
+        if legacy_translation:
+            legacy_item = {"text": legacy_translation}
+            legacy_condition = str(entry.get("condition") or "").strip()
+            if legacy_condition:
+                legacy_item["condition"] = legacy_condition
+            translations.append(legacy_item)
+        aliases = [{"original": canonical_original, "translations": translations}]
+        entry.pop("translation", None)
+        entry.pop("condition", None)
+        entry["aliases"] = aliases
+
+    modified = False
+    for incoming_alias in incoming_aliases:
+        alias_original = incoming_alias["original"]
+        alias_key = _glossary_match_key(alias_original)
+        target_alias = next(
+            (
+                alias
+                for alias in aliases
+                if isinstance(alias, dict)
+                and _glossary_match_key(alias.get("original")) == alias_key
+            ),
+            None,
+        )
+        if target_alias is None:
+            aliases.append(
+                {
+                    "original": alias_original,
+                    "translations": [
+                        {"text": item["text"]}
+                        for item in incoming_alias["translations"]
+                    ],
+                }
+            )
+            modified = True
+            continue
+        # AI may create a new alias, but never append another translation to
+        # an alias that already exists. Conditional variants remain manual.
+        continue
+    return modified
+
+
+def merge_glossary_to_file(file_path: str, new_terms: List[Dict[str, Any]]) -> bool:
     """
     将新提取的术语合并到提示词文件中
     Merge newly extracted terms into the prompt file
@@ -3266,7 +3397,7 @@ def merge_glossary_to_file(file_path: str, new_terms: List[Dict[str, str]]) -> b
     
     Args:
         file_path: 提示词文件路径
-        new_terms: 新术语列表 [{"original": "...", "translation": "...", "category": "..."}]
+        new_terms: 统一别名结构的新增或追加增量
     """
     import json
     import os
@@ -3314,42 +3445,56 @@ def merge_glossary_to_file(file_path: str, new_terms: List[Dict[str, str]]) -> b
         modified = False
         
         for term in new_terms:
-            raw_category = term.get("category", "Item")
-            original = term.get("original")
-            translation = term.get("translation")
+            if not isinstance(term, dict):
+                continue
+            raw_category = term.get("category")
+            original = str(term.get("original") or "").strip()
+            incoming_aliases = _auto_alias_deltas(term)
             
-            if not original or not translation:
+            if not original or not incoming_aliases:
                 continue
 
             # 映射 Category 到标准 Key
-            target_key = "Item" # Default fallback
-            if raw_category:
-                normalized_cat = raw_category.lower()
-                if normalized_cat in valid_keys_map:
-                    target_key = valid_keys_map[normalized_cat]
-                else:
-                    # 尝试模糊匹配或直接使用 Title Case
-                    for k in valid_keys_map.values():
-                        if k.lower() == normalized_cat:
-                            target_key = k
-                            break
+            normalized_cat = str(raw_category or "").strip().lower()
+            target_key = valid_keys_map.get(normalized_cat)
+            if target_key is None:
+                continue
             
-            # 检查是否已存在 (根据 original 去重)
-            exists = False
-            if target_key in glossary:
-                for existing_term in glossary[target_key]:
-                    if existing_term.get("original") == original:
-                        exists = True
-                        break
-            else:
+            if not isinstance(glossary.get(target_key), list):
                 glossary[target_key] = []
-            
-            if not exists:
-                glossary[target_key].append({
-                    "original": original,
-                    "translation": translation
-                })
-                modified = True
+
+            original_key = _glossary_match_key(original)
+            target_entry = next(
+                (
+                    entry
+                    for entry in glossary[target_key]
+                    if isinstance(entry, dict)
+                    and _glossary_match_key(entry.get("original")) == original_key
+                ),
+                None,
+            )
+            if target_entry is not None:
+                if target_entry.get("overwrite") is True:
+                    modified = (
+                        _merge_auto_glossary_aliases(target_entry, incoming_aliases)
+                        or modified
+                    )
+                continue
+
+            # A newly created entry must contain its canonical source form.
+            if (
+                _glossary_match_key(incoming_aliases[0]["original"])
+                != _glossary_match_key(original)
+            ):
+                continue
+
+            new_entry: Dict[str, Any] = {
+                "original": original,
+                "aliases": incoming_aliases,
+                "overwrite": False,
+            }
+            glossary[target_key].append(new_entry)
+            modified = True
         
         if modified:
             # 确保存储目录存在

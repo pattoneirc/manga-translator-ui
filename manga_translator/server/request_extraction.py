@@ -10,13 +10,16 @@ from base64 import b64decode
 from contextlib import asynccontextmanager
 from typing import Union
 
-import requests
 from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
 from PIL import Image
 from pydantic import BaseModel
 
 from manga_translator import Config
+from manga_translator.image_formats import (
+    RGB_PIL_FORMATS,
+    resolve_output_image_format,
+)
 from manga_translator.utils import normalize_pil_image, open_pil_image
 from manga_translator.utils.image_modes import normalize_rgb_image
 
@@ -120,15 +123,17 @@ async def to_pil_image(image: Union[str, bytes, Image.Image]) -> Image.Image:
         else:
             if re.match(r'^data:image/.+;base64,', image):
                 value = image.split(',', 1)[1]
-                image_data = b64decode(value)
+                image_data = b64decode(value, validate=True)
                 image = open_pil_image(io.BytesIO(image_data), eager=False)
                 return image
-            else:
-                response = requests.get(image)
-                image = open_pil_image(io.BytesIO(response.content), eager=False)
-                return image
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=str(e))
+            raise HTTPException(
+                status_code=422,
+                detail="Image must be uploaded as bytes or a base64 data URI",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid image data")
 
 
 def _run_translate_sync(pil_image, config: Config, task_id: str = None, cancel_check_callback=None):
@@ -293,13 +298,10 @@ def prepare_translator_params(config: Config, workflow: str = "normal") -> dict:
             if attempts is not None and (attempts >= 0 or attempts == -1):
                 translator_params['attempts'] = attempts
     
-    # 字体路径 - 直接传递相对路径，翻译程序会自动用 BASE_PATH 拼接
-    if hasattr(config, 'render') and hasattr(config.render, 'font_path'):
-        font_path = config.render.font_path
-        if font_path:
-            translator_params['font_path'] = font_path
-            logger.debug(f"Using font path: {font_path}")
-    
+    if hasattr(config, 'render') and getattr(config.render, 'font_family', None):
+        translator_params['font_family'] = config.render.font_family
+        logger.debug(f"Using font family: {config.render.font_family}")
+
     # 直接粘贴模式只能在 Qt UI 的替换翻译模式中使用，Web UI 禁止使用
     if hasattr(config, 'render') and hasattr(config.render, 'enable_template_alignment'):
         config.render.enable_template_alignment = False
@@ -577,11 +579,8 @@ async def while_streaming(req: Request, transform, config: Config, image: bytes 
                     
                     yield pack_message(1, json.dumps({"stage": "translate_done", "message": "Processing result..."}, ensure_ascii=False).encode('utf-8'))
                 except Exception as translate_error:
-                    error_msg = f"Translation failed: {str(translate_error)}"
-                    print(f"[STREAMING ERROR] {error_msg}")
-                    import traceback
-                    traceback.print_exc()
-                    yield pack_message(2, json.dumps({"error": error_msg, "stage": "translate"}, ensure_ascii=False).encode('utf-8'))
+                    print(f"[STREAMING ERROR] Translation failed: {type(translate_error).__name__}")
+                    yield pack_message(2, json.dumps({"error": "Translation failed", "stage": "translate"}, ensure_ascii=False).encode('utf-8'))
                     return
             
             has_result = ctx.result is not None if hasattr(ctx, 'result') else False
@@ -617,11 +616,8 @@ async def while_streaming(req: Request, transform, config: Config, image: bytes 
                 
                 yield pack_message(1, json.dumps({"stage": "complete", "message": "Done!"}, ensure_ascii=False).encode('utf-8'))
             except Exception as transform_error:
-                error_msg = f"Transform failed: {type(transform_error).__name__}: {str(transform_error)}"
-                print(f"[STREAMING ERROR] {error_msg}")
-                import traceback
-                traceback.print_exc()
-                yield pack_message(2, json.dumps({"error": error_msg, "stage": "transform"}, ensure_ascii=False).encode('utf-8'))
+                print(f"[STREAMING ERROR] Transform failed: {type(transform_error).__name__}")
+                yield pack_message(2, json.dumps({"error": "Transform failed", "stage": "transform"}, ensure_ascii=False).encode('utf-8'))
                 return
             
         except asyncio.CancelledError:
@@ -631,12 +627,9 @@ async def while_streaming(req: Request, transform, config: Config, image: bytes 
             except Exception:
                 pass
         except Exception as e:
-            error_msg = f"Translation failed: {type(e).__name__}: {str(e)}"
-            print(f"[STREAMING ERROR] {error_msg}")
-            import traceback
-            traceback.print_exc()
+            print(f"[STREAMING ERROR] Translation failed: {type(e).__name__}")
             try:
-                yield pack_message(2, json.dumps({"error": error_msg, "stage": "unknown"}, ensure_ascii=False).encode('utf-8'))
+                yield pack_message(2, json.dumps({"error": "Translation failed", "stage": "unknown"}, ensure_ascii=False).encode('utf-8'))
             except Exception:
                 pass
         finally:
@@ -860,16 +853,6 @@ async def save_translation_to_history(ctx, username: str, task_id: str, workflow
             if fmt and fmt != '不指定':
                 output_format = fmt.lower()
         
-        # 格式映射
-        format_map = {
-            'jpg': ('JPEG', '.jpg'),
-            'jpeg': ('JPEG', '.jpg'),
-            'png': ('PNG', '.png'),
-            'webp': ('WEBP', '.webp'),
-            'gif': ('GIF', '.gif'),
-            'bmp': ('BMP', '.bmp'),
-        }
-        
         # 安全过滤文件名，防止路径遍历攻击
         def sanitize_filename(filename: str) -> str:
             if not filename:
@@ -891,23 +874,15 @@ async def save_translation_to_history(ctx, username: str, task_id: str, workflow
         
         if safe_filename:
             base_name = os.path.splitext(safe_filename)[0]
-            if output_format and output_format in format_map:
-                # 使用配置指定的格式
-                save_format, ext = format_map[output_format]
-                result_filename = f"{base_name}{ext}"
-            else:
-                # 保持原始扩展名
-                result_filename = safe_filename
-                ext = os.path.splitext(safe_filename)[1].lower()
-                save_format = format_map.get(ext.lstrip('.'), ('PNG', '.png'))[0]
+            save_format, ext = resolve_output_image_format(
+                output_format,
+                original_path=safe_filename,
+            )
+            result_filename = f"{base_name}{ext}"
         else:
             timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
-            if output_format and output_format in format_map:
-                save_format, ext = format_map[output_format]
-                result_filename = f"translated_{timestamp}{ext}"
-            else:
-                result_filename = f"translated_{timestamp}.png"
-                save_format = 'PNG'
+            save_format, ext = resolve_output_image_format(output_format)
+            result_filename = f"translated_{timestamp}{ext}"
         
         result_path = os.path.join(temp_dir, result_filename)
         
@@ -920,13 +895,9 @@ async def save_translation_to_history(ctx, username: str, task_id: str, workflow
                 # 如果复制失败，尝试直接使用原图
                 img_to_save = ctx.result
             
-            # 根据文件扩展名也检查是否需要转换（PIL 可能根据扩展名决定格式）
-            is_jpeg = save_format == 'JPEG' or result_path.lower().endswith(('.jpg', '.jpeg'))
-            
-            # JPEG does not support alpha or non-RGB color modes.
-            if is_jpeg and img_to_save.mode not in ('RGB', 'L'):
+            if save_format in RGB_PIL_FORMATS and img_to_save.mode not in ('RGB', 'L'):
                 img_to_save = normalize_rgb_image(img_to_save)
-                add_log(f"Converted {ctx.result.mode} to RGB for JPEG format", "DEBUG")
+                add_log(f"Converted {ctx.result.mode} to RGB for {save_format} format", "DEBUG")
             
             img_to_save.save(result_path, save_format)
             temp_files.append(result_path)
@@ -967,9 +938,7 @@ async def save_translation_to_history(ctx, username: str, task_id: str, workflow
         add_log(f"Translation saved to history successfully, session: {task_id[:8]}", "INFO")
         
     except Exception as e:
-        import traceback
-        add_log(f"Failed to save translation to history: {e}", "ERROR")
-        add_log(f"Traceback: {traceback.format_exc()}", "DEBUG")
+        add_log(f"Failed to save translation to history ({type(e).__name__})", "ERROR")
     finally:
         # 清理临时目录
         try:

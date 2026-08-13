@@ -9,8 +9,10 @@ from typing import Any, Dict, List
 import openai
 from PIL import Image
 
+from ..api_request_params import merge_openai_chat_request_params
 from ..api_key_rotation import APIRotationExhaustedError, run_with_api_candidates
 from ..runtime_api_resolver import resolve_runtime_api_config
+from ..utils.dotenv_utils import load_app_dotenv
 from ..utils.image_modes import normalize_rgb_image
 from .common import (
     VALID_LANGUAGES,
@@ -78,8 +80,7 @@ class OpenAIHighQualityTranslator(CommonTranslator):
         # Web环境下不重新加载，避免覆盖用户临时设置的环境变量
         is_web_server = os.getenv('MANGA_TRANSLATOR_WEB_SERVER', 'false').lower() == 'true'
         if not is_web_server:
-            from dotenv import load_dotenv
-            load_dotenv(override=True)
+            load_app_dotenv(override=True)
         
         self.api_key = os.getenv('OPENAI_API_KEY', OPENAI_API_KEY)
         self.base_url = os.getenv('OPENAI_API_BASE', 'https://api.openai.com/v1')
@@ -404,11 +405,6 @@ class OpenAIHighQualityTranslator(CommonTranslator):
                 if self.max_tokens is not None:
                     api_params["max_tokens"] = self.max_tokens
                 
-                # 合并自定义API参数
-                if self._custom_api_params:
-                    api_params.update(self._custom_api_params)
-                    self.logger.debug(f"使用自定义API参数: {self._custom_api_params}")
-
                 def _extract_openai_stream_text(chunk):
                     if not (hasattr(chunk, 'choices') and chunk.choices):
                         return ""
@@ -436,8 +432,13 @@ class OpenAIHighQualityTranslator(CommonTranslator):
                     response = None
                     streamed_text = None
                     streamed_finish_reason = None
-                    request_params = dict(api_params)
-                    request_params["model"] = self.model
+                    custom_api_params = self._resolve_translator_custom_api_params(self.model)
+                    request_params = merge_openai_chat_request_params(
+                        {**api_params, "model": self.model},
+                        custom_api_params,
+                    )
+                    if custom_api_params:
+                        self.logger.debug(f"使用翻译模型预设参数: {custom_api_params}")
                     if use_streaming:
                         try:
                             self._reset_stream_json_preview()

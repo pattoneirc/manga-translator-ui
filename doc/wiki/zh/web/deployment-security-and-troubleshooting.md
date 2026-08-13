@@ -1,0 +1,114 @@
+---
+title: Web 部署、安全与排错
+description: 部署 Web 服务（本机、局域网与 Docker），理解会话与权限安全边界，并定位常见启动、登录与访问问题
+pageId: web.deployment-security-and-troubleshooting
+lang: zh-CN
+outline: [2, 4]
+lastUpdated: true
+---
+
+# Web 部署、安全与排错
+
+当需要把 Web 界面部署到本机、局域网或 Docker，确认会话令牌、限流与权限边界，或遇到“端口被占用”“局域网无法访问”“登录被限流”等问题时使用本页。这里仅列出 Web 服务的部署、安全边界与排错；账号、权限与 API Key 的具体操作见[账号、权限与 API 密钥](./accounts-permissions-and-api-keys.md)，登录与会话的界面操作见[登录、语言与会话](./login-language-and-session.md)，管理控制台见[管理员界面](./administrator-interface.md)。完整的 HTTP 路由、状态码与端口契约属于开发者文档，见[Web 服务器端口与部署](../developer/web-server-ports-and-deployment.md)与[鉴权与错误](../developer/http-api/authentication-and-errors.md)。
+
+## 页面与接口范围
+
+- Web 服务同时提供用户界面（`GET /`）、管理界面（`GET /admin`）、登录页（`/static/login.html`）和开发者 HTTP API；这里按面向使用者的部署、安全边界与排错，不重复开发者 API 契约。
+- 默认监听 `0.0.0.0:8000`，可用 `--host`/`--port` 或环境变量 `MT_WEB_HOST`/`MT_WEB_PORT` 覆盖；`0.0.0.0` 表示监听所有 IPv4 接口，不是浏览器访问地址。
+- Docker Compose 提供 CPU 与 GPU 两个服务：CPU 版映射 `8000:8000`，GPU 版映射 `8001:8000`。
+- 会话、权限、限流与审计都在服务端强制执行；浏览器隐藏控件或删除前端令牌不能替代服务端检查。
+- 这里不记录真实密码、令牌、API Key、用户名或私有路径，也不展示 `.env` 明文。
+
+## 部署方式 {#deploy-methods}
+
+### 本机或局域网运行
+
+在项目根目录执行 `uv run python -m manga_translator web`（已安装环境下也可运行 `python -m manga_translator web`）。默认监听 `0.0.0.0:8000`；只允许本机访问时建议改用 `--host 127.0.0.1`。
+
+浏览器访问地址：本机为 `http://127.0.0.1:8000`；局域网客户端必须使用服务器实际局域网 IP，例如 `http://192.168.x.x:8000`，并放行系统防火墙对应端口。是否真正对外可达取决于防火墙、端口映射和网络环境，不能由监听地址断言。
+
+### Docker CPU 与 GPU
+
+`packaging/docker-compose.yml` 定义两个服务：
+
+| 服务 | 镜像 | 端口映射 | GPU | 内存限制（模板示例） |
+| --- | --- | --- | --- | --- |
+| `manga-translator-cpu` | `manga-translator:cpu` | `8000:8000` | 关闭 | 上限 8G / 预留 2G |
+| `manga-translator-gpu` | `manga-translator:gpu` | `8001:8000` | 开启 | 上限 16G / 预留 4G |
+
+容器内服务始终监听 `8000`；主机访问入口分别是 `8000`（CPU）与 `8001`（GPU），不要把 GPU 版误写成容器内默认端口。Compose 通过 `MANGA_TRANSLATOR_ADMIN_PASSWORD` 设置首次启动的管理员密码（模板内含示例占位值，生产环境必须修改），并传入 `MT_USE_GPU`、`MT_MODELS_TTL`、`MT_RETRY_ATTEMPTS`、`MT_VERBOSE` 等环境变量。
+
+Compose 把 `./data/fonts`、`./data/dict`、`./data/result`、`./data/models`、`./data/logs`、`./data/server`、`./data/config` 挂载为卷；要让 Web 管理界面保存的服务器 API Key 在重建容器后保留，需要先创建空文件 `./data/app.env` 并取消 `.env` 卷挂载注释。容器入口脚本 `packaging/docker-entrypoint.sh` 在对应卷为空时，从镜像内置的 `default_config`、`default_fonts`、`default_dict`、`default_server_data` 恢复默认内容，因此“清空卷”会回到默认状态而不是报错。
+
+```mermaid
+flowchart LR
+    A["启动 Web 服务"] --> B{"运行环境?"}
+    B -->|"本机 / 局域网"| C["python -m manga_translator web<br/>--host 0.0.0.0 --port 8000"]
+    B -->|"Docker CPU"| D["manga-translator-cpu<br/>主机 8000 -> 容器 8000"]
+    B -->|"Docker GPU"| E["manga-translator-gpu<br/>主机 8001 -> 容器 8000"]
+    C --> F["浏览器访问 http://localhost:8000"]
+    D --> F
+    E --> G["浏览器访问 http://localhost:8001"]
+```
+
+容器健康检查每 30 秒请求一次 `http://localhost:8000/`，启动期 60 秒、最多重试 3 次；首次启动若在初始化服务或加载模型，健康检查短暂失败属正常现象。
+
+## 安全边界 {#security-boundary}
+
+### 会话令牌与认证
+
+登录成功后服务端创建会话，不活动超过 60 分钟自动过期。会话失效时，前端清除本地令牌并跳转登录页。
+
+会话安全服务（`session_security_service.py`）提供所有权与反枚举保护：
+
+- 会话所有权令牌使用 UUID v4（128 位随机）；格式不合法直接拒绝。
+- 同一用户 5 分钟内失败访问超过 10 次触发限流，防止暴力枚举令牌。
+- 普通用户只能访问自己名下的会话；管理员可以查看全部会话。
+- 每次拒绝都写入访问尝试日志，供审计查询。
+
+```mermaid
+flowchart LR
+    A["浏览器读取 localStorage.session_token"] --> B["GET /auth/check"]
+    B -->|"缺失 / 无效 / 过期"| C["清除本地令牌<br/>跳转 /static/login.html"]
+    B -->|"有效"| D["进入主工作区"]
+    D --> E["业务请求携带 X-Session-Token"]
+    E --> F{"require_auth / require_admin"}
+    F -->|"401 会话无效"| C
+    F -->|"403 权限不足"| G["拒绝并提示无权限"]
+    F -->|"429 并发或配额超限"| H["拒绝并提示限流"]
+```
+
+### 权限边界
+
+- `require_auth` 验证令牌、刷新活动时间，并拒绝不存在、过期或已停用账号（`401`）。
+- `require_admin` 在此基础上要求 `role == 'admin'`；非管理员访问管理端点返回 `403`。
+- 翻译端点还会校验翻译器、OCR、上色器、渲染器权限，并对用户提交的参数做服务端过滤，未授权参数被静默丢弃。
+- 下载票据是短时令牌（默认 5 分钟），`GET|HEAD /api/history/downloads/t/{ticket}` 不读取会话头，只依赖票据本身；无效或过期票据返回 `404`。
+- CORS 源码配置为 `allow_origins=["*"]` 且 `allow_credentials=True`。这不代表浏览器会放行所有 origin/credential 组合；对外部署时建议用反向代理收紧来源，并在浏览器开发者工具中检查预检请求。
+
+### 凭据与敏感信息
+
+- 首次启动没有账号时，登录页进入“初始设置”：创建第一个管理员账户（用户名至少 2 字符、密码至少 6 字符）；账号被标记 `must_change_password` 时登录后强制改密。
+- 是否开放注册由管理端“允许用户注册”开关控制，默认关闭；未开启时注册请求返回 `403`。
+- 管理端“服务器默认API密钥”对应 `.env`；`/env` 与 `/env/effective` 不返回服务器密钥明文，前端只显示“已保存”类状态。
+- “API Keys (.env)”页签默认隐藏，是否显示与可编辑由登录状态和权限策略决定；用户输入暂时保存在浏览器 `localStorage.user_env_vars`。
+- 部署或分享排错信息前，删除日志、错误消息、票据、令牌、`.env` 内容、私有路径和用户图片。Docker Compose 模板中的管理员密码是示例占位值，生产必须替换。
+
+## 常见问题 {#troubleshooting}
+
+| 现象 | 常见原因 | 处理 |
+| --- | --- | --- |
+| 启动报“端口被占用 / address already in use” | `8000` 已被其他进程占用 | 换用 `--port 8001` 或设置 `MT_WEB_PORT`；Windows 可用 `netstat -ano` 定位占用进程 |
+| 局域网设备无法访问 | 监听地址是 `127.0.0.1`，或防火墙未放行端口，或使用了错误的 IP | 确认 `--host 0.0.0.0`、放行防火墙、使用服务器实际局域网 IP |
+| Docker GPU 版访问不到 | 用了容器内默认端口 `8000` | 主机入口是 `8001`，对应 Compose 映射 `8001:8000` |
+| 登录频繁失败后提示“尝试过于频繁” | 触发了登录限流 | 等待 `Retry-After` 指示的时间后再试；不要在文档或公开日志中记录真实密码 |
+| 页面跳回登录页 | 会话过期（60 分钟无活动）、令牌失效或本地存储被清空 | 重新登录；清空站点数据后令牌不存在属正常行为 |
+| 管理界面或操作返回 `403` | 当前账号不是管理员或缺少对应权限 | 用管理员账号登录，或由管理员在用户/用户组中授予权限 |
+| 批量任务返回 `499` | 任务被取消或检测到取消 | 重新发起任务；取消是用户操作，不是服务崩溃 |
+| 请求返回 `422` | 请求体未通过 FastAPI 校验 | 检查字段类型与必填项；响应包含 `detail` 与请求 body 字符串 |
+| Docker 健康检查红灯 | 服务仍在初始化、模型加载中或端口映射错误 | 查看 `docker logs`，确认主机端口与容器 `8000` 的映射关系 |
+| 容器启动后配置/字体/数据“变回默认” | 挂载卷为空，入口脚本恢复了默认内容 | 这是设计行为；不要删除卷中的 `admin_config.json`、`accounts.json` 等文件 |
+
+状态码的完整矩阵与触发来源见[鉴权与错误](../developer/http-api/authentication-and-errors.md)；翻译、导入导出等请求错误的详细解释见[翻译端点](../developer/http-api/translation-endpoints.md)。
+
+> 详见参考索引：[界面选项对照表](../reference/options-i18n-matrix.md)。
