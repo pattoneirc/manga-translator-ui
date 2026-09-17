@@ -22,7 +22,7 @@ Follow this order:
 3. Use the “Jump to” link to open the parameter section on the settings page; rows without a dedicated explicit anchor link to the page itself.
 4. Defaults, dependencies, consumers, and runtime behavior always come from the settings page you land on; this guide does not expand them.
 
-This guide focuses on the visible parameter rows of the settings page. `settings_tab_layout.json` has 109 entries, of which 108 render as visible parameters; the remaining one (`render.font_color`) is not rendered because its release default is `null` and it has no control branch. Interface language, theme, system proxy, update checks, and the automatic-update preference belong to About Application and are not settings-page parameter rows. The following are out of scope: API-management credentials, addresses, models, slots, and rotation strategies; editor property-panel parameters; prompt lists and batch-management schemes; and the full processing steps of the nine workflows.
+This guide focuses on the visible parameter rows of the settings page. `settings_tab_layout.json` has 110 entries, of which 109 render as visible parameters; the remaining one (`render.font_color`) is not rendered because its release default is `null` and it has no control branch. Interface language, theme, system proxy, update checks, and the automatic-update preference belong to About Application and are not settings-page parameter rows. The following are out of scope: API-management credentials, addresses, models, slots, and rotation strategies; editor property-panel parameters; prompt lists and batch-management schemes; and the full processing steps of the nine workflows.
 
 ## Settings tabs and pages {#settings-tabs}
 
@@ -36,9 +36,9 @@ The settings page groups parameters by the left-side tabs; tab titles come from 
 | `Translation` | Translation | 翻译 | 11 | [Translation settings](../desktop/settings/translation.md) |
 | `Inpainting` | Inpainting | 修复 | 10 | [Mask And Inpainting](../desktop/settings/mask-and-inpainting.md) |
 | `Typesetting` | Typesetting | 排版 | 28 | [Typesetting and Rendering](../desktop/settings/typesetting-and-rendering.md) |
-| `Mode Specific` | Mode Specific | 模式相关 | 11 | [Mode-Specific Workflows and Template Alignment](../desktop/settings/mode-specific.md), [Upscale and Colorization](../desktop/settings/upscale-and-colorization.md) |
+| `Mode Specific` | Mode Specific | 模式相关 | 12 | [Mode-Specific Workflows and Template Alignment](../desktop/settings/mode-specific.md), [Upscale and Colorization](../desktop/settings/upscale-and-colorization.md) |
 
-The seven tabs total 107 visible parameter rows.
+The seven tabs total 108 visible parameter rows.
 
 ## Parameter index {#parameter-index}
 
@@ -79,8 +79,8 @@ The 17 parameters of this tab are explained in [OCR, Filtering, and Text-Line Me
 | `ocr.secondary_ocr` | Secondary OCR | 备用OCR | [#hybrid-ocr](../desktop/settings/ocr-filter-and-merge.md#hybrid-ocr) |
 | `ocr.ai_ocr_prompt_path` | AI OCR Prompt | AI OCR 提示词 | [#ocr-vl-and-ai](../desktop/settings/ocr-filter-and-merge.md#ocr-vl-and-ai) |
 | `ocr.ai_ocr_concurrency` | AI OCR Concurrency | AI OCR 并发数 | [#ocr-vl-and-ai](../desktop/settings/ocr-filter-and-merge.md#ocr-vl-and-ai) |
-| `ocr.ocr_vl_language_hint` | PaddleOCR-VL Language Hint | PaddleOCR-VL 语言提示 | [#ocr-vl-and-ai](../desktop/settings/ocr-filter-and-merge.md#ocr-vl-and-ai) |
-| `ocr.ocr_vl_custom_prompt` | PaddleOCR-VL Custom Prompt (Override) | PaddleOCR-VL 自定义提示词（优先） | [#ocr-vl-and-ai](../desktop/settings/ocr-filter-and-merge.md#ocr-vl-and-ai) |
+| `ocr.ocr_vl_language_hint` | VLM OCR Language Hint | VLM OCR 语言提示 | [#ocr-vl-and-ai](../desktop/settings/ocr-filter-and-merge.md#ocr-vl-and-ai) |
+| `ocr.ocr_vl_custom_prompt` | VLM OCR Custom Prompt (Override) | VLM OCR 自定义提示词（优先） | [#ocr-vl-and-ai](../desktop/settings/ocr-filter-and-merge.md#ocr-vl-and-ai) |
 | `ocr.use_model_bubble_filter` | Enable Model Bubble Filter | 启用模型气泡过滤 | [#model-bubble-filter](../desktop/settings/ocr-filter-and-merge.md#model-bubble-filter) |
 | `ocr.min_text_length` | Minimum Text Length | 最小文本长度 | [#ocr-min-text-length](../desktop/settings/ocr-filter-and-merge.md#ocr-min-text-length) |
 | `ocr.ignore_bubble` | Ignore Non-Bubble Text | 忽略非气泡文本 | [#ocr-ignore-bubble](../desktop/settings/ocr-filter-and-merge.md#ocr-ignore-bubble) |
@@ -164,6 +164,7 @@ The 29 parameters of this tab are explained in [Typesetting and Rendering](../de
 | `render.disable_auto_wrap` | AI Line Breaking | AI断句 | [Page](../desktop/settings/typesetting-and-rendering.md) |
 | `render.optimize_line_breaks` | AI Line Break Auto Enlarge | AI断句自动扩大文字 | [Page](../desktop/settings/typesetting-and-rendering.md) |
 | `render.strict_smart_scaling` | Don't Expand Box on Auto Enlarge | AI断句自动扩大文字下不扩大文本框 | [Page](../desktop/settings/typesetting-and-rendering.md) |
+| `render.balloon_fill_mask_layout` | Bubble Mask Layout | 气泡蒙版排版 | [Page](../desktop/settings/typesetting-and-rendering.md) |
 | `render.check_br_and_retry` | AI Line Break Check | AI断句检查 | [Page](../desktop/settings/typesetting-and-rendering.md) |
 | `render.stroke_width` | Stroke Width Ratio | 描边宽度比例 | [Page](../desktop/settings/typesetting-and-rendering.md) |
 | `render.disable_font_border` | Disable Font Border | 禁用字体边框 | [Page](../desktop/settings/typesetting-and-rendering.md) |
@@ -185,10 +186,11 @@ The 29 parameters of this tab are explained in [Typesetting and Rendering](../de
 
 ### Mode Specific {#tab-mode-specific}
 
-The 11 parameters of this tab span two pages: direct-paste and template-alignment parameters are in [Mode-Specific Workflows and Template Alignment](../desktop/settings/mode-specific.md), and upscale/colorization parameters are in [Upscale and Colorization](../desktop/settings/upscale-and-colorization.md).
+The 12 parameters of this tab span two pages: text export, direct-paste, and template-alignment parameters are in [Mode-Specific Workflows and Template Alignment](../desktop/settings/mode-specific.md), and upscale/colorization parameters are in [Upscale and Colorization](../desktop/settings/upscale-and-colorization.md).
 
 | Stored value | English actual value | Simplified Chinese actual value | Jump to |
 | --- | --- | --- | --- |
+| `cli.export_from_local_json` | Export Text from Local JSON Only | 仅从本地 JSON 导出文本 | [#cli-export-from-local-json](../desktop/settings/mode-specific.md#cli-export-from-local-json) |
 | `render.enable_template_alignment` | Enable Direct Paste Mode | 启用直接粘贴模式 | [#render-enable-template-alignment](../desktop/settings/mode-specific.md#render-enable-template-alignment) |
 | `render.paste_mask_dilation_pixels` | Paste Mode Mask Dilation Pixels | 粘贴模式蒙版膨胀大小 | [#render-paste-mask-dilation-pixels](../desktop/settings/mode-specific.md#render-paste-mask-dilation-pixels) |
 | `upscale.upscaler` | Upscaling Model | 超分模型 | [#upscale-upscaler](../desktop/settings/upscale-and-colorization.md#upscale-upscaler) |

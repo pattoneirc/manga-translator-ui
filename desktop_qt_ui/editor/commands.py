@@ -157,10 +157,13 @@ class DeleteRegionCommand(QUndoCommand):
         return None if value is None else np.array(value, copy=True)
 
     def _apply_masks(self, raw_mask, refined_mask) -> None:
-        if raw_mask is not _NO_MASK_CHANGE and hasattr(self._model, "set_raw_mask"):
-            self._model.set_raw_mask(self._copy_mask_value(raw_mask))
-        if refined_mask is not _NO_MASK_CHANGE and hasattr(self._model, "set_refined_mask"):
-            self._model.set_refined_mask(self._copy_mask_value(refined_mask))
+        masks: Dict[str, Any] = {}
+        if raw_mask is not _NO_MASK_CHANGE:
+            masks["raw"] = self._copy_mask_value(raw_mask)
+        if refined_mask is not _NO_MASK_CHANGE:
+            masks["refined"] = self._copy_mask_value(refined_mask)
+        if masks:
+            self._model.set_masks(**masks)
 
     def redo(self):
         """执行删除操作。"""
@@ -199,7 +202,7 @@ class MoveRegionCommand(QUndoCommand):
 class MaskEditCommand(QUndoCommand):
     """用于处理蒙版编辑的命令。"""
 
-    def __init__(self, model: "EditorModel", old_mask: np.ndarray, new_mask: np.ndarray):
+    def __init__(self, model: "EditorModel", old_mask: np.ndarray, new_mask: np.ndarray, repair_mask: Optional[np.ndarray] = None):
         super().__init__("Edit Mask")
         self._model = model
         self._mask_shape: Optional[tuple[int, int]] = None
@@ -208,6 +211,7 @@ class MaskEditCommand(QUndoCommand):
         self._new_patch: Optional[np.ndarray] = None
         self._full_old_mask: Optional[np.ndarray] = None
         self._full_new_mask: Optional[np.ndarray] = None
+        self._repair_mask = self._normalize_mask(repair_mask)
 
         old_mask_np = self._normalize_mask(old_mask)
         new_mask_np = self._normalize_mask(new_mask)
@@ -256,9 +260,9 @@ class MaskEditCommand(QUndoCommand):
             mask_np = mask_np[:, :, 0]
         return np.where(mask_np > 0, 255, 0).astype(np.uint8, copy=False)
 
-    def _apply_mask(self, full_mask: Optional[np.ndarray], patch: Optional[np.ndarray]) -> None:
+    def _apply_mask(self, full_mask: Optional[np.ndarray], patch: Optional[np.ndarray], repair: Optional[np.ndarray] = None) -> None:
         if full_mask is not None:
-            self._model.set_refined_mask(full_mask.copy())
+            self._model.set_refined_mask(full_mask.copy(), repair=repair)
             return
 
         if self._mask_shape is None:
@@ -275,10 +279,10 @@ class MaskEditCommand(QUndoCommand):
             y_min, y_max, x_min, x_max = self._bounds
             current_mask[y_min:y_max, x_min:x_max] = patch
 
-        self._model.set_refined_mask(current_mask)
+        self._model.set_refined_mask(current_mask, repair=repair)
 
     def redo(self):
-        self._apply_mask(self._full_new_mask, self._new_patch)
+        self._apply_mask(self._full_new_mask, self._new_patch, self._repair_mask)
 
     def undo(self):
         self._apply_mask(self._full_old_mask, self._old_patch)
@@ -446,3 +450,29 @@ class MultiRegionUpdateCommand(QUndoCommand):
 
     def undo(self):
         self._apply(0)
+
+
+class PasteOverlaysReplaceCommand(QUndoCommand):
+    """整表替换贴片列表的 undo/redo（保存 before/after 快照）。
+
+    通知统一由 :meth:`EditorModel.set_paste_overlays` 广播（经
+    ``paste_overlays_changed`` 信号），本命令只做文档状态转换，不直接触碰视图。
+    """
+
+    def __init__(
+        self,
+        model: "EditorModel",
+        before: list[dict],
+        after: list[dict],
+        description: str = "Edit Paste Overlay",
+    ):
+        super().__init__(description)
+        self._model = model
+        self._before = copy.deepcopy(before)
+        self._after = copy.deepcopy(after)
+
+    def redo(self):
+        self._model.set_paste_overlays(self._after)
+
+    def undo(self):
+        self._model.set_paste_overlays(self._before)

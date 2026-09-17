@@ -84,9 +84,9 @@ lastUpdated: true
 | `craft` | craft | craft | 同上 |
 | `none` | none | none | 同上 |
 
-### OCR 引擎与 PaddleOCR-VL 语言提示 {#ocr-options}
+### OCR 引擎与 VLM OCR 语言提示 {#ocr-options}
 
-`ocr.ocr`、`ocr.secondary_ocr` 与 `ocr.ocr_vl_language_hint` 是下拉；编辑器属性面板复用 OCR 映射。完整说明见[OCR 过滤与合并](../desktop/settings/ocr-filter-and-merge.md)与[区域列表与文本编辑](../desktop/editor/region-list-and-text-editing.md)。
+`ocr.ocr`、`ocr.secondary_ocr` 与 `ocr.ocr_vl_language_hint` 是设置页下拉；编辑器属性面板复用 OCR 的选项列表，但当前编辑器选择保存为 `app.editor_ocr`，默认值为 `mocr`，不会改写主页的 `ocr.ocr`。完整说明见[OCR 过滤与合并](../desktop/settings/ocr-filter-and-merge.md)与[区域列表与文本编辑](../desktop/editor/region-list-and-text-editing.md)。
 
 | 存储值 | English | 简体中文 | 控件 / 使用页面 |
 | --- | --- | --- | --- |
@@ -99,6 +99,7 @@ lastUpdated: true
 | `paddleocr_latin` | paddleocr_latin | paddleocr_latin | 同上 |
 | `paddleocr_thai` | paddleocr_thai | paddleocr_thai | 同上 |
 | `paddleocr_vl` | paddleocr_vl | paddleocr_vl | 同上 |
+| `hayai_ocr_v2` | hayai_ocr_v2 | hayai_ocr_v2 | 同上 |
 | `openai_ocr` | openai_ocr | openai_ocr | 同上 |
 | `gemini_ocr` | gemini_ocr | gemini_ocr | 同上 |
 | `auto` | Auto | 自动 | `ocr.ocr_vl_language_hint`，设置 OCR |
@@ -124,7 +125,7 @@ lastUpdated: true
 
 ## 翻译器与语言 {#translator-and-languages}
 
-翻译器、目标语言和保留语言的下拉在设置“翻译”分组、API 管理翻译功能页和编辑器属性面板中复用；完整说明见[翻译器选择](../desktop/translator/selection-and-languages.md)、[翻译设置](../desktop/settings/translation.md)与[API 功能选择器](../desktop/api-management/feature-selectors.md)。
+设置页、API 管理翻译功能页和编辑器属性面板复用翻译器选项列表；设置页与 API 管理使用 `translator.translator`，编辑器使用独立的 `app.editor_translator`，默认值为 `openai`。目标语言和保留语言仍共享主页/编辑器的翻译设置。完整说明见[翻译器选择](../desktop/translator/selection-and-languages.md)、[翻译设置](../desktop/settings/translation.md)与[API 功能选择器](../desktop/api-management/feature-selectors.md)。
 
 ### 翻译器 {#translator-options}
 

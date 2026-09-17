@@ -21,14 +21,15 @@ This guide documents the Windows startup chain, runtime selection, and maintenan
 
 > Before installing, first make sure the Microsoft Visual C++ Redistributable ([vc_redist.x64.exe](https://aka.ms/vs/17/release/vc_redist.x64.exe)) is installed; otherwise the app may fail to start with errors such as missing VCRUNTIME140.dll.
 
+
 The portable package is published under the `portable` tag in GitHub Releases:
 
-1. Download the latest version from the [portable package release page](https://github.com/hgmzhn/manga-translator-ui/releases/tag/portable) and extract it to any directory (for example `D:\manga-translator-ui\`). The package bundles Python 3.12 and uv, so no Python installation is required.
+1. Download the latest version from the [portable package release page](https://github.com/hgmzhn/manga-translator-ui/releases/tag/portable) and extract it; the package bundles Python 3.12 and uv, so no Python installation is required.
 2. Double-click `Win-Install-or-Update.bat` to open the maintenance menu and select `[1] Install`:
    - Choose a download route (GitHub official or the Gitee mirror; Gitee is recommended in China).
    - The script force-syncs the latest code; if sync fails it suggests switching routes and retrying.
    - It detects the GPU (NVIDIA / AMD / integrated; lists them when several GPUs exist).
-   - Choose the PyTorch build: CUDA 13.0 or newer defaults to `cuda13.0`; CUDA 12.x selects `cuda12.6`; AMD uses `rocm7.2.1` (experimental); anything else or integrated graphics selects `cpu`. No Git branch switch is involved.
+   - Choose the PyTorch build: GeForce 10-series GPUs require `cuda12.6`; RTX 50-series GPUs require `cuda13.0`, so update the NVIDIA driver if needed; other GPUs follow automatic detection.
    - uv installs dependencies in bulk (PyPI multi-mirror fallback: Tsinghua → Aliyun → Douban → official); failures can be retried and installed packages are kept.
    - The download cache is cleaned automatically when done.
 3. Afterwards, start the app each time by double-clicking `Win-Start.bat`.
@@ -79,5 +80,4 @@ The install flow in `launch.py` reads dependencies and PyTorch sources from `pyp
 - **Windows ROCm**: the script handles ROCm SDK 7.2.1/PyTorch ordering separately and reports driver/support-list limits. Compatibility cannot be inferred from the AMD brand alone.
 - **Legacy Conda**: It is used only when the portable interpreter is absent. Do not combine packages from `packaging\\python`, `conda_env`, and an external environment; an incorrect PATH can cause DLL, Torch, or ONNX Runtime conflicts.
 - **GPU/CPU resources**: GPU dependencies do not mean models are downloaded or that available VRAM is sufficient; the first start may still download or initialize models. CPU can run the application but is usually slower. If installation fails, do not delete successful packages and repeatedly switch schemes without checking the cause.
-- **Paths**: The script has a special drive-root Miniconda lookup when the installation path contains non-ASCII characters. To reduce DLL, Git, and model-path problems, prefer a short, writable path without special characters.
 - **Network**: Installation/update needs Git and package-index or mirror access. API networking is a separate runtime path; successful installation does not prove a translation API is usable.

@@ -39,6 +39,7 @@ Model loading, GPU VRAM, and memory issues are covered by [Model, GPU, and Memor
 
 Fix: install Python 3.12 and run `uv sync` again; do not reuse an old `.venv` with a Python 3.13+ interpreter.
 
+
 ### Dependency installation failures and mirror fallback {#dependency-install}
 
 The installer first uses the declared dependency sources and, on failure, falls back through the mirror list in `packaging/launch.py`: ordinary packages try the Tsinghua, Aliyun, Douban, and official PyPI mirrors in order, while PyTorch packages try mirrors or the official source per `PYTORCH_INDEX_FALLBACKS`/`PYTORCH_INDEX_PRIORITY`. When every source fails, the installer reports that all mirrors failed and stops; already installed packages are kept and the retry resumes from the failing package.

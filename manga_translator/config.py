@@ -99,6 +99,7 @@ class Inpainter(str, Enum):
     default = "default"
     lama_large = "lama_large"
     lama_mpe = "lama_mpe"
+    flux2_klein = "flux2-klein"
     sd = "sd"
     none = "none"
     original = "original"
@@ -119,6 +120,7 @@ class Ocr(str, Enum):
     paddleocr_latin = "paddleocr_latin"
     paddleocr_thai = "paddleocr_thai"
     paddleocr_vl = "paddleocr_vl"  # PaddleOCR-VL for Manga (VLM-based OCR)
+    hayai_ocr_v2 = "hayai_ocr_v2"  # Hayai OCR v2 crop-level VLM
     openai_ocr = "openai_ocr"
     gemini_ocr = "gemini_ocr"
 
@@ -203,6 +205,8 @@ class RenderConfig(BaseModel):
     """Right-to-left reading order for panel and text_region sorting,"""  
     layout_mode: str = 'smart_scaling'
     """The layout mode to use for rendering. Options: 'smart_scaling', 'strict', 'balloon_fill'"""
+    balloon_fill_mask_layout: bool = False
+    """Lay out balloon-fill text against the bubble mask while preserving explicit line breaks."""
     stroke_width: float = 0.07
     """Stroke/border width ratio relative to font size. Default is 0.07 (7%). Set to 0 to disable stroke."""
     enable_template_alignment: bool = False
@@ -371,7 +375,7 @@ class InpainterConfig(BaseModel):
     force_use_torch_inpainting: bool = False
     """Force use PyTorch for inpainting instead of ONNX (useful if ONNX has memory issues)"""
     solid_fill_pure_bubbles: bool = False
-    """Use model-detected bubble masks to fill solid-color bubbles directly, skipping inpainting for them"""
+    """Use model-detected bubble masks to find solid-color bubbles, but fill only their intersection with the refined repair mask."""
     per_block_inpainting: bool = False
     """Inpaint each isolated refined-mask component in a 2x crop instead of feeding the whole page to the model"""
 
@@ -411,6 +415,8 @@ class CliConfig(BaseModel):
     """Skip images with no text"""
     save_text: bool = False
     """Save extracted text"""
+    export_from_local_json: bool = False
+    """Export original/translated sidecars from existing local project JSON without processing images."""
     ignore_errors: bool = False
     """Ignore errors and continue processing"""
     export_editable_psd: bool = False
@@ -452,11 +458,10 @@ class OcrConfig(BaseModel):
     merge_edge_ratio_threshold: float = 0.0
     """If a box has two neighbors with edge distance ratio > this value, disconnect the larger distance edge. 0 means disabled."""
     merge_special_require_full_wrap: bool = True
-    """Require unlabeled boxes to be fully wrapped by target-labeled boxes in special pre-merge groups."""
     ocr_vl_language_hint: str = 'auto'
-    """PaddleOCR-VL language hint. Options: auto, multilingual, ja, ko, zh, en, fr, de, es, ru, ar."""
+    """Language hint for vision-language OCR models that support it."""
     ocr_vl_custom_prompt: Optional[str] = None
-    """Custom PaddleOCR-VL prompt. If set, it overrides built-in prompt mode/language hint."""
+    """Custom prompt for vision-language OCR models that support it."""
     ai_ocr_concurrency: int = 1
     """Maximum concurrent API requests for OpenAI OCR and Gemini OCR."""
     ai_ocr_custom_prompt: Optional[str] = None

@@ -78,6 +78,22 @@ def test_10_series_match_does_not_capture_newer_geforce_models():
         assert launch.select_nvidia_dependency_variant(13, (7, 5), gpu_name) == "cuda13.0"
 
 
+def test_rtx_50_series_requires_cuda13_driver():
+    launch = load_launch("launch_nvidia_50_series_test")
+
+    for gpu_name in (
+        "NVIDIA GeForce RTX 5060 Laptop GPU",
+        "GeForce RTX 5070 Ti",
+        "NVIDIA GeForce RTX 5090",
+    ):
+        assert launch.is_nvidia_50_series_gpu(gpu_name)
+        assert launch.select_nvidia_dependency_variant(12, (12, 0), gpu_name) is None
+        assert launch.select_nvidia_dependency_variant(None, (12, 0), gpu_name) is None
+        assert launch.select_nvidia_dependency_variant(13, None, gpu_name) == "cuda13.0"
+
+    assert not launch.is_nvidia_50_series_gpu("NVIDIA GeForce RTX 4090")
+
+
 def test_nvidia_compute_capability_matches_selected_gpu(monkeypatch):
     launch = load_launch("launch_nvidia_compute_capability_test")
     monkeypatch.setattr(
@@ -103,4 +119,188 @@ def test_installed_cuda_12_runtime_preserves_cuda126_group(monkeypatch):
         "cuda12.6",
         "GPU",
         "CUDA 12.6",
+    )
+
+
+def test_rtx_50_update_variant_uses_driver_cuda_instead_of_installed_wheel(monkeypatch):
+    launch = load_launch("launch_rtx50_update_variant_test")
+    monkeypatch.setattr(
+        launch,
+        "detect_installed_pytorch_version",
+        lambda: ("GPU", "CUDA 12.6"),
+    )
+    detect_calls = []
+
+    def detect_gpu(*, interactive=True):
+        detect_calls.append(interactive)
+        return "NVIDIA", "NVIDIA GeForce RTX 5090", 13, "13.0", "580.00", (12, 0)
+
+    monkeypatch.setattr(launch, "detect_gpu", detect_gpu)
+
+    assert launch.get_update_variant_info() == (
+        "cuda13.0",
+        "cuda12.6",
+        "GPU",
+        "CUDA 12.6",
+    )
+    assert detect_calls == [False]
+
+
+def test_rtx_50_update_rejects_cuda126_when_driver_is_cuda12(monkeypatch):
+    launch = load_launch("launch_rtx50_cuda12_update_variant_test")
+    monkeypatch.setattr(
+        launch,
+        "detect_installed_pytorch_version",
+        lambda: ("GPU", "CUDA 12.6"),
+    )
+    monkeypatch.setattr(
+        launch,
+        "detect_gpu",
+        lambda *, interactive=True: (
+            "NVIDIA",
+            "NVIDIA GeForce RTX 5060 Laptop GPU",
+            12,
+            "12.8",
+            "573.24",
+            (12, 0),
+        ),
+    )
+
+    assert launch.get_update_variant_info()[0] is None
+
+
+def test_torch_update_reenters_auto_selection_when_rtx50_driver_is_unsupported(monkeypatch):
+    launch = load_launch("launch_rtx50_update_driver_warning_test")
+    args = type("Args", (), {"requirements": "cuda12.6"})()
+    prepared_variants = []
+
+    monkeypatch.setattr(launch, "ensure_pytorch_runtime_ready", lambda: True)
+    monkeypatch.setattr(
+        launch,
+        "get_update_variant_info",
+        lambda: (None, "cuda12.6", "GPU", "CUDA 12.6"),
+    )
+    monkeypatch.setattr(
+        launch,
+        "prepare_environment",
+        lambda current_args: prepared_variants.append(current_args.requirements),
+    )
+
+    assert launch.update_dependencies(args, select_cuda_variant=True)
+    assert prepared_variants == ["auto"]
+
+
+def test_update_dependencies_applies_driver_selected_cuda_variant(monkeypatch):
+    launch = load_launch("launch_apply_driver_cuda_variant_test")
+    args = type("Args", (), {"requirements": "auto"})()
+    applied_variants = []
+
+    monkeypatch.setattr(launch, "ensure_pytorch_runtime_ready", lambda: True)
+    monkeypatch.setattr(
+        launch,
+        "get_update_variant_info",
+        lambda: ("cuda13.0", "cuda12.6", "GPU", "CUDA 12.6"),
+    )
+    monkeypatch.setattr(
+        launch,
+        "prepare_environment",
+        lambda current_args: applied_variants.append(current_args.requirements),
+    )
+
+    assert launch.update_dependencies(args, select_cuda_variant=True)
+    assert applied_variants == ["cuda13.0"]
+
+
+def test_update_runtime_only_selects_driver_cuda_for_torch_upgrade(monkeypatch):
+    launch = load_launch("launch_runtime_cuda_detection_gate_test")
+    args = type("Args", (), {"requirements": "auto"})()
+    update_calls = []
+    selective_calls = []
+
+    monkeypatch.setattr(launch, "ensure_pytorch_runtime_ready", lambda: True)
+    monkeypatch.setattr(launch, "cleanup_caches", lambda: None)
+    monkeypatch.setattr(launch, "cleanup_runtime_dependencies", lambda _variant: True)
+    monkeypatch.setattr(launch, "run_deps_with_retry", lambda task, *_: task())
+    monkeypatch.setattr(
+        launch,
+        "update_dependencies",
+        lambda current_args, **kwargs: update_calls.append(kwargs["select_cuda_variant"]) or True,
+    )
+    monkeypatch.setattr(
+        launch,
+        "update_dependencies_selective",
+        lambda current_args, missing: selective_calls.append(missing) or True,
+    )
+
+    assert launch.update_runtime_dependencies(args, "cuda12.6", ["numpy==2.0"])
+    assert selective_calls == [["numpy==2.0"]]
+    assert update_calls == []
+
+    assert launch.update_runtime_dependencies(args, "cuda12.6", ["torch==2.13.0"])
+    assert update_calls == [True]
+
+
+def test_cleanup_stale_torchaudio_uninstalls_and_verifies_removal(monkeypatch):
+    launch = load_launch("launch_stale_torchaudio_cleanup_test")
+    return_codes = iter((0, 1))
+    uninstall_commands = []
+
+    def fake_subprocess_run(*_args, **_kwargs):
+        return type("Result", (), {"returncode": next(return_codes)})()
+
+    monkeypatch.setattr(launch.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(
+        launch,
+        "run",
+        lambda command, *_args, **_kwargs: uninstall_commands.append(command) or "",
+    )
+
+    assert launch.cleanup_stale_torchaudio("cpu")
+    assert len(uninstall_commands) == 1
+    assert "-m pip uninstall torchaudio -y" in uninstall_commands[0]
+
+
+def test_cleanup_stale_torchaudio_preserves_rocm_package(monkeypatch):
+    launch = load_launch("launch_rocm_torchaudio_cleanup_test")
+
+    def unexpected_subprocess(*_args, **_kwargs):
+        raise AssertionError("ROCm torchaudio must not be inspected or removed")
+
+    monkeypatch.setattr(launch.subprocess, "run", unexpected_subprocess)
+
+    assert launch.cleanup_stale_torchaudio("rocm7.2.1")
+
+
+def test_full_update_cleans_stale_dependencies_when_everything_is_current(monkeypatch):
+    launch = load_launch("launch_current_runtime_cleanup_test")
+    args = type("Args", (), {"requirements": "auto"})()
+    cleanup_calls = []
+
+    monkeypatch.setattr(
+        launch,
+        "check_all_updates",
+        lambda: (False, False, "v1", "v1", "cpu", []),
+    )
+    monkeypatch.setattr(
+        launch,
+        "cleanup_runtime_dependencies",
+        lambda variant: cleanup_calls.append(variant) or True,
+    )
+
+    assert launch.run_full_update(args)
+    assert cleanup_calls == ["cpu"]
+
+
+def test_legacy_rocm_runtime_preserves_rocm_group(monkeypatch):
+    launch = load_launch("launch_installed_rocm_variant_test")
+    monkeypatch.setattr(
+        launch,
+        "detect_installed_pytorch_version",
+        lambda: ("ROCm", "ROCm 7.2.53211-158bd99533"),
+    )
+
+    assert launch.get_requirements_file_from_env() == (
+        "rocm7.2.1",
+        "ROCm",
+        "ROCm 7.2.53211-158bd99533",
     )

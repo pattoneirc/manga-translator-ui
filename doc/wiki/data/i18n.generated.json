@@ -6,8 +6,8 @@
     "phase0Evidence": "doc/wiki/research/phase0-options-i18n-matrix.md"
   },
   "summary": {
-    "keys": 1463,
-    "exact": 1463,
+    "keys": 1515,
+    "exact": 1515,
     "missingInEnglish": 0,
     "missingInChinese": 0
   },
@@ -334,6 +334,12 @@
       "key": "Add Section",
       "en_US": "Add Section",
       "zh_CN": "添加字段",
+      "status": "exact"
+    },
+    {
+      "key": "Add Text Box",
+      "en_US": "Add Text Box",
+      "zh_CN": "添加文本框",
       "status": "exact"
     },
     {
@@ -1051,6 +1057,12 @@
       "status": "exact"
     },
     {
+      "key": "Copy Region",
+      "en_US": "Copy Region",
+      "zh_CN": "复制区域",
+      "status": "exact"
+    },
+    {
       "key": "Created",
       "en_US": "Created",
       "zh_CN": "已创建",
@@ -1144,6 +1156,12 @@
       "key": "Delete Row",
       "en_US": "Delete Row",
       "zh_CN": "删除行",
+      "status": "exact"
+    },
+    {
+      "key": "Delete Selected Regions",
+      "en_US": "Delete Selected Regions ({count})",
+      "zh_CN": "删除选中的 {count} 个区域",
       "status": "exact"
     },
     {
@@ -1879,6 +1897,18 @@
       "status": "exact"
     },
     {
+      "key": "Height",
+      "en_US": "Height",
+      "zh_CN": "高度",
+      "status": "exact"
+    },
+    {
+      "key": "Height Stretch",
+      "en_US": "Height Stretch",
+      "zh_CN": "纵向拉伸",
+      "status": "exact"
+    },
+    {
       "key": "Hide Secret",
       "en_US": "Hide key",
       "zh_CN": "隐藏密钥",
@@ -1978,6 +2008,12 @@
       "key": "International Sponsor",
       "en_US": "International support",
       "zh_CN": "海外赞助",
+      "status": "exact"
+    },
+    {
+      "key": "International Sponsor Hint",
+      "en_US": "Can't use WeChat or Alipay? Support the project directly through Ko-fi.",
+      "zh_CN": "不方便使用微信或支付宝？可直接通过 Ko-fi 赞助。",
       "status": "exact"
     },
     {
@@ -2539,6 +2575,12 @@
       "status": "exact"
     },
     {
+      "key": "OCR Selected Regions",
+      "en_US": "OCR Selected Regions",
+      "zh_CN": "OCR识别选中项",
+      "status": "exact"
+    },
+    {
       "key": "OK",
       "en_US": "OK",
       "zh_CN": "确定",
@@ -2710,6 +2752,18 @@
       "key": "Paste",
       "en_US": "Paste",
       "zh_CN": "粘贴",
+      "status": "exact"
+    },
+    {
+      "key": "Paste Region",
+      "en_US": "Paste Region",
+      "zh_CN": "粘贴区域",
+      "status": "exact"
+    },
+    {
+      "key": "Paste Style",
+      "en_US": "Paste Style",
+      "zh_CN": "粘贴样式",
       "status": "exact"
     },
     {
@@ -2983,6 +3037,12 @@
       "status": "exact"
     },
     {
+      "key": "Quick Symbols",
+      "en_US": "Quick Symbols",
+      "zh_CN": "快捷符号",
+      "status": "exact"
+    },
+    {
       "key": "RGB: -",
       "en_US": "RGB: -",
       "zh_CN": "RGB：-",
@@ -3052,6 +3112,12 @@
       "key": "Refresh",
       "en_US": "Refresh",
       "zh_CN": "刷新",
+      "status": "exact"
+    },
+    {
+      "key": "Refresh View",
+      "en_US": "Refresh View",
+      "zh_CN": "刷新视图",
       "status": "exact"
     },
     {
@@ -3829,6 +3895,12 @@
       "status": "exact"
     },
     {
+      "key": "Stretch",
+      "en_US": "Stretch",
+      "zh_CN": "拉伸",
+      "status": "exact"
+    },
+    {
       "key": "Strikethrough",
       "en_US": "Strikethrough",
       "zh_CN": "删除线",
@@ -3943,6 +4015,168 @@
       "status": "exact"
     },
     {
+      "key": "Symbol: Beamed eighth notes",
+      "en_US": "Beamed eighth notes",
+      "zh_CN": "连杠八分音符",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Beamed sixteenth notes",
+      "en_US": "Beamed sixteenth notes",
+      "zh_CN": "连杠十六分音符",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Black circle",
+      "en_US": "Black circle",
+      "zh_CN": "实心圆",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Black heart",
+      "en_US": "Black heart",
+      "zh_CN": "实心心号",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Black square",
+      "en_US": "Black square",
+      "zh_CN": "实心方形",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Eighth note",
+      "en_US": "Eighth note",
+      "zh_CN": "八分音符",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Ellipsis",
+      "en_US": "Ellipsis",
+      "zh_CN": "省略号",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Full-width exclamation mark",
+      "en_US": "Full-width exclamation mark",
+      "zh_CN": "全角感叹号",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Full-width question mark",
+      "en_US": "Full-width question mark",
+      "zh_CN": "全角问号",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Full-width space",
+      "en_US": "Full-width space",
+      "zh_CN": "全角空格",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Full-width tilde",
+      "en_US": "Full-width tilde",
+      "zh_CN": "全角波浪号",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Half-width exclamation mark",
+      "en_US": "Half-width exclamation mark",
+      "zh_CN": "半角感叹号",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Half-width question mark",
+      "en_US": "Half-width question mark",
+      "zh_CN": "半角问号",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Half-width tilde",
+      "en_US": "Half-width tilde",
+      "zh_CN": "半角波浪号",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Left corner bracket",
+      "en_US": "Left corner bracket",
+      "zh_CN": "左单角引号",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Left white corner bracket",
+      "en_US": "Left white corner bracket",
+      "zh_CN": "左双角引号",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Long dash",
+      "en_US": "Long dash",
+      "zh_CN": "长破折号",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Quarter note",
+      "en_US": "Quarter note",
+      "zh_CN": "四分音符",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Reference mark",
+      "en_US": "Reference mark",
+      "zh_CN": "参考标记",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Right corner bracket",
+      "en_US": "Right corner bracket",
+      "zh_CN": "右单角引号",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Right white corner bracket",
+      "en_US": "Right white corner bracket",
+      "zh_CN": "右双角引号",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Vertical closing quotation mark",
+      "en_US": "Vertical closing quotation mark",
+      "zh_CN": "后竖引号",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Vertical opening quotation mark",
+      "en_US": "Vertical opening quotation mark",
+      "zh_CN": "前竖引号",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Wave dash",
+      "en_US": "Wave dash",
+      "zh_CN": "老式全角波浪号",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: Wavy dash",
+      "en_US": "Wavy dash",
+      "zh_CN": "波浪线",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: White circle",
+      "en_US": "White circle",
+      "zh_CN": "空心圆",
+      "status": "exact"
+    },
+    {
+      "key": "Symbol: White heart",
+      "en_US": "White heart",
+      "zh_CN": "空心心号",
+      "status": "exact"
+    },
+    {
       "key": "System Prompt",
       "en_US": "System Prompt",
       "zh_CN": "系统提示词",
@@ -4039,6 +4273,12 @@
       "status": "exact"
     },
     {
+      "key": "Text Export",
+      "en_US": "Text Export",
+      "zh_CN": "文本导出",
+      "status": "exact"
+    },
+    {
       "key": "Text or regular expression",
       "en_US": "Text or regular expression",
       "zh_CN": "文字或正则表达式",
@@ -4123,6 +4363,18 @@
       "status": "exact"
     },
     {
+      "key": "Tip: Reads existing local JSON and exports original text only; no detection, OCR, API translation, or JSON write-back",
+      "en_US": "Tip: Reads existing local JSON and exports original text only; no detection, OCR, API translation, or JSON write-back",
+      "zh_CN": "提示：只读取本地已有工程 JSON 并导出原文；不执行检测、OCR、API 翻译，也不回写 JSON",
+      "status": "exact"
+    },
+    {
+      "key": "Tip: Reads existing local JSON and exports translated text only; no detection, OCR, API translation, or JSON write-back",
+      "en_US": "Tip: Reads existing local JSON and exports translated text only; no detection, OCR, API translation, or JSON write-back",
+      "zh_CN": "提示：只读取本地已有工程 JSON 并导出译文；不执行检测、OCR、API 翻译，也不回写 JSON",
+      "status": "exact"
+    },
+    {
       "key": "Tip: Replace translation applies translations from one image to another raw image",
       "en_US": "Tip: Replace translation applies translations from one image to another raw image",
       "zh_CN": "提示：替换翻译将一张图的翻译数据应用到另一张生肉图片上",
@@ -4168,6 +4420,12 @@
       "key": "Translate JSON Only",
       "en_US": "Translate JSON Only",
       "zh_CN": "仅翻译（JSON）",
+      "status": "exact"
+    },
+    {
+      "key": "Translate Selected Regions",
+      "en_US": "Translate Selected Regions",
+      "zh_CN": "翻译选中项",
       "status": "exact"
     },
     {
@@ -4501,6 +4759,18 @@
       "status": "exact"
     },
     {
+      "key": "Width / Height Stretch",
+      "en_US": "Width / Height Stretch",
+      "zh_CN": "宽度 / 高度拉伸",
+      "status": "exact"
+    },
+    {
+      "key": "Width Stretch",
+      "en_US": "Width Stretch",
+      "zh_CN": "横向拉伸",
+      "status": "exact"
+    },
+    {
       "key": "Wiki",
       "en_US": "Wiki",
       "zh_CN": "Wiki 文档",
@@ -4615,6 +4885,18 @@
       "status": "exact"
     },
     {
+      "key": "all_existing_outputs_skipped_dialog",
+      "en_US": "All {count} files were skipped because files with the same names already exist in the output directory. Translation did not start.\n\nSolutions:\n1. Delete the same-named files from the output directory\n2. Or enable ‘Overwrite Existing Files’ under Settings → General",
+      "zh_CN": "所有 {count} 个文件都因为输出目录中已有同名文件被跳过，未开始翻译。\n\n解决方法：\n1. 删除输出目录中的同名文件\n2. 或在 设置 → 通用 → 覆盖已存在文件 开启覆盖",
+      "status": "exact"
+    },
+    {
+      "key": "all_existing_outputs_skipped_status",
+      "en_US": "All {count} files were skipped. Delete the same-named files or enable overwrite.",
+      "zh_CN": "全部 {count} 个文件已跳过：删除同名文件或开启覆盖。",
+      "status": "exact"
+    },
+    {
       "key": "api_models_error_failed",
       "en_US": "Failed to retrieve the model list: {error}",
       "zh_CN": "获取模型列表失败：{error}",
@@ -4660,6 +4942,12 @@
       "key": "api_test_error_gemini_no_image",
       "en_US": "The Gemini image response did not contain an image.",
       "zh_CN": "Gemini 图像响应中没有图片。",
+      "status": "exact"
+    },
+    {
+      "key": "api_test_error_invalid_key_characters",
+      "en_US": "The API key contains characters unsupported by HTTP headers (positions {start}-{end}). Re-paste the key and remove Chinese, full-width, or invisible characters.",
+      "zh_CN": "API 密钥包含请求头不支持的字符（位置 {start}-{end}）。请重新粘贴密钥，并删除中文、全角符号或不可见字符。",
       "status": "exact"
     },
     {
@@ -4831,6 +5119,12 @@
       "status": "exact"
     },
     {
+      "key": "desc_cli_export_from_local_json",
+      "en_US": "For Export Translation and Export Original Text, read the existing local project JSON and write only the text sidecar. Skip image detection, OCR, API translation, and project JSON write-back to protect edited translations.",
+      "zh_CN": "导出翻译和导出原文时，只读取本地已有工程 JSON 并生成文本副文件；不重新检测图片、不执行 OCR、不调用翻译 API，也不回写工程 JSON，避免覆盖已修改的译文。",
+      "status": "exact"
+    },
+    {
       "key": "desc_cli_format",
       "en_US": "Output image format. Choose PNG, JPG/JPEG/JFIF, WebP, AVIF, BMP, TIFF/TIF, HEIC/HEIF, or leave empty to keep the original format.",
       "zh_CN": "输出图片格式。可选 PNG、JPG/JPEG/JFIF、WebP、AVIF、BMP、TIFF/TIF、HEIC/HEIF，或留空保持原格式。",
@@ -4844,8 +5138,8 @@
     },
     {
       "key": "desc_cli_overwrite",
-      "en_US": "Overwrite existing translated files. When disabled, already translated images are skipped.",
-      "zh_CN": "覆盖已存在的翻译文件。关闭时会跳过已翻译的图片。",
+      "en_US": "Overwrite existing translated files. When disabled, already translated images are skipped and context is automatically restored from their history.",
+      "zh_CN": "覆盖已存在的翻译文件。关闭时会跳过已翻译的图片，并自动从跳过页的历史记录中恢复上下文。",
       "status": "exact"
     },
     {
@@ -5030,8 +5324,8 @@
     },
     {
       "key": "desc_inpainter_inpainter",
-      "en_US": "Image inpainting algorithm. lama_large has best quality (recommended); lama_mpe is fast; default uses AOT.",
-      "zh_CN": "图像修复算法。lama_large 效果最好（推荐）；lama_mpe 速度快；default 使用 AOT。",
+      "en_US": "Image inpainting algorithm. lama_large has best quality (recommended); lama_mpe is fast; flux2-klein uses FLUX.2 Klein 4B with higher quality but significantly higher VRAM and speed requirements; default uses AOT.",
+      "zh_CN": "图像修复算法。lama_large 效果最好（推荐）；lama_mpe 速度快；flux2-klein 使用 FLUX.2 Klein 4B，质量高但显存和速度要求更高；default 使用 AOT。",
       "status": "exact"
     },
     {
@@ -5144,14 +5438,14 @@
     },
     {
       "key": "desc_ocr_ocr_vl_custom_prompt",
-      "en_US": "Custom prompt for PaddleOCR-VL (overrides default). Example: OCR: Extract all Arabic text.",
-      "zh_CN": "PaddleOCR-VL 自定义提示词（优先级高于默认提示词）。例如：OCR: Extract all Arabic text.",
+      "en_US": "Custom prompt for vision-language OCR models such as PaddleOCR-VL. Models without prompt support ignore this setting.",
+      "zh_CN": "供 PaddleOCR-VL 等视觉语言 OCR 模型使用的自定义提示词。不支持提示词的模型会忽略此设置。",
       "status": "exact"
     },
     {
       "key": "desc_ocr_ocr_vl_language_hint",
-      "en_US": "Language hint for PaddleOCR-VL to help recognize text in the specified language more accurately.",
-      "zh_CN": "PaddleOCR-VL 的语言提示，帮助模型更准确地识别指定语言的文本。",
+      "en_US": "Language hint for vision-language OCR models such as PaddleOCR-VL. Models without prompt support ignore this setting.",
+      "zh_CN": "供 PaddleOCR-VL 等视觉语言 OCR 模型使用的语言提示。不支持提示词的模型会忽略此设置。",
       "status": "exact"
     },
     {
@@ -5200,6 +5494,12 @@
       "key": "desc_render_alignment",
       "en_US": "Text alignment. auto detects automatically; left/center/right for specific alignment.",
       "zh_CN": "文本对齐方式。auto 自动检测；left 左对齐；center 居中；right 右对齐。",
+      "status": "exact"
+    },
+    {
+      "key": "desc_render_balloon_fill_mask_layout",
+      "en_US": "Without explicit breaks, line-break against the bubble mask's largest inscribed range. With explicit breaks, preserve them, use the text-box center anchor, and expand the font-size search to the bubble bounds. Later text boxes that overlap earlier ones shrink to the largest non-overlapping font size. Off by default.",
+      "zh_CN": "无显式断行时按气泡蒙版最大内接范围自动断句；有显式断行时保留断点，以文本框中心为锚点并扩大字号搜索范围；后续文字框与已有文字框重叠时，缩小到最大不重叠字号。默认关闭。",
       "status": "exact"
     },
     {
@@ -6109,6 +6409,12 @@
       "status": "exact"
     },
     {
+      "key": "label_balloon_fill_mask_layout",
+      "en_US": "Bubble Mask Layout",
+      "zh_CN": "气泡蒙版排版",
+      "status": "exact"
+    },
+    {
       "key": "label_batch_concurrent",
       "en_US": "Concurrent Batch Processing",
       "zh_CN": "并发批量处理",
@@ -6250,6 +6556,12 @@
       "key": "label_export_editable_psd",
       "en_US": "Export Editable PSD",
       "zh_CN": "导出可编辑PSD",
+      "status": "exact"
+    },
+    {
+      "key": "label_export_from_local_json",
+      "en_US": "Export Text from Local JSON Only",
+      "zh_CN": "仅从本地 JSON 导出文本",
       "status": "exact"
     },
     {
@@ -6500,14 +6812,14 @@
     },
     {
       "key": "label_ocr_vl_custom_prompt",
-      "en_US": "PaddleOCR-VL Custom Prompt (Override)",
-      "zh_CN": "PaddleOCR-VL 自定义提示词（优先）",
+      "en_US": "VLM OCR Custom Prompt (Override)",
+      "zh_CN": "VLM OCR 自定义提示词（优先）",
       "status": "exact"
     },
     {
       "key": "label_ocr_vl_language_hint",
-      "en_US": "PaddleOCR-VL Language Hint",
-      "zh_CN": "PaddleOCR-VL 语言提示",
+      "en_US": "VLM OCR Language Hint",
+      "zh_CN": "VLM OCR 语言提示",
       "status": "exact"
     },
     {

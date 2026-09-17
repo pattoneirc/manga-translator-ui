@@ -525,6 +525,7 @@ class ConfigService(QObject):
                     "remove_linebreak_punctuation": False,
                     "check_br_and_retry": False,
                     "strict_smart_scaling": False,
+                    "balloon_fill_mask_layout": False,
                 }
             )
             config_dict.setdefault("translator", {})["high_quality_prompt_path"] = (

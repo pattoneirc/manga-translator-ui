@@ -818,9 +818,8 @@ class EditorToolbar(CardWidget):
         self.redo_action.setEnabled(self._can_redo)
 
     def set_original_image_alpha_slider(self, alpha: float):
-        """同步滑块值（alpha: 0.0-1.0）"""
-        # 转换：alpha 0.0 = slider 0（完全透明），alpha 1.0 = slider 100（完全不透明）
-        slider_value = int(alpha * 100)
+        """将模型透明度投影到滑块，不回发用户输入。"""
+        slider_value = round(max(0.0, min(1.0, float(alpha))) * 100)
         self.original_image_alpha_slider.blockSignals(True)
         self.original_image_alpha_slider.setValue(slider_value)
         self.original_image_alpha_slider.blockSignals(False)

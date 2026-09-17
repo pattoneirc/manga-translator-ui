@@ -23,10 +23,11 @@ Choose the portable package if you only want to extract and run it; choose Docke
 
 > Windows users: first make sure the Microsoft Visual C++ Redistributable ([vc_redist.x64.exe](https://aka.ms/vs/17/release/vc_redist.x64.exe)) is installed; otherwise the app may fail to start with errors such as missing VCRUNTIME140.dll.
 
+
 A source environment needs Git, uv, and Python 3.12 (`>=3.12,<3.13`). To install:
 
 1. Install [Git](https://git-scm.com/), [uv](https://docs.astral.sh/uv/), and Python 3.12 (download the 3.12 installer from [python.org](https://www.python.org/downloads/) and check “Add python.exe to PATH”).
-2. Clone the repository and enter it:
+2. Enter a suitable parent directory, then clone and enter the repository:
    ```powershell
    git clone https://github.com/hgmzhn/manga-translator-ui.git
    cd manga-translator-ui
@@ -107,7 +108,7 @@ The maintenance mode's `prepare_environment` detects the device and checks the i
 - **Python version**: `pyproject.toml` and the launcher both constrain Python to 3.12; Python 3.13 is rejected. Check `uv run --no-sync python --version`, not only the system `python`.
 - **Mutually exclusive groups**: `cpu`, `cuda13.0`, `cuda12.6`, `rocm7.2.1`, and `metal` are mutually exclusive under `[tool.uv].conflicts`. Do not install multiple backend groups into one environment.
 - **Default groups**: the project defaults to `cuda13.0`, `packaging`, and `test`; other runtime environments use `--no-default-groups` and do not install the `test` group.
-- **NVIDIA**: `cuda13.0` uses `pytorch-cu130`, while `cuda12.6` uses `pytorch-cu126`; both are in the same source branch and include `onnxruntime-gpu` and `xformers`. RTX 50-series cards must use CUDA 13.0; other systems with CUDA 13.0-or-newer drivers can also run the CUDA 12.6 build.
+- **NVIDIA**: `cuda13.0` uses `pytorch-cu130`, while `cuda12.6` uses `pytorch-cu126`. RTX 50-series GPUs require CUDA 13.0; if the current driver does not support it, update the NVIDIA driver first. GeForce 10-series GPUs must use CUDA 12.6.
 - **ROCm**: the Linux `rocm7.2.1` group uses the ROCm 7.2 index and platform-marked torch/torchvision/triton. On Windows, the launcher installs ROCm SDK 7.2.1 and fixed PyTorch wheels; driver and gfx architecture determine compatibility.
 - **Metal**: `metal` targets Apple Silicon macOS with MPS PyTorch, CPU ONNX Runtime, and Cocoa from normal PyPI; do not select it on Windows.
 - **Switching conflicts**: if the installed PyTorch type differs from the target, the launcher may uninstall `torch`, `torchvision`, and `torchaudio` and purge the pip cache. Close other Python processes using PyTorch first.

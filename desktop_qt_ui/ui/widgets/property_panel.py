@@ -16,14 +16,14 @@ from qfluentwidgets import (
     CaptionLabel,
     CardWidget,
     CheckBox,
-    CompactDoubleSpinBox,
-    CompactSpinBox,
+    DoubleSpinBox,
     PopUpAniStackedWidget,
     PrimaryPushButton,
     PushButton,
     SegmentedWidget,
     SimpleCardWidget,
     Slider,
+    SpinBox,
     StrongBodyLabel,
     TextEdit,
     TogglePushButton,
@@ -33,6 +33,10 @@ from qfluentwidgets import (
     FluentIcon as FIF,
 )
 
+from editor.rich_text_editing import (
+    plain_text_to_storage_text,
+    storage_text_to_editor_text,
+)
 from editor.region_geometry_state import normalize_region_geometry_data
 from services import get_config_service, get_i18n_manager
 
@@ -42,6 +46,7 @@ from utils.font_list import FontComboBox
 
 from .color_picker import ColorPickerWidget
 from .hover_hint import set_hover_hint
+from .quick_symbol_button import QuickSymbolButton
 from .sidebar import FluentScrollArea
 from .wheel_filter import TopLevelComboBox as ComboBox
 from .wheel_filter import install_wheel_filter
@@ -132,16 +137,14 @@ class CustomSlider(Slider):
         event.accept()
 
 
-def _compact_double_spin_box() -> CompactDoubleSpinBox:
-    spin_box = CompactDoubleSpinBox()
-    spin_box.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
+def _double_spin_box() -> DoubleSpinBox:
+    spin_box = DoubleSpinBox()
     spin_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
     return spin_box
 
 
-def _compact_spin_box() -> CompactSpinBox:
-    spin_box = CompactSpinBox()
-    spin_box.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
+def _spin_box() -> SpinBox:
+    spin_box = SpinBox()
     spin_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
     return spin_box
 
@@ -154,6 +157,8 @@ class PropertyPanel(QWidget):
     MASK_ROUTE = "property_mask_page"
     PAINT_ROUTE = "property_paint_page"
     STAMP_ROUTE = "property_stamp_page"
+    FONT_SIZE_MIN = 8
+    FONT_SIZE_MAX = 1000
 
     # --- Define all required signals ---
     # 第三个参数是编辑操作记录 {'ops': [[pos, removed, inserted], ...],
@@ -727,8 +732,12 @@ class PropertyPanel(QWidget):
         self.translated_text_label = BodyLabel(self._t("Translated Text:"))
         text_layout.addWidget(self.translated_text_label)
         text_layout.addWidget(self.translated_text_box)
-        self.text_stats_label = CaptionLabel(self._t("Character count: 0"))
-        text_layout.addWidget(self.text_stats_label)
+        self.quick_symbols_button = QuickSymbolButton(
+            self.translated_text_box,
+            self._t,
+            text_card,
+        )
+        text_layout.addWidget(self.quick_symbols_button)
         self._finish_group(self.text_edit_frame, text_card)
         layout.addWidget(self.text_edit_frame)
 
@@ -775,11 +784,11 @@ class PropertyPanel(QWidget):
         style_layout.addRow(self.font_label, self.font_family_combo)
 
         # Font size
-        self.font_size_input = _compact_spin_box()
-        self.font_size_input.setRange(8, 1000)
+        self.font_size_input = _spin_box()
+        self.font_size_input.setRange(self.FONT_SIZE_MIN, self.FONT_SIZE_MAX)
         self.font_size_input.setKeyboardTracking(False)
         self.font_size_slider = CustomSlider(Qt.Orientation.Horizontal)
-        self.font_size_slider.setRange(8, 150)
+        self.font_size_slider.setRange(self.FONT_SIZE_MIN, 150)
         self.font_size_label = BodyLabel(self._t("Font Size:"))
         style_layout.addRow(self.font_size_label, self.font_size_input)
         style_layout.addRow(CaptionLabel(""), self.font_size_slider)
@@ -807,7 +816,7 @@ class PropertyPanel(QWidget):
         style_layout.addRow(self.stroke_color_label, self.stroke_color_picker)
 
         # Stroke width (描边宽度)
-        self.stroke_width_spinbox = _compact_double_spin_box()
+        self.stroke_width_spinbox = _double_spin_box()
         self.stroke_width_spinbox.setRange(0.0, 1.0)
         self.stroke_width_spinbox.setSingleStep(0.01)
         self.stroke_width_spinbox.setDecimals(2)
@@ -816,7 +825,7 @@ class PropertyPanel(QWidget):
         style_layout.addRow(self.stroke_width_label, self.stroke_width_spinbox)
 
         # Line spacing (行间距倍率)
-        self.line_spacing_spinbox = _compact_double_spin_box()
+        self.line_spacing_spinbox = _double_spin_box()
         self.line_spacing_spinbox.setRange(0.1, 5.0)
         self.line_spacing_spinbox.setSingleStep(0.1)
         self.line_spacing_spinbox.setDecimals(1)
@@ -824,15 +833,15 @@ class PropertyPanel(QWidget):
         self.line_spacing_label = BodyLabel(self._t("Line Spacing:"))
         style_layout.addRow(self.line_spacing_label, self.line_spacing_spinbox)
 
-        self.letter_spacing_spinbox = _compact_double_spin_box()
+        self.letter_spacing_spinbox = _double_spin_box()
         self.letter_spacing_spinbox.setRange(0.1, 5.0)
-        self.letter_spacing_spinbox.setSingleStep(0.1)
-        self.letter_spacing_spinbox.setDecimals(1)
+        self.letter_spacing_spinbox.setSingleStep(0.01)
+        self.letter_spacing_spinbox.setDecimals(2)
         self.letter_spacing_spinbox.setValue(1.0)
         self.letter_spacing_label = BodyLabel(self._t("Letter Spacing:"))
         style_layout.addRow(self.letter_spacing_label, self.letter_spacing_spinbox)
 
-        self.angle_spinbox = _compact_double_spin_box()
+        self.angle_spinbox = _double_spin_box()
         self.angle_spinbox.setRange(-9999.0, 9999.0)
         self.angle_spinbox.setSingleStep(1.0)
         self.angle_spinbox.setDecimals(1)
@@ -958,7 +967,6 @@ class PropertyPanel(QWidget):
 
     def _connect_model_signals(self):
         self.model.display_mask_type_changed.connect(self._on_display_mask_type_changed)
-        self.model.refined_mask_changed.connect(self._on_refined_mask_changed)
         self.model.regions_changed.connect(self.on_regions_changed)
 
     def _on_display_mask_type_changed(self, mask_type: str):
@@ -968,10 +976,6 @@ class PropertyPanel(QWidget):
         self.show_refined_mask_checkbox.setChecked(mask_type == "refined")
         self.show_refined_mask_checkbox.blockSignals(False)
 
-    def _on_refined_mask_changed(self, mask):
-        """响应refined mask数据变化"""
-        # 不自动勾选checkbox，让用户自己决定是否显示
-        pass
 
     def repopulate_options(self):
         """Public method to populate combo boxes from config. Should be called after config is loaded."""
@@ -979,25 +983,27 @@ class PropertyPanel(QWidget):
             return
 
         config = self.app_logic.config_service.get_config()
-        ocr_config = config.ocr
+        app_config = config.app
         translator_config = config.translator
+        editor_ocr = getattr(app_config, "editor_ocr", "mocr")
+        editor_translator = getattr(app_config, "editor_translator", "openai")
 
-        # OCR
+        # OCR and translator selections are editor-specific, not homepage settings.
         ocr_options = self.app_logic.get_options_for_key("ocr")
         if ocr_options:
             self._repopulate_combo(
-                self.ocr_model_combo, ocr_options, current_text=ocr_config.ocr
+                self.ocr_model_combo, ocr_options, current_text=editor_ocr
             )
 
-        # Translator
         translator_map = self.app_logic.get_display_mapping("translator")
         if translator_map:
             self.translator_display_to_key = {v: k for k, v in translator_map.items()}
             self._repopulate_combo(
                 self.translator_combo,
                 list(translator_map.values()),
-                current_text=translator_map.get(translator_config.translator),
+                current_text=translator_map.get(editor_translator),
             )
+
 
         # Target Language
         lang_map = self.app_logic.get_display_mapping("target_lang")
@@ -1080,8 +1086,8 @@ class PropertyPanel(QWidget):
             self.translation_raw_checkbox.setText(self._t("Show Translation (Raw)"))
         if hasattr(self, "translated_text_label"):
             self.translated_text_label.setText(self._t("Translated Text:"))
-        if hasattr(self, "text_stats_label"):
-            self.text_stats_label.setText(self._t("Character count: 0"))
+        if hasattr(self, "quick_symbols_button"):
+            self.quick_symbols_button.refresh_ui_texts()
 
         # 刷新按钮
         if hasattr(self, "ocr_button"):
@@ -1099,10 +1105,6 @@ class PropertyPanel(QWidget):
             set_hover_hint(self.select_button, self._t("Selection Tool") + " (Q)")
         if hasattr(self, "paint_select_button"):
             self.paint_select_button.setText(self._t("No Selection"))
-            set_hover_hint(self.paint_select_button, self._t("Selection Tool") + " (Q)")
-        if hasattr(self, "paint_brush_button"):
-            self.paint_brush_button.setText(self._t("Brush"))
-            set_hover_hint(self.paint_brush_button, self._t("Brush Tool") + " (W)")
         if hasattr(self, "paint_eraser_button"):
             self.paint_eraser_button.setText(self._t("Eraser"))
             set_hover_hint(self.paint_eraser_button, self._t("Eraser Tool") + " (E)")
@@ -1649,20 +1651,40 @@ class PropertyPanel(QWidget):
                     regions[region_index], region_index, update_focused_text=True
                 )
         else:
-            # 多选，启用样式编辑，但禁用文本编辑
+            # 多选，启用样式编辑，但禁用文本编辑。样式值沿用第一个选中区域，
+            # 与通过 Ctrl+点击形成多选时的显示口径一致。
             self.text_edit_frame.setEnabled(False)
-            self.style_edit_frame.setEnabled(True)  # 启用样式编辑
+            self.style_edit_frame.setEnabled(True)
             self.action_frame.setEnabled(True)
             self.current_region_index = -1
 
-            # 清空显示但不禁用样式控件
+            regions = self.model.get_regions()
+            representative_index = selected_indices[0]
+            if 0 <= representative_index < len(regions):
+                self._update_display(
+                    regions[representative_index],
+                    representative_index,
+                    update_focused_text=False,
+                    update_text_fields=False,
+                )
+
+            # 多选不显示任何一个区域的文本，只保留其样式控件值。
             self.block_updates = True
+            self._set_selection_controls_blocked(True)
             try:
                 self.original_text_box.clear()
                 self.translated_text_box.clear()
-                self._refresh_style_preset_combo(selected_name="")
             finally:
+                self._set_selection_controls_blocked(False)
                 self.block_updates = False
+            self._refresh_style_preset_combo(
+                selected_name=(
+                    self._find_matching_style_preset_name(regions[representative_index])
+                    if 0 <= representative_index < len(regions)
+                    else ""
+                )
+                or ""
+            )
 
     def clear_and_disable_selection_dependent(self):
         """Clears selection-dependent fields and disables their sections."""
@@ -1678,7 +1700,7 @@ class PropertyPanel(QWidget):
         try:
             self.original_text_box.clear()
             self.translated_text_box.clear()
-            self.font_size_input.setValue(12)
+            self._set_font_size_controls(12)
             self.stroke_width_spinbox.setValue(0.07)  # 重置为默认值
             self.line_spacing_spinbox.setValue(1.0)  # 重置为默认值
             self.letter_spacing_spinbox.setValue(1.0)  # 重置为默认值
@@ -1699,72 +1721,71 @@ class PropertyPanel(QWidget):
         region_index,
         *,
         update_focused_text: bool = True,
+        update_text_fields: bool = True,
         force_text_fields: set[str] | None = None,
     ):
-        """Populate all widgets with data from the selected region.
+        """Populate widgets with data from the selected region.
+
+        ``update_text_fields=False`` is used when a multi-selection needs a
+        representative style without exposing one region's text.
 
         Args:
             region_data: 区域数据字典
             region_index: 区域索引
             update_focused_text: 是否覆盖正在编辑的文本框
+            update_text_fields: 是否刷新原文和译文文本框
         """
         force_text_fields = force_text_fields or set()
         self.block_updates = True
         self._set_selection_controls_blocked(True)
         try:
             # --- Update Text & Styles ---
-            # 统一使用 text 字段（用户编辑和OCR识别都使用这个字段）
-            original_text = region_data.get("text", "")
-            update_original_text = update_focused_text or "text" in force_text_fields
-            if (
-                update_original_text or not self.original_text_box.hasFocus()
-            ) and self.original_text_box.toPlainText() != original_text:
-                self.original_text_box.setText(original_text)
+            if update_text_fields:
+                # 统一使用 text 字段（用户编辑和OCR识别都使用这个字段）
+                original_text = region_data.get("text", "")
+                update_original_text = update_focused_text or "text" in force_text_fields
+                if (
+                    update_original_text or not self.original_text_box.hasFocus()
+                ) and self.original_text_box.toPlainText() != original_text:
+                    self.original_text_box.setText(original_text)
 
-            import re
 
-            # 复选框选中 → 显示"替换前译文"(translation_raw),否则显示"译文"(translation)
-            show_raw = bool(
-                getattr(self, "translation_raw_checkbox", None)
-                and self.translation_raw_checkbox.isChecked()
-            )
-            field_key = "translation_raw" if show_raw else "translation"
-            translation_text = region_data.get(field_key, "") or region_data.get(
-                "translation", ""
-            )
-            update_translation_text = (
-                update_focused_text
-                or field_key in force_text_fields
-                or (
-                    field_key == "translation_raw"
-                    and "translation" in force_text_fields
-                    and not region_data.get("translation_raw")
+                # 复选框选中 → 显示"替换前译文"(translation_raw)，否则显示"译文"(translation)
+                show_raw = bool(
+                    getattr(self, "translation_raw_checkbox", None)
+                    and self.translation_raw_checkbox.isChecked()
                 )
-            )
+                field_key = "translation_raw" if show_raw else "translation"
+                translation_text = region_data.get(field_key, "") or region_data.get(
+                    "translation", ""
+                )
+                update_translation_text = (
+                    update_focused_text
+                    or field_key in force_text_fields
+                    or (
+                        field_key == "translation_raw"
+                        and "translation" in force_text_fields
+                        and not region_data.get("translation_raw")
+                    )
+                )
 
-            # 将所有 AI 换行符 ([BR], <br>, 【BR】) 转换为真实换行
-            translation_text = re.sub(
-                r"\s*(\[BR\]|<br>|【BR】)\s*",
-                "\n",
-                translation_text,
-                flags=re.IGNORECASE,
-            )
+                # 将所有 AI 换行符转换为真实换行，保留换行两侧的用户空格
+                translation_text = storage_text_to_editor_text(translation_text)
 
-            # 剥除存量的旧 <H> 局部横排标记（协议已废除，保留内文显示）
-            display_text = strip_legacy_horizontal_tags(translation_text)
+                # 剥除存量的旧 <H> 局部横排标记（协议已废除，保留内文显示）
+                display_text = strip_legacy_horizontal_tags(translation_text)
 
-            if (
-                update_translation_text or not self.translated_text_box.hasFocus()
-            ) and self.translated_text_box.toPlainText() != display_text:
-                self.translated_text_box.setText(display_text)
-            # 重置编辑操作基线:无论是否覆盖了文本,都以框内当前内容为准
-            self._translation_edit_recorder.reset(
-                self.translated_text_box.toPlainText()
-            )
+                if (
+                    update_translation_text or not self.translated_text_box.hasFocus()
+                ) and self.translated_text_box.toPlainText() != display_text:
+                    self.translated_text_box.setText(display_text)
+                # 重置编辑操作基线:无论是否覆盖了文本,都以框内当前内容为准
+                self._translation_edit_recorder.reset(
+                    self.translated_text_box.toPlainText()
+                )
 
-            font_size = int(region_data.get("font_size", 12) or 12)
-            self.font_size_input.setValue(font_size)
-            self.font_size_slider.setValue(font_size)
+            font_size = region_data.get("font_size", 12) or 12
+            self._set_font_size_controls(font_size)
 
             default_color = (
                 self.config_service.get_config().render.font_color or "#000000"
@@ -1856,10 +1877,8 @@ class PropertyPanel(QWidget):
         存量/手输的字面 <H></H> 在此剥除（保留内文），避免被当普通字符
         画上成品图。
         """
-        import re
-
         text_without_tags = strip_legacy_horizontal_tags(raw_text)
-        return re.sub(r"\n+", "[BR]", text_without_tags)
+        return plain_text_to_storage_text(text_without_tags)
 
     def force_save_text_edits(self):
         """强制保存当前文本框的编辑内容（在失去焦点前）"""
@@ -1981,6 +2000,35 @@ class PropertyPanel(QWidget):
             return self.lang_name_to_code.get(display_name, display_name)
         return display_name
 
+    def _set_font_size_controls(self, value: int) -> int:
+        """同步字号控件；滑块只显示自身范围内的值。"""
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = self.FONT_SIZE_MIN
+        value = max(self.FONT_SIZE_MIN, min(self.FONT_SIZE_MAX, value))
+
+        slider_value = max(
+            self.font_size_slider.minimum(),
+            min(self.font_size_slider.maximum(), value),
+        )
+        if (
+            self.font_size_input.value() == value
+            and self.font_size_slider.value() == slider_value
+        ):
+            return value
+
+        input_blocked = self.font_size_input.blockSignals(True)
+        slider_blocked = self.font_size_slider.blockSignals(True)
+        try:
+            self.font_size_input.setValue(value)
+            self.font_size_slider.setValue(slider_value)
+            self.font_size_slider.update()
+        finally:
+            self.font_size_input.blockSignals(input_blocked)
+            self.font_size_slider.blockSignals(slider_blocked)
+        return value
+
     def _emit_style_patch(self, patch: dict) -> None:
         if self.block_updates or not patch:
             return
@@ -1991,26 +2039,14 @@ class PropertyPanel(QWidget):
     def _on_font_size_input_changed(self, value: int):
         if self.block_updates:
             return
-        value = max(8, min(1000, int(value)))
-        if self.font_size_slider.minimum() <= value <= self.font_size_slider.maximum():
-            if self.font_size_slider.value() != value:
-                self.font_size_slider.blockSignals(True)
-                try:
-                    self.font_size_slider.setValue(value)
-                finally:
-                    self.font_size_slider.blockSignals(False)
+        value = self._set_font_size_controls(value)
         self._emit_style_patch({"font_size": value})
 
-    def _on_font_size_slider_changed(self, value):
+    def _on_font_size_slider_changed(self, value: int):
         if self.block_updates:
             return
-        if self.font_size_input.value() != value:
-            self.font_size_input.blockSignals(True)
-            try:
-                self.font_size_input.setValue(value)
-            finally:
-                self.font_size_input.blockSignals(False)
-        self._emit_style_patch({"font_size": int(value)})
+        value = self._set_font_size_controls(value)
+        self._emit_style_patch({"font_size": value})
 
     def _on_font_family_changed(self, index):
         if self.block_updates:
@@ -2124,12 +2160,14 @@ class PropertyPanel(QWidget):
             checked = self.mask_tool_group.checkedButton()
             if checked not in buttons:
                 buttons[0].setChecked(True)
+                if self.model.get_active_tool() == "select":
+                    self.sync_brush_size_from_model(self.model.get_brush_size())
                 self.mask_tool_changed.emit("select")
         except Exception:
             pass
 
     def sync_brush_size_from_model(self, size: int):
-        """从模型同步画笔大小到UI（不触发信号）"""
+        """从模型同步画笔大小到 UI，并刷新当前工具对应的滑块外观。"""
         for slider, label in (
             (self.brush_size_slider, self.brush_size_value_label),
             (
@@ -2146,6 +2184,7 @@ class PropertyPanel(QWidget):
             slider.blockSignals(True)
             slider.setValue(size)
             slider.blockSignals(False)
+            slider.update()
             if label is not None:
                 label.setText(str(size))
 
@@ -2196,6 +2235,7 @@ class PropertyPanel(QWidget):
             if self.paint_segmented_widget is not None:
                 self.paint_segmented_widget.blockSignals(False)
         self.sync_sidebar_layout()
+        self.sync_brush_size_from_model(self.model.get_brush_size())
 
     def _on_alignment_changed(self, text: str):
         if self.block_updates:
@@ -2250,15 +2290,14 @@ class PropertyPanel(QWidget):
 
     # _mark_horizontal 已删除：局部横排改用富文本 tcy（浮动编辑器 T 按钮），
     # 旧 <H> 协议已废除，渲染管线不再有任何 <H> 消费方。
-
     def _on_ocr_model_change(self, text):
-        """OCR模型变化时保存配置"""
-        self.app_logic.update_single_config("ocr.ocr", text)
+        """OCR模型变化时保存编辑器专用配置"""
+        self.app_logic.update_single_config("app.editor_ocr", text)
 
     def _on_translator_change(self, display_name):
-        """翻译器变化时保存配置"""
+        """翻译器变化时保存编辑器专用配置"""
         translator_key = self.translator_display_to_key.get(display_name, display_name)
-        self.app_logic.update_single_config("translator.translator", translator_key)
+        self.app_logic.update_single_config("app.editor_translator", translator_key)
 
     def _on_target_language_change(self, display_name):
         """目标语言变化时保存配置"""

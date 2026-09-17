@@ -21,14 +21,15 @@ lastUpdated: true
 
 > 安装前请先确保已安装 Microsoft Visual C++ 运行库（[vc_redist.x64.exe](https://aka.ms/vs/17/release/vc_redist.x64.exe)）；缺少它可能导致程序启动报错（如缺少 VCRUNTIME140.dll）。
 
+
 便携安装包来自 GitHub Releases 的 `portable` 标签：
 
-1. 前往 [便携整合包发布页](https://github.com/hgmzhn/manga-translator-ui/releases/tag/portable) 下载最新版本，解压到任意目录（如 `D:\manga-translator-ui\`）。包内自带打包版 Python 3.12 和 uv，无需预装 Python。
+1. 前往 [便携整合包发布页](https://github.com/hgmzhn/manga-translator-ui/releases/tag/portable) 下载最新版本并解压；包内自带打包版 Python 3.12 和 uv，无需预装 Python。
 2. 双击 `Win-Install-or-Update.bat` 打开维护菜单，选择 `[1] 安装`：
    - 选择下载线路（GitHub 官方 / Gitee 国内镜像，国内推荐 Gitee）。
    - 脚本强制同步最新代码；同步失败会提示切换线路重试。
    - 自动检测显卡（NVIDIA / AMD / 集显；多显卡时列出选择）。
-   - 选择 PyTorch 版本：CUDA 13.0 及以上默认选 `cuda13.0`；CUDA 12.x 选 `cuda12.6`；AMD 使用 `rocm7.2.1`（实验性）；其他或集显选 `cpu`。全程不切换 Git 分支。
+   - 选择 PyTorch 版本：GeForce 10 系必须使用 `cuda12.6`；RTX 50 系必须使用 `cuda13.0`，如不支持请更新 NVIDIA 驱动；其他显卡按检测结果选择。
    - uv 批量安装依赖（PyPI 多镜像回退：清华 → 阿里 → 豆瓣 → 官方），失败可重试，已安装包保留。
    - 完成后自动清理下载缓存。
 3. 安装完成后，以后每次使用双击 `Win-Start.bat` 启动。
@@ -79,5 +80,4 @@ flowchart TD
 - **Windows ROCm**：脚本单独处理 ROCm SDK 7.2.1/PyTorch 顺序，并提示驱动与支持列表限制。兼容性不能仅凭 AMD 显卡品牌判断。
 - **旧 Conda**：只有便携解释器不存在时才回退。不要同时把 `packaging\\python`、`conda_env` 和外部环境的包混作一个环境；错误的 PATH 可能导致 DLL、Torch 或 ONNX Runtime 冲突。
 - **GPU/CPU 资源**：GPU 依赖不等于模型已下载，也不保证显存足够；首次启动仍可能下载或初始化模型。CPU 方案可运行但通常更慢。安装失败时不要删除已成功包后反复切换方案。
-- **目录路径**：脚本对非 ASCII 安装路径有特殊 Miniconda 根目录查找回退（盘符根目录）；为降低 DLL、Git 和模型路径问题，优先使用可写且不含特殊字符的短路径。
 - **网络**：安装/更新需要 Git、包索引或镜像网络；API 网络是应用运行时的另一条链路，不能用“安装成功”证明翻译 API 可用。

@@ -33,6 +33,7 @@ from desktop_qt_ui.core.git_update_helpers import (
 from desktop_qt_ui.core.git_update_helpers import (
     fetch_origin,
     git_output,
+    non_interactive_git_env,
     set_origin_url,
 )
 from desktop_qt_ui.core.git_update_helpers import (
@@ -689,6 +690,18 @@ def restart_maintenance(action):
         command.extend(["--branch", UPDATE_BRANCH_OVERRIDE])
     sys.stdout.flush()
     sys.stderr.flush()
+    if sys.platform == "win32":
+        # os.execv may hand Windows an unquoted executable path. Popen receives
+        # an argv sequence and therefore preserves bundled Python paths with spaces.
+        try:
+            subprocess.Popen(command, cwd=PATH_ROOT)
+        except OSError as e:
+            print(L(f'[错误] 无法重新加载维护程序: {e}',
+                    f'[ERROR] Could not reload the maintenance program: {e}'))
+            print(L('请重新运行安装/更新脚本，更新后的代码不会在当前进程中继续执行。',
+                    'Run the install/update script again; the updated code will not continue in this process.'))
+            raise SystemExit(1) from e
+        raise SystemExit(0)
     try:
         os.execv(sys.executable, command)
     except OSError as e:
@@ -724,7 +737,7 @@ def restart_desktop_ui():
         return False
 
 
-def detect_gpu():
+def detect_gpu(interactive=True):
     """检测GPU类型 - 使用多种方法以提高兼容性
     
     支持双显卡笔记本（如 NVIDIA 独显 + AMD 核显）：
@@ -829,14 +842,8 @@ def detect_gpu():
         except Exception:
             return None, None, None
     
-    def prompt_user_choose_gpu(all_gpus):
-        """当检测到多张显卡时，让用户选择使用哪张
-        
-        Args:
-            all_gpus: [(type, name), ...] 列表
-        Returns:
-            (gpu_type, gpu_name) 用户选择的显卡
-        """
+    def prompt_user_choose_gpu(all_gpus, interactive=True):
+        """选择多显卡中的计算设备；非交互模式直接采用默认设备。"""
         # 只有一张显卡，直接返回
         if len(all_gpus) <= 1:
             return all_gpus[0]
@@ -896,6 +903,10 @@ def detect_gpu():
                     return gpu_type, gpu_name
         
         # 多张显卡，提示用户选择
+        if not interactive:
+            # 自动更新不能阻塞等待输入；沿用同一套默认优先级。
+            return options[default_idx - 1]
+
         print()
         print('=' * 55)
         print('检测到多张显卡')
@@ -1004,8 +1015,7 @@ def detect_gpu():
             # 处理检测结果
             if all_gpus:
                 if len(all_gpus) > 1:
-                    # 多张显卡：让用户选择
-                    gpu_type, gpu_name = prompt_user_choose_gpu(all_gpus)
+                    gpu_type, gpu_name = prompt_user_choose_gpu(all_gpus, interactive=interactive)
                 else:
                     # 单张显卡：直接使用第一个
                     gpu_type, gpu_name = all_gpus[0]
@@ -1045,12 +1055,12 @@ def detect_gpu():
                                               'M3' in chip_name or 'M4' in chip_name or
                                               'Apple' in chip_name):
                                 # Apple Silicon，支持 Metal
-                                return "AppleSilicon", chip_name, None, None, None
+                                return "AppleSilicon", chip_name, None, None, None, None
                         except Exception:
                             pass
                         
                         # 如果无法获取具体芯片名称，但确定是 arm64，仍然返回 Apple Silicon
-                        return "AppleSilicon", "Apple Silicon", None, None, None
+                        return "AppleSilicon", "Apple Silicon", None, None, None, None
                     
                     # Intel Mac，继续使用下面的通用检测逻辑
                 except Exception:
@@ -1074,7 +1084,7 @@ def detect_gpu():
             
             if all_gpus:
                 if len(all_gpus) > 1:
-                    gpu_type, gpu_name = prompt_user_choose_gpu(all_gpus)
+                    gpu_type, gpu_name = prompt_user_choose_gpu(all_gpus, interactive=interactive)
                 else:
                     gpu_type, gpu_name = all_gpus[0]
                 
@@ -1263,6 +1273,9 @@ except OSError as e:
             output = result.stdout.strip()
             if '|' in output:
                 pytorch_type, detail = output.split('|', 1)
+                # 兼容旧版/外部检测器使用的 ROCm 标签；内部统一使用 AMD。
+                if pytorch_type == 'ROCm':
+                    pytorch_type = 'AMD'
                 # 子进程输出 "None|未安装" 是字符串，转成真正的 None（未安装不算版本不匹配）
                 if pytorch_type == 'None':
                     return None, detail
@@ -1282,7 +1295,7 @@ def dependency_variant_from_pytorch(pytorch_type, detail):
         return 'cuda12.6' if "CUDA 12." in (detail or "") else 'cuda13.0'
     if pytorch_type == "Metal":
         return 'metal'
-    if pytorch_type == "AMD":
+    if pytorch_type in ("AMD", "ROCm"):
         return 'rocm7.2.1'
     if pytorch_type == "CPU":
         return 'cpu'
@@ -1294,6 +1307,34 @@ def get_requirements_file_from_env():
     pytorch_type, detail = detect_installed_pytorch_version()
     variant = dependency_variant_from_pytorch(pytorch_type, detail)
     return variant, pytorch_type if variant else None, detail
+
+
+def get_update_variant_info():
+    """Return the dependency variant the current hardware should use for updates.
+
+    The installed torch build is not authoritative: an older CUDA wheel can be
+    installed on a driver that now supports a newer CUDA runtime.  Keep the
+    installed variant only when hardware detection cannot determine a safer
+    target, or when the backend is not NVIDIA.
+    """
+    installed_variant, pytorch_type, detail = get_requirements_file_from_env()
+    target_variant = installed_variant
+
+    if pytorch_type == "GPU":
+        gpu_type, gpu_name, cuda_major, _, _, compute_capability = detect_gpu(
+            interactive=False
+        )
+        if gpu_type == "NVIDIA":
+            detected_variant = select_nvidia_dependency_variant(
+                cuda_major, compute_capability, gpu_name
+            )
+            if detected_variant is not None:
+                target_variant = detected_variant
+            elif is_nvidia_50_series_gpu(gpu_name):
+                # 50 系不能继续使用已安装的 cu126；交回自动安装流程提示升级驱动。
+                target_variant = None
+
+    return target_variant, installed_variant, pytorch_type, detail
 
 
 def repair_broken_pytorch_runtime(pytorch_type, detail, *, allow_reinstall=True):
@@ -1405,13 +1446,23 @@ def is_nvidia_10_series_gpu(gpu_name):
     return re.search(r'\b(?:GTX|GT)\s*10\d{2}\b', normalized) is not None
 
 
+def is_nvidia_50_series_gpu(gpu_name):
+    """识别 GeForce RTX 50 系；该架构不支持项目的 CUDA 12.6 构建。"""
+    import re
+
+    normalized = ' '.join((gpu_name or '').upper().split())
+    return re.search(r'\bRTX\s*50\d{2}\b', normalized) is not None
+
+
 def select_nvidia_dependency_variant(cuda_major, compute_capability=None, gpu_name=None):
     """根据驱动 CUDA 上限和 GPU 架构选择 NVIDIA 依赖组。
 
-    GeForce 10 系显卡显式强制使用 cuda12.6。其余显卡中，只有计算能力
-    7.5 及以上的 Turing 或更新架构才能使用 cuda13.0；无法确认计算能力时
-    保守回退到 cuda12.6。
+    GeForce 10 系显卡显式强制使用 cuda12.6。RTX 50 系必须使用 cuda13.0；
+    驱动尚未支持 CUDA 13 时返回 None，要求用户先升级驱动。其余显卡中，
+    只有计算能力 7.5 及以上的 Turing 或更新架构才能使用 cuda13.0。
     """
+    if is_nvidia_50_series_gpu(gpu_name):
+        return 'cuda13.0' if cuda_major is not None and cuda_major >= 13 else None
     if cuda_major is None or cuda_major < 12:
         return None
     if cuda_major == 12 or is_nvidia_10_series_gpu(gpu_name):
@@ -1450,6 +1501,43 @@ def ensure_pytorch_runtime_ready():
         "Install the VC++ runtime above and run the operation again.",
     ))
     return False
+
+
+def cleanup_stale_torchaudio(requirements_file):
+    """Remove an obsolete torchaudio installation unless the ROCm variant needs it."""
+    if normalize_variant(requirements_file) == 'rocm7.2.1':
+        return True
+
+    show_command = [python, '-m', 'pip', 'show', 'torchaudio']
+    try:
+        installed = subprocess.run(show_command, capture_output=True, text=True, check=False)
+    except OSError as exc:
+        print(f'无法检查残留的 torchaudio: {exc}')
+        return False
+    if installed.returncode != 0:
+        return True
+
+    print('检测到残留的 torchaudio，正在卸载...')
+    try:
+        run(
+            f'"{python}" -m pip uninstall torchaudio -y',
+            "卸载残留 torchaudio",
+            "无法卸载 torchaudio",
+            live=True,
+        )
+    except (OSError, RuntimeError) as exc:
+        print(f'卸载残留的 torchaudio 失败: {exc}')
+        return False
+
+    try:
+        remaining = subprocess.run(show_command, capture_output=True, text=True, check=False)
+    except OSError as exc:
+        print(f'无法确认 torchaudio 是否已卸载: {exc}')
+        return False
+    if remaining.returncode == 0:
+        print('卸载命令完成后仍检测到 torchaudio，请关闭占用该环境的 Python 进程后重试。')
+        return False
+    return True
 
 
 def prepare_environment(args):
@@ -1637,16 +1725,27 @@ except:
             print('=' * 50)
             print()
             
-            # 驱动支持 CUDA 13 还不代表旧显卡架构支持 CUDA 13；Turing 之前强制使用 12.6。
+            # 50 系不支持项目的 CUDA 12.6 构建；未升级驱动时必须先提示，不能回退 cu126。
+            is_50_series = is_nvidia_50_series_gpu(gpu_name)
+            if is_50_series and cuda_major is None:
+                cuda_major = 0  # 进入“不支持”分支，避免未知版本回退 CUDA 12.6。
             if cuda_major is not None:
                 selected_variant = select_nvidia_dependency_variant(cuda_major, compute_capability, gpu_name)
                 if selected_variant is None:
-                    print(L('⚠️  警告: 检测到 CUDA 版本低于 12.0',
-                            '⚠️  Warning: detected CUDA version is below 12.0'))
-                    print(L(f'   当前 CUDA 版本: {cuda_version}',
-                            f'   Current CUDA version: {cuda_version}'))
-                    print(L('   NVIDIA GPU 版本最低需要: CUDA 12.x',
-                            '   NVIDIA GPU support requires CUDA 12.x or newer'))
+                    if is_50_series:
+                        print(L('⚠️  RTX 50 系列必须使用 CUDA 13.0',
+                                '⚠️  RTX 50-series GPUs require CUDA 13.0'))
+                        print(L(f'   当前驱动支持的 CUDA 版本: {cuda_version or "无法检测"}',
+                                f'   CUDA version supported by the current driver: {cuda_version or "unknown"}'))
+                        print(L('   当前驱动不支持，请先更新 NVIDIA 驱动',
+                                '   The current driver does not support it; update the NVIDIA driver first'))
+                    else:
+                        print(L('⚠️  警告: 检测到 CUDA 版本低于 12.0',
+                                '⚠️  Warning: detected CUDA version is below 12.0'))
+                        print(L(f'   当前 CUDA 版本: {cuda_version}',
+                                f'   Current CUDA version: {cuda_version}'))
+                        print(L('   NVIDIA GPU 版本最低需要: CUDA 12.x',
+                                '   NVIDIA GPU support requires CUDA 12.x or newer'))
                     print()
                     print(L('请选择:', 'Choose an option:'))
                     print(L('  [1] 更新 NVIDIA 驱动后重新运行安装',
@@ -2039,18 +2138,11 @@ except:
     else:
         print('依赖已满足 ✓')
 
-    # 清理残留的 torchaudio（依赖方案中已不包含它；旧版本残留会因 ABI 不匹配
-    # 导致 transformers 导入时加载 libtorchaudio.pyd 失败，OCR 报错）
-    # AMD ROCm 方案的 torchaudio 是配套安装的，不清理
-    if not use_amd_pytorch:
-        try:
-            result = subprocess.run(f'"{python}" -m pip show torchaudio', shell=True,
-                                    capture_output=True, text=True)
-            if result.returncode == 0:
-                print('检测到残留的 torchaudio，正在卸载...')
-                run(f'"{python}" -m pip uninstall torchaudio -y', "卸载残留 torchaudio", "无法卸载 torchaudio")
-        except Exception:
-            pass
+    # 旧版本残留会因 ABI 不匹配导致 transformers 加载 libtorchaudio.pyd 失败。
+    # AMD ROCm 方案需要配套的 torchaudio，其他方案必须清理并确认卸载成功。
+    if not cleanup_stale_torchaudio(requirements_file):
+        raise RuntimeError('无法卸载残留的 torchaudio')
+
 
 
     # 返回 AMD PyTorch 相关信息
@@ -2211,12 +2303,23 @@ def switch_mirror():
     return False
 
 
+def _run_git_fetch(fetch_args=None, *, capture_output=False, timeout=300):
+    """Fetch origin without opening Git Credential Manager or terminal prompts."""
+    return subprocess.run(
+        [git, 'fetch', 'origin'] + (fetch_args or []),
+        capture_output=capture_output,
+        check=False,
+        timeout=timeout,
+        env=non_interactive_git_env(),
+    )
+
+
 def git_fetch_with_mirror_prompt(fetch_args=None, desc=None):
     """git fetch，失败时推荐切换到另一条线路并重试"""
     while True:
         print((desc or L('获取远程更新', 'Fetching remote updates')) + '...')
         try:
-            result = subprocess.run([git, 'fetch', 'origin'] + (fetch_args or []), check=False, timeout=300)
+            result = _run_git_fetch(fetch_args, timeout=300)
             if result.returncode == 0:
                 return True
         except Exception:
@@ -2498,7 +2601,7 @@ def update_code_force(skip_confirm=False, target_branch=None):
     return True
 
 
-def update_dependencies(args):
+def update_dependencies(args, *, select_cuda_variant=False):
     """更新依赖"""
     print()
     print("=" * 40)
@@ -2512,13 +2615,19 @@ def update_dependencies(args):
     if not ensure_pytorch_runtime_ready():
         return False
     
-    # 设置参数，让 prepare_environment 处理所有逻辑
-    # 检测已安装的 PyTorch 类型来决定 dependency group
-    req_file, pytorch_type, detail = get_requirements_file_from_env()
+    if select_cuda_variant:
+        # 只有 Torch 核心包需要升级时，才按当前驱动重新选择 CUDA 方案。
+        req_file, installed_variant, pytorch_type, detail = get_update_variant_info()
+    else:
+        req_file, pytorch_type, detail = get_requirements_file_from_env()
+        installed_variant = req_file
     if req_file:
         args.requirements = req_file
         print(f"检测到 PyTorch 类型: {pytorch_type} ({detail})")
-        print(f"使用: {req_file}")
+        if select_cuda_variant and installed_variant != req_file:
+            print(f"检测到驱动支持的目标方案: {req_file}（当前 {installed_variant}）")
+        else:
+            print(f"使用: {req_file}")
     else:
         args.requirements = 'auto'
         print(f"未检测到可用的 PyTorch: {detail}")
@@ -2631,12 +2740,7 @@ def check_all_updates():
     
     fetch_ok = False
     try:
-        fetch_result = subprocess.run(
-            [git, 'fetch', 'origin'],
-            capture_output=True,
-            check=False,
-            timeout=10
-        )
+        fetch_result = _run_git_fetch(capture_output=True, timeout=10)
         fetch_ok = (fetch_result.returncode == 0)
     except Exception:
         fetch_ok = False
@@ -2706,7 +2810,7 @@ def check_all_updates():
     print()
     print("[2/2] 检查依赖...")
     
-    # 检测已安装的 PyTorch 类型
+    # 更新检查只读取已安装方案；硬件 CUDA 检测延迟到 Torch 核心包确实需要升级时。
     req_file, pytorch_type, detail = get_requirements_file_from_env()
     if req_file:
         print(f"  检测到 PyTorch: {pytorch_type} ({detail})")
@@ -2834,7 +2938,7 @@ def install_dependencies(args):
     return True
 
 
-def update_runtime_dependencies(args, req_file, missing_packages):
+def update_runtime_dependencies(args, req_file, missing_packages, *, full_sync=False):
     """Apply dependency changes using the currently loaded launcher code."""
     print()
     print(L("[2/2] 更新依赖...", "[2/2] Updating dependencies..."))
@@ -2845,16 +2949,24 @@ def update_runtime_dependencies(args, req_file, missing_packages):
     if req_file:
         args.requirements = req_file
 
+    torch_upgrade = any(
+        _dep_base_name(pkg).lower() in {"torch", "torchvision", "torchaudio"}
+        for pkg in missing_packages
+    )
+
     def do_update_deps():
-        if missing_packages:
+        if missing_packages and not torch_upgrade and not full_sync:
             print(L(f"只安装缺失的 {len(missing_packages)} 个包...",
                     f"Installing only the {len(missing_packages)} missing package(s)..."))
             return update_dependencies_selective(args, missing_packages)
-        return update_dependencies(args)
+        return update_dependencies(args, select_cuda_variant=torch_upgrade)
 
     if not run_deps_with_retry(do_update_deps, "更新", "Update"):
         print(L("[错误] 依赖更新失败，未完成本次更新",
                 "[ERROR] Dependency update failed; this update was not completed"))
+        return False
+
+    if not cleanup_runtime_dependencies(req_file):
         return False
 
     cleanup_caches()
@@ -2863,6 +2975,14 @@ def update_runtime_dependencies(args, req_file, missing_packages):
     print(L("[完成] 更新完成", "[DONE] Update complete"))
     print("=" * 40)
     return True
+
+
+def cleanup_runtime_dependencies(req_file):
+    """Apply removals that a missing-dependency check cannot discover."""
+    if cleanup_stale_torchaudio(req_file):
+        return True
+    print(L("[错误] 依赖清理失败，更新未完成", "[ERROR] Dependency cleanup failed; update incomplete"))
+    return False
 
 
 def resume_updated_code(args, action):
@@ -2874,14 +2994,14 @@ def resume_updated_code(args, action):
 
     print(L('已加载更新后的代码，重新检查依赖。',
             'Updated code loaded; re-checking dependencies.'))
-    code_needs_update, _, _, _, req_file, _ = check_all_updates()
+    code_needs_update, _, _, _, req_file, missing_packages = check_all_updates()
     if code_needs_update:
         print(L('[错误] 代码在重启后仍未与远程同步，已停止依赖更新',
                 '[ERROR] Code is still not synchronized after restart; dependency update stopped'))
         return False
     # Code updates may remove dependencies without creating a "missing package".
     # Always run the full preparation path so managed environments are synced.
-    return update_runtime_dependencies(args, req_file, [])
+    return update_runtime_dependencies(args, req_file, missing_packages, full_sync=True)
 
 
 def run_install(args):
@@ -2929,11 +3049,16 @@ def run_install(args):
 def run_full_update(args, automatic=False):
     """更新代码和依赖；桌面端自动更新时跳过二次确认。"""
     code_needs_update, deps_needs_update, _, _, req_file, missing_packages = check_all_updates()
-
-    print()
     if not code_needs_update and not deps_needs_update:
-        print(L("[信息] 代码和依赖都已是最新，无需更新", "[INFO] Code and dependencies are up to date"))
+        if not cleanup_runtime_dependencies(req_file):
+            return False
+        print()
+        print(L("[信息] 代码和依赖都已是最新，已完成残留依赖清理",
+                "[INFO] Code and dependencies are current; stale dependencies were cleaned"))
         return True
+
+
+
 
     print()
     if not automatic:

@@ -24,7 +24,7 @@ The current source of dependency truth is `pyproject.toml` and `uv.lock`. `requi
 | Disk | 5 GB free space | 10 GB SSD |
 | Python (source) | 3.12 (`>=3.12,<3.13`) | 3.12 |
 | NVIDIA GPU | GTX 1060 or newer with 6 GB VRAM; GeForce 10-series GPUs must use CUDA 12.6, while CUDA 13.0 requires Turing (compute capability 7.5) or newer | More VRAM is better |
-> GeForce 10-series GPUs such as the GTX 1060/1070/1080 must use the CUDA 12.6 package even when a newer driver reports CUDA 13 support. RTX 20/30/40/50-series GPUs may use CUDA 13.0 when the driver supports it; CUDA 13.0 is recommended for RTX 50-series GPUs.
+> GeForce 10-series GPUs must use CUDA 12.6. RTX 50-series GPUs require CUDA 13.0. If the current driver does not support it, update the NVIDIA driver first.
 | AMD GPU | RX 7000/9000 series only (RDNA 3/4); ROCm is experimental. Use the CPU build on RX 5000/6000 | — |
 
 > Windows AMD users can choose the experimental AMD portable release or install through the maintenance script. Both require a supported GPU, Radeon ROCm 7.2.1, and AMD driver 26.2.2; this remains an experimental Windows path.
@@ -85,7 +85,7 @@ Installation and models are separate stages. `manga_translator/utils/inference.p
 ## Environment and compatibility
 
 - **CPU**: no CUDA/ROCm; broadly compatible, but speed is limited by CPU and memory.
-- **NVIDIA GPU**: the current group contains `torch==2.13.0`, `torchvision==0.28.0`, `onnxruntime-gpu==1.28.0`, and `xformers==0.0.35`; the driver must support the CUDA runtime.
+- **NVIDIA GPU**: the CUDA 13.0 group uses `onnxruntime-gpu==1.28.0`; the CUDA 12.6 group uses `onnxruntime-gpu==1.26.0` because PyPI switched the default GPU package to CUDA 13 starting with ONNX Runtime 1.27. Each group matches its CUDA-specific PyTorch and xformers packages; the driver must support that CUDA version.
 - **AMD ROCm**: Linux x86_64 uses `pytorch-rocm72`; Windows AMD uses the installer to install the Radeon ROCm SDK and matching PyTorch wheels in two stages. This path is experimental.
 - **Metal**: Apple Silicon uses PyTorch/MPS from PyPI and does not install CUDA, `onnxruntime-gpu`, or `xformers`.
 

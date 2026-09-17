@@ -39,6 +39,7 @@ lastUpdated: true
 
 修复：安装 Python 3.12 后重新执行 `uv sync`；不要用 Python 3.13+ 解释器复用旧的 `.venv`。
 
+
 ### 依赖安装失败与镜像回退 {#dependency-install}
 
 安装器先使用项目声明的依赖源，失败后按 `packaging/launch.py` 的镜像列表逐个回退：普通包依次尝试清华、阿里、豆瓣与官方 PyPI 镜像，PyTorch 相关包按 `PYTORCH_INDEX_FALLBACKS`/`PYTORCH_INDEX_PRIORITY` 尝试镜像或官方源。所有源都失败时安装器抛出“所有镜像源均失败”并停止；已安装成功的包会保留，可从失败包继续重试。

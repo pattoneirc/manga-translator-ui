@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from PyQt6.QtCore import QEvent, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPalette
 from PyQt6.QtWidgets import (
-    QAbstractSpinBox,
     QApplication,
     QGridLayout,
     QHBoxLayout,
@@ -23,12 +22,12 @@ from PyQt6.QtWidgets import (
 )
 from qfluentwidgets import (
     CaptionLabel,
-    CompactDoubleSpinBox,
-    CompactSpinBox,
+    DoubleSpinBox,
     LineEdit,
     PushButton,
     ScrollArea,
     SimpleCardWidget,
+    SpinBox,
     TextEdit,
     TogglePushButton,
     ToolButton,
@@ -99,6 +98,11 @@ STYLE_SPECS: dict[str, StyleSpec] = {
     "XY": StyleSpec(
         "Offset", "X / Y Offset", {"transform": {"offsetX": 0.0, "offsetY": 0.0}}
     ),
+    "WH": StyleSpec(
+        "Stretch",
+        "Width / Height Stretch",
+        {"transform": {"scaleX": 1.2, "scaleY": 1.2}},
+    ),
     "M": StyleSpec(
         "Mirror Horizontal", "Mirror Horizontal", {"transform": {"mirrorX": True}}
     ),
@@ -117,11 +121,19 @@ _EFFECT_SPECS = {
 }
 
 
-def default_style_patch(key: str) -> dict:
+def default_style_patch(key: str, *, region_font_size: object = None) -> dict:
     if key == "F":
         return {"fontFamily": QFont().family()}
     spec = STYLE_SPECS.get(key)
-    return copy.deepcopy(spec.default_patch) if spec else {}
+    patch = copy.deepcopy(spec.default_patch) if spec else {}
+    if key == "S" and region_font_size is not None:
+        try:
+            font_size = int(region_font_size)
+        except (TypeError, ValueError):
+            font_size = 0
+        if font_size > 0:
+            patch["fontSize"] = font_size
+    return patch
 
 
 def clear_style_patch(key: str) -> dict:
@@ -175,24 +187,26 @@ class RichTextBodyEdit(TextEdit):
 
 
 def _double_spin_box(
-    value: float, minimum: float, maximum: float, decimals: int = 2
-) -> CompactDoubleSpinBox:
-    control = CompactDoubleSpinBox()
-    control.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
+    value: float,
+    minimum: float,
+    maximum: float,
+    decimals: int = 2,
+    step: float | None = None,
+) -> DoubleSpinBox:
+    control = DoubleSpinBox()
     control.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
     control.setRange(minimum, maximum)
     control.setDecimals(decimals)
-    # 步进跟随精度：两位小数的量（缩放/字距/描边宽度）按 0.05 微调，
-    # 一位小数的量（角度/像素偏移)按 1 步进。
-    control.setSingleStep(0.05 if decimals >= 2 else 1.0)
+    control.setSingleStep(
+        step if step is not None else (0.05 if decimals >= 2 else 1.0)
+    )
     control.setAccelerated(True)
     control.setValue(float(value))
     return control
 
 
-def _spin_box(value: int, minimum: int, maximum: int) -> CompactSpinBox:
-    control = CompactSpinBox()
-    control.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
+def _spin_box(value: int, minimum: int, maximum: int) -> SpinBox:
+    control = SpinBox()
     control.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
     control.setRange(minimum, maximum)
     control.setAccelerated(True)
@@ -490,6 +504,7 @@ def style_keys_for_segment(
         "LK": "lineKerning" in style,
         "NK": "nextKerning" in style,
         "XY": "offsetX" in transform or "offsetY" in transform,
+        "WH": "scaleX" in transform or "scaleY" in transform,
         "M": bool(transform.get("mirrorX")),
         "MV": bool(transform.get("mirrorY")),
     }
@@ -823,7 +838,10 @@ class StyleRunCard(SimpleCardWidget):
                 values.get("color", color_default),
                 f"saved_{source}_colors",
             )
-            number = _double_spin_box(values.get(number_key, number_default), 0.0, 5.0)
+            number = _double_spin_box(
+                values.get(number_key, number_default), 0.0, 5.0, step=0.01
+            )
+            number.setSymbolVisible(False)
             color.color_changed.connect(
                 lambda value, field=source: self._emit_patch(
                     key, {field: {"color": value}}
@@ -920,6 +938,10 @@ class StyleRunCard(SimpleCardWidget):
             y_control = _double_spin_box(
                 transform.get("offsetY", 0.0), -500.0, 500.0, 1
             )
+            # Paired fields are intentionally wheel/text driven: Fluent's two
+            # 31 px arrow buttons otherwise leave too little room for values.
+            x_control.setSymbolVisible(False)
+            y_control.setSymbolVisible(False)
             x_control.setSuffix("%")
             y_control.setSuffix("%")
             x_control.valueChanged.connect(
@@ -945,6 +967,38 @@ class StyleRunCard(SimpleCardWidget):
                 y_control.setValue,
             )
             return self._pair(x_control, y_control, "X", "Y")
+        if key == "WH":
+            width_control = _double_spin_box(transform.get("scaleX", 1.0), 0.1, 10.0, 2)
+            height_control = _double_spin_box(
+                transform.get("scaleY", 1.0), 0.1, 10.0, 2
+            )
+            width_control.setSymbolVisible(False)
+            height_control.setSymbolVisible(False)
+            width_control.valueChanged.connect(
+                lambda value: self._emit_patch(
+                    key, {"transform": {"scaleX": float(value)}}
+                )
+            )
+            height_control.valueChanged.connect(
+                lambda value: self._emit_patch(
+                    key, {"transform": {"scaleY": float(value)}}
+                )
+            )
+            self._register_applier(
+                key,
+                width_control,
+                lambda s, t, *_: float(t.get("scaleX", 1.0)),
+                width_control.setValue,
+            )
+            self._register_applier(
+                key,
+                height_control,
+                lambda s, t, *_: float(t.get("scaleY", 1.0)),
+                height_control.setValue,
+            )
+            return self._pair(
+                width_control, height_control, _tr("Width"), _tr("Height")
+            )
         return None
 
     def _color_picker(

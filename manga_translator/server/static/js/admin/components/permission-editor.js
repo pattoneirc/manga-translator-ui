@@ -476,6 +476,7 @@ class PermissionEditor {
                 ${this.createFormRow(this.t('label_overwrite', '覆盖已有文件'), this.createCheckbox('cli', 'overwrite'), '', 'cli', 'overwrite')}
                 ${this.createFormRow(this.t('label_skip_no_text', '跳过无文本图片'), this.createCheckbox('cli', 'skip_no_text'), '', 'cli', 'skip_no_text')}
                 ${this.createFormRow(this.t('label_save_text', '保存文本'), this.createCheckbox('cli', 'save_text'), '', 'cli', 'save_text')}
+                ${this.createFormRow(this.t('label_export_from_local_json', '仅从本地 JSON 导出文本'), this.createCheckbox('cli', 'export_from_local_json'), this.t('desc_cli_export_from_local_json', '导出翻译或原文时只读取本地工程 JSON，不执行检测、OCR、API 翻译或 JSON 回写'), 'cli', 'export_from_local_json')}
             </div>
             <div class="form-section">
                 <h3>${this.t('Processing Settings', '处理设置')}</h3>
@@ -566,6 +567,7 @@ class PermissionEditor {
                 ${this.createFormRow(this.t('label_optimize_line_breaks', 'AI断句自动扩大文字'), this.createCheckbox('render', 'optimize_line_breaks'), '自动优化换行以找到最佳字体大小', 'render', 'optimize_line_breaks')}
                 ${this.createFormRow(this.t('label_check_br_and_retry', 'AI断句检查'), this.createCheckbox('render', 'check_br_and_retry'), '检查翻译是否包含换行标记并重试', 'render', 'check_br_and_retry')}
                 ${this.createFormRow(this.t('label_strict_smart_scaling', 'AI断句自动扩大文字下不扩大文本框'), this.createCheckbox('render', 'strict_smart_scaling'), '智能缩放模式下防止文本框扩展', 'render', 'strict_smart_scaling')}
+                ${this.createFormRow(this.t('label_balloon_fill_mask_layout', '气泡蒙版排版'), this.createCheckbox('render', 'balloon_fill_mask_layout'), this.t('desc_render_balloon_fill_mask_layout', '无显式断行时按气泡蒙版最大内接范围自动断句；有显式断行时保留断点，以文本框中心为锚点并扩大字号搜索范围；后续文字框与已有文字框重叠时，缩小到最大不重叠字号。默认关闭。'), 'render', 'balloon_fill_mask_layout')}
             </div>
         `;
     }

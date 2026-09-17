@@ -28,6 +28,7 @@ The “Inpainting Model” combo box is on the Settings → Inpainting tab and d
 - `default`: default inpainting approach.
 - `lama_large`: best quality and recommended.
 - `lama_mpe`: faster.
+- `flux2-klein`: uses the FLUX.2 Klein 4B image inpainting model; quality is higher but it needs substantially more VRAM and is slower. The first use downloads several gigabytes of model files.
 - `sd`: optional inpainting approach.
 - `none`: runs no model and fills the masked area white.
 - `original`: returns the original image and keeps the source text.
@@ -54,7 +55,7 @@ Defaults: Keep Dilation Inside Bubble Mask `true`; Expand Bubble Repair Range `f
 
 ### Solid Fill Pure Bubbles
 
-When enabled, near-solid backgrounds inside bubbles are filled directly and removed from the pending inpainting mask instead of going to the inpainting model; the optimization is skipped when bubble detection fails. Default: `false`.
+When enabled, the bubble mask identifies text-matched bubbles with near-solid backgrounds, but direct background-color filling is limited to the intersection of the refined repair mask and the bubble mask. Filled pixels are removed from the pending inpainting mask; bubble detection failure or an empty intersection skips this optimization. Default: `false`.
 
 ### Per-Block Inpainting
 

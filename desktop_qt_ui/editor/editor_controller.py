@@ -6,7 +6,7 @@ from typing import Optional
 
 import numpy as np
 from PIL import Image
-from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, Qt, pyqtSignal, pyqtSlot
 
 from editor.commands import _NO_MASK_CHANGE, MoveRegionCommand, UpdateRegionCommand
 from editor.geometry_commit_pipeline import build_rotate_region_data
@@ -25,12 +25,14 @@ from services import (
 )
 
 from .controller_document_service import EditorControllerDocumentService
-from .controller_export_service import EditorControllerExportService, ExportOutcome
+from .controller_export_service import (
+    EditorControllerExportService,
+    ExportOutcome,
+)
 from .controller_inpaint_service import EditorControllerInpaintService
 from .editor_model import EditorModel
-from .image_utils import copy_image_like, image_like_to_display_array
+from .image_utils import image_like_to_display_array
 from .render_text_value import has_renderable_text, render_text_value_from_region
-from .session import DocumentSnapshot
 
 _UNSET = object()
 
@@ -188,12 +190,12 @@ class EditorController(QObject):
     _regions_update_finished = pyqtSignal(object)
     _ocr_finished = pyqtSignal(str, str)
     _translation_finished = pyqtSignal(str, str)
+    _inpaint_result_ready = pyqtSignal(object)
 
     # Export queue worker -> GUI thread signals
     _export_queue_status_signal = pyqtSignal(object)
     _export_job_finished_signal = pyqtSignal(object)
 
-    # Signal for thread-safe image loading
     _load_result_ready = pyqtSignal(object)  # 加载结果信号
     _deferred_load_requested = pyqtSignal(str)
 
@@ -212,19 +214,6 @@ class EditorController(QObject):
         self.config_service = get_config_service()
         self.resource_manager = get_resource_manager()  # 新的资源管理器
 
-        # 缓存键常量
-        self.CACHE_LAST_INPAINTED = "last_inpainted_image"
-        self.CACHE_LAST_MASK = "last_processed_mask"
-        self.WEAK_CACHE_BASE_IMAGE_RGB = "weak_base_image_rgb"
-
-        # 用户透明度调整标志
-        self._user_adjusted_alpha = False
-
-        # 只允许最新一笔/最新一次蒙版变更写回修复结果。
-        self._active_inpaint_future = None
-        self._inpaint_request_generation = 0
-        self._suppress_refined_mask_autoinpaint = False
-
         self.document_service = EditorControllerDocumentService(self)
         self.inpaint_service = EditorControllerInpaintService(self)
         self.export_service = EditorControllerExportService(self)
@@ -236,12 +225,18 @@ class EditorController(QObject):
         self._regions_update_finished.connect(self.on_regions_update_finished)
         self._ocr_finished.connect(self._on_ocr_finished)
         self._translation_finished.connect(self._on_translation_finished)
+        self._inpaint_result_ready.connect(
+            self._apply_inpaint_result,
+            type=Qt.ConnectionType.QueuedConnection,
+        )
         self._load_result_ready.connect(self._apply_load_result)  # 连接加载结果信号
         self._deferred_load_requested.connect(self.document_service.do_load_image)
         self._export_queue_status_signal.connect(self._on_export_queue_status_changed)
         self._export_job_finished_signal.connect(self._on_export_job_finished)
 
-        self._connect_model_signals()
+        self.model.effective_mask_delta_changed.connect(
+            self.inpaint_service.on_effective_mask_delta_changed
+        )
         self.history_service.undo_redo_state_changed.connect(
             self._on_history_undo_redo_state_changed
         )
@@ -261,44 +256,6 @@ class EditorController(QObject):
 
     # ========== Resource Access Helpers (新的资源访问辅助方法) ==========
 
-    def _get_current_image(self) -> Optional[Image.Image]:
-        """获取当前图片（PIL Image）
-
-        优先从 Session/Model 获取，如果失败再回退到 ResourceManager。
-        """
-        image = self.model.get_image()
-        if image is not None:
-            return image
-        resource = self.resource_manager.get_current_image()
-        if resource:
-            return resource.image
-        return None
-
-    @staticmethod
-    def _normalize_binary_mask(mask: Optional[np.ndarray]) -> Optional[np.ndarray]:
-        return EditorControllerInpaintService.normalize_binary_mask(mask)
-
-    def _get_cached_mask_snapshot(self) -> Optional[np.ndarray]:
-        return self.inpaint_service.get_cached_mask_snapshot()
-
-    def _get_cached_inpainted_snapshot(self) -> Optional[np.ndarray]:
-        return self.inpaint_service.get_cached_inpainted_snapshot()
-
-    def _get_base_image_rgb_array(self) -> Optional[np.ndarray]:
-        return self.inpaint_service.get_base_image_rgb_array()
-
-    def _cancel_active_inpaint_task(self) -> None:
-        self.inpaint_service.cancel_active_inpaint_task()
-
-    def _invalidate_inpaint_requests(self) -> None:
-        self.inpaint_service.invalidate_inpaint_requests()
-
-    def _begin_inpaint_request(self) -> int:
-        return self.inpaint_service.begin_inpaint_request()
-
-    def _is_inpaint_request_current(self, generation: int) -> bool:
-        return self.inpaint_service.is_inpaint_request_current(generation)
-
     @staticmethod
     def _normalize_image_path(path: Optional[str]) -> Optional[str]:
         if not path:
@@ -310,26 +267,18 @@ class EditorController(QObject):
         right_path = self._normalize_image_path(right)
         return bool(left_path and right_path and left_path == right_path)
 
-    def _snapshot_image_for_export(self, image_obj, label: str):
-        """为导出创建独立快照，避免切图时原图/数组被后续编辑覆盖。"""
-        if image_obj is None:
-            return None
-        try:
-            return copy_image_like(image_obj)
-        except Exception as e:
-            self.logger.error(
-                f"Failed to snapshot {label} for export: {e}", exc_info=True
-            )
-            raise
-
     def _load_detached_image_array(
-        self, image_path: str, target_size: tuple[int, int]
+        self,
+        image_path: str,
+        target_size: tuple[int, int],
+        *,
+        resize: bool = True,
     ) -> np.ndarray:
         """加载辅助图并直接归一化为 numpy，避免 PIL/ndarray 双持有。"""
         detached_image = self.resource_manager.load_detached_image(image_path)
         resized_image = detached_image
         try:
-            if detached_image.size != target_size:
+            if resize and detached_image.size != target_size:
                 resized_image = detached_image.resize(
                     target_size, Image.Resampling.LANCZOS
                 )
@@ -350,28 +299,6 @@ class EditorController(QObject):
             self.resource_manager.log_memory_snapshot(stage, logger=self.logger)
         except Exception as e:
             self.logger.debug(f"Failed to log memory snapshot at {stage}: {e}")
-
-    def _get_regions(self):
-        """获取所有区域
-
-        Returns:
-            List[Dict]: 区域列表
-        """
-        return self.model.get_regions()
-
-    def _get_region_by_index(self, index: int):
-        """根据索引获取区域
-
-        Args:
-            index: 区域索引
-
-        Returns:
-            Dict: 区域数据，如果不存在返回None
-        """
-        regions = self._get_regions()
-        if 0 <= index < len(regions):
-            return regions[index]
-        return None
 
     def _merge_live_geometry_state(self, region_index: int, region_data: dict) -> dict:
         """为样式类更新保留当前 item 的合法持久化几何状态。"""
@@ -554,9 +481,9 @@ class EditorController(QObject):
             return
 
         message = (
-            "正在导出..."
+            "正在处理后台任务..."
             if unfinished_count == 1
-            else f"正在导出（{unfinished_count} 个任务）"
+            else f"正在处理后台任务（{unfinished_count} 个）"
         )
         if message == self._export_status_text:
             return
@@ -574,6 +501,8 @@ class EditorController(QObject):
         toast_manager = self.get_toast_manager()
         file_name = os.path.basename(outcome.source_path)
         if outcome.success:
+            if outcome.generated_artifact is not None:
+                self.model.install_inpaint_artifact(outcome.generated_artifact)
             if not outcome.automatic and toast_manager is not None:
                 toast_manager.show_success(
                     f"导出成功\n{outcome.output_path}",
@@ -595,13 +524,10 @@ class EditorController(QObject):
                 7000,
             )
 
-    def _connect_model_signals(self):
-        """监听模型的变化，可能需要触发一些后续逻辑"""
-        # 监听蒙版编辑后触发 inpainting
-        self.model.refined_mask_changed.connect(self.on_refined_mask_changed)
 
-    def on_refined_mask_changed(self, mask):
-        self.inpaint_service.on_refined_mask_changed(mask)
+    @pyqtSlot(object)
+    def _apply_inpaint_result(self, result) -> None:
+        self.inpaint_service.apply_inpaint_result(result)
 
     @pyqtSlot(dict)
     def update_multiple_translations(self, translations: dict):
@@ -731,64 +657,9 @@ class EditorController(QObject):
             self.logger.warning(f"auto rich text rules failed: {e}")
             return None
 
-    def _clear_editor_state(self, release_image_cache: bool = False):
-        self.document_service.clear_editor_state(
-            release_image_cache=release_image_cache
-        )
-
-    def _find_source_from_translation_map(self, image_path: str) -> Optional[str]:
-        return self.document_service.find_source_from_translation_map(image_path)
-
-    def _resolve_editor_image_paths(self, image_path: str) -> tuple[str, str]:
-        return self.document_service.resolve_editor_image_paths(image_path)
-
-    def load_image_and_regions(self, image_path: str):
-        self.document_service.load_image_and_regions(image_path)
-
-    def _do_load_image(self, image_path: str):
-        self.document_service.do_load_image(image_path)
-
     @pyqtSlot(object)
     def _apply_load_result(self, result: object):
         self.document_service.apply_load_result(result)
-
-    def _apply_loaded_data_to_model(self, snapshot: DocumentSnapshot):
-        self.document_service.apply_loaded_data_to_model(snapshot)
-
-    def _handle_load_error(self, error_msg: str):
-        self.document_service.handle_load_error(error_msg)
-
-    async def _async_refine_and_inpaint(self):
-        return await self.inpaint_service.async_refine_and_inpaint()
-
-    async def _async_incremental_inpaint(self, current_mask, generation: int):
-        return await self.inpaint_service.async_incremental_inpaint(
-            current_mask, generation
-        )
-
-    async def _async_full_inpaint_with_cache(self, mask, generation: int):
-        return await self.inpaint_service.async_full_inpaint_with_cache(
-            mask, generation
-        )
-
-    def force_inpaint_stroke(self, stroke_mask: np.ndarray):
-        self.inpaint_service.force_inpaint_stroke(stroke_mask)
-
-    @pyqtSlot(str, bool)
-    def set_display_mask_type(self, mask_type: str, visible: bool):
-        self.inpaint_service.set_display_mask_type(mask_type, visible)
-
-    @pyqtSlot(str)
-    def set_active_tool(self, tool: str):
-        self.inpaint_service.set_active_tool(tool)
-
-    @pyqtSlot(int)
-    def set_brush_size(self, size: int):
-        self.inpaint_service.set_brush_size(size)
-
-    @pyqtSlot(str)
-    def set_brush_color(self, color: str):
-        self.inpaint_service.set_brush_color(color)
 
     @pyqtSlot()
     def clear_all_masks(self):
@@ -838,7 +709,7 @@ class EditorController(QObject):
         merge_live_geometry: bool = True,
         current_value=_UNSET,
     ) -> bool:
-        old_region_data = self._get_region_by_index(region_index)
+        old_region_data = self.model.get_region_by_index(region_index)
         if not old_region_data:
             return False
 
@@ -931,7 +802,7 @@ class EditorController(QObject):
     @pyqtSlot(int, str, object)
     def update_translated_text(self, region_index: int, text: str, edit_info=None):
         # 译文编辑:同步覆盖 translation_raw(规则不可逆,只能粗暴同步)
-        old_region_data = self._get_region_by_index(region_index)
+        old_region_data = self.model.get_region_by_index(region_index)
         if not old_region_data:
             return
         new_rich = self._sync_rich_for_plain_edit(
@@ -962,7 +833,7 @@ class EditorController(QObject):
     @pyqtSlot(int, str, object)
     def update_translation_raw(self, region_index: int, raw_text: str, edit_info=None):
         """编辑替换前译文:实时跑 apply_replacements 同步到 translation 字段。"""
-        old_region_data = self._get_region_by_index(region_index)
+        old_region_data = self.model.get_region_by_index(region_index)
         if not old_region_data:
             return
 
@@ -986,7 +857,7 @@ class EditorController(QObject):
     def update_translation_rich(
         self, region_index: int, rich_document, plain_text: str
     ):
-        old_region_data = self._get_region_by_index(region_index)
+        old_region_data = self.model.get_region_by_index(region_index)
         if not old_region_data:
             return
 
@@ -1032,7 +903,7 @@ class EditorController(QObject):
         translation_rich: Optional[dict] = None,
     ) -> bool:
         """同时更新 translation 和 translation_raw,共用一个 Undo Command(撤销时一起回滚)。"""
-        old_region_data = self._get_region_by_index(region_index)
+        old_region_data = self.model.get_region_by_index(region_index)
         if not old_region_data:
             return False
 
@@ -1120,7 +991,7 @@ class EditorController(QObject):
 
     @pyqtSlot(int, float)
     def update_line_spacing(self, region_index: int, value: float):
-        old_region_data = self._get_region_by_index(region_index)
+        old_region_data = self.model.get_region_by_index(region_index)
         if not old_region_data:
             return
         current_value = old_region_data.get("line_spacing")
@@ -1136,7 +1007,7 @@ class EditorController(QObject):
 
     @pyqtSlot(int, float)
     def update_letter_spacing(self, region_index: int, value: float):
-        old_region_data = self._get_region_by_index(region_index)
+        old_region_data = self.model.get_region_by_index(region_index)
         if not old_region_data:
             return
         current_value = old_region_data.get("letter_spacing")
@@ -1199,7 +1070,7 @@ class EditorController(QObject):
 
     @pyqtSlot(int, float)
     def update_angle(self, region_index: int, value: float):
-        old_region_data = self._get_region_by_index(region_index)
+        old_region_data = self.model.get_region_by_index(region_index)
         if not old_region_data:
             return
 
@@ -1240,7 +1111,7 @@ class EditorController(QObject):
         """处理来自视图的区域几何变化。"""
         # 现在RegionTextItem在调用callback之前不会修改self.region_data
         # 所以我们可以从模型中获取正确的旧数据
-        old_region_data = self._get_region_by_index(region_index)
+        old_region_data = self.model.get_region_by_index(region_index)
         if not old_region_data:
             return
 
@@ -1564,6 +1435,128 @@ class EditorController(QObject):
         self.history_service.redo()
         self._update_undo_redo_buttons()
 
+    # --- 贴片（paste overlay）操作方法 ---
+    def _normalize_paste_overlays(self, overlays) -> list:
+        """贴片列表规范化（统一补默认值/id），保证 undo/redo 快照 id 稳定。"""
+        from editor.paste_overlay_state import serialize_paste_overlays
+
+        return serialize_paste_overlays(overlays or [])
+
+    def add_paste_overlay(self, overlay: dict) -> bool:
+        """新增一个贴片（支持撤销）。overlay 可为未规范化字典。"""
+        from editor.commands import PasteOverlaysReplaceCommand
+
+        if self.model.get_source_image_path() is None:
+            return False
+        before = self.model.get_paste_overlays()
+        after = self._normalize_paste_overlays(before + [overlay])
+        if after == before:
+            return False
+        self.execute_command(
+            PasteOverlaysReplaceCommand(
+                self.model, before, after, description="Add Paste Overlay"
+            )
+        )
+        return True
+
+    def update_paste_overlay(self, overlay_id: str, patch: dict) -> bool:
+        """按 id 更新一个贴片（patch 按字段合并，支持撤销）。"""
+        from editor.commands import PasteOverlaysReplaceCommand
+
+        if self.model.get_source_image_path() is None:
+            return False
+        before = self.model.get_paste_overlays()
+        after = copy.deepcopy(before)
+        for item in after:
+            if item.get("id") == overlay_id:
+                item.update(copy.deepcopy(patch))
+                break
+        else:
+            return False
+        after = self._normalize_paste_overlays(after)
+        if after == before:
+            return False
+        self.execute_command(
+            PasteOverlaysReplaceCommand(
+                self.model, before, after, description="Update Paste Overlay"
+            )
+        )
+        return True
+
+    def remove_paste_overlay(self, overlay_id: str) -> bool:
+        """按 id 删除一个贴片（支持撤销）。"""
+        from editor.commands import PasteOverlaysReplaceCommand
+
+        if self.model.get_source_image_path() is None:
+            return False
+        before = self.model.get_paste_overlays()
+        after = [item for item in before if item.get("id") != overlay_id]
+        if len(after) == len(before):
+            return False
+        self.execute_command(
+            PasteOverlaysReplaceCommand(
+                self.model, before, after, description="Remove Paste Overlay"
+            )
+        )
+        return True
+
+    def replace_paste_overlays(self, overlays: list) -> bool:
+        """整表替换贴片列表（用于拖放导入、z 序调整等，支持撤销）。"""
+        from editor.commands import PasteOverlaysReplaceCommand
+
+        if self.model.get_source_image_path() is None:
+            return False
+        before = self.model.get_paste_overlays()
+        after = self._normalize_paste_overlays(overlays)
+        if after == before:
+            return False
+        self.execute_command(
+            PasteOverlaysReplaceCommand(
+                self.model, before, after, description="Replace Paste Overlays"
+            )
+        )
+        return True
+
+    def copy_paste_overlay(self, overlay_id: str) -> bool:
+        """复制贴片到贴片剪贴板。"""
+        if self.model.get_source_image_path() is None:
+            return False
+        for overlay in self.model.get_paste_overlays():
+            if overlay.get("id") == overlay_id:
+                self._paste_overlay_clipboard = copy.deepcopy(overlay)
+                self._last_clipboard_kind = "paste_overlay"
+                return True
+        return False
+
+    def last_clipboard_kind(self) -> str | None:
+        """返回最近一次复制的对象类型 ('paste_overlay' | 'region' | None)。"""
+        return getattr(self, "_last_clipboard_kind", None)
+
+    def paste_overlay_clipboard_available(self) -> bool:
+        return bool(getattr(self, "_paste_overlay_clipboard", None))
+
+    def paste_paste_overlay(self, center: tuple[float, float] | None = None) -> bool:
+        """粘贴贴片：无 center 时相对原位置偏移 (+20,+20)，有则落在 center。"""
+        clipboard = getattr(self, "_paste_overlay_clipboard", None)
+        if clipboard is None or self.model.get_source_image_path() is None:
+            return False
+        clone = copy.deepcopy(clipboard)
+        clone.pop("id", None)  # 重新生成 id，避免与源重复
+        if center is not None:
+            center_x = center.x() if hasattr(center, "x") else center[0]
+            center_y = center.y() if hasattr(center, "y") else center[1]
+            clone["center_x"], clone["center_y"] = float(center_x), float(center_y)
+        else:
+            clone["center_x"] = float(clone.get("center_x", 0.0)) + 20.0
+            clone["center_y"] = float(clone.get("center_y", 0.0)) + 20.0
+        return self.add_paste_overlay(clone)
+
+    def duplicate_paste_overlay(self, overlay_id: str) -> bool:
+        """原地复制一份贴片（偏移 +20, +20），便于快捷键/右键复制副本。"""
+        if not self.copy_paste_overlay(overlay_id):
+            return False
+        return self.paste_paste_overlay()
+
     # --- 右键菜单相关方法 ---
     def ocr_regions(self, region_indices: list):
         """对指定区域进行OCR识别，使用与UI按钮相同的逻辑"""
@@ -1608,6 +1601,7 @@ class EditorController(QObject):
 
         # 将区域数据保存到历史服务的剪贴板
         self.history_service.copy_to_clipboard(copy.deepcopy(region_data))
+        self._last_clipboard_kind = "region"
 
     def paste_region_style(self, region_index: int):
         """将复制的样式粘贴到指定区域"""
@@ -1873,13 +1867,8 @@ class EditorController(QObject):
 
     @pyqtSlot(int)
     def set_original_image_alpha(self, alpha: int):
-        """设置原图的不透明度 (0-100)，值越大越不透明（越显示原图）"""
-        # slider = 0 -> alpha = 0.0（完全透明，显示inpainted）
-        # slider = 100 -> alpha = 1.0（完全不透明，显示原图）
-        alpha_float = alpha / 100.0
-        self.model.set_original_image_alpha(alpha_float)
-        # 标记用户已手动调整透明度
-        self._user_adjusted_alpha = True
+        """将工具栏百分比记录为会话级用户透明度。"""
+        self.model.set_original_image_alpha_override(alpha / 100.0)
 
     def handle_global_render_setting_change(self):
         """Forces a re-render of all regions when a global render setting has changed."""
@@ -1898,7 +1887,7 @@ class EditorController(QObject):
         selected_indices = self.model.get_selection()
         if not selected_indices:
             return
-        image = self._get_current_image()
+        image = self.model.get_image()
         if not image:
             return
 
@@ -2081,7 +2070,7 @@ class EditorController(QObject):
         selected_indices = self.model.get_selection()
         if not selected_indices:
             return
-        image = self._get_current_image()
+        image = self.model.get_image()
         if not image:
             return
 
