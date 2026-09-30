@@ -48,7 +48,8 @@ async def dispatch(detector_key: Detector, image: np.ndarray, detect_size: int, 
                    device: str = 'cpu', verbose: bool = False,
                    use_yolo_obb: bool = False, yolo_obb_conf: float = 0.4, yolo_obb_overlap_threshold: float = 0.1, min_box_area_ratio: float = 0.0009,
                    result_path_fn=None, det_rearrange_min_effective_short_side: float = 341.0,
-                   use_sfx_filter: bool = False, sfx_filter_include_bubble_text: bool = False):
+                   use_sfx_filter: bool = False, sfx_filter_include_bubble_text: bool = False,
+                   bubble_mask: Optional[np.ndarray] = None):
     """
     检测调度函数，支持混合检测模式
     
@@ -101,23 +102,22 @@ async def dispatch(detector_key: Detector, image: np.ndarray, detect_size: int, 
             use_sfx_filter=use_sfx_filter,
             sfx_filter_include_bubble_text=sfx_filter_include_bubble_text,
             image=image,
+            bubble_mask=bubble_mask,
         )
         
         replaced_count = len(main_textlines) + len(yolo_textlines) - len(combined_textlines)
-        detector.logger.info(f"混合检测: 主检测器={len(main_textlines)}, YOLO OBB={len(yolo_textlines)}, "
-                           f"替换/移除={replaced_count}, "
-                           f"总计={len(combined_textlines)}")
+        detector.logger.info(f"Hybrid detection: primary detector={len(main_textlines)}, YOLO OBB={len(yolo_textlines)}, replaced/removed={replaced_count}, total={len(combined_textlines)}")
         
         # 生成调试图片（如果verbose=True）
         debug_img = None
         if verbose:
             debug_img = draw_detection_debug_image(image, main_textlines, yolo_textlines, yolo_obb_overlap_threshold)
-            detector.logger.info("已生成混合检测调试图片")
+            detector.logger.info("Hybrid detection debug image generated")
         
         return combined_textlines, mask, debug_img if debug_img is not None else raw_image
     
     except Exception as e:
-        detector.logger.error(f"YOLO OBB辅助检测失败: {e}")
+        detector.logger.error(f"YOLO OBB auxiliary detection failed: {e}")
         # 失败时返回主检测器结果
         return main_textlines, mask, raw_image
 
@@ -284,6 +284,7 @@ def _get_sfx_filtered_main_indices(
     image: Optional[np.ndarray] = None,
     model_bubble_overlap_threshold: float = 0.1,
     sfx_filter_include_bubble_text: bool = False,
+    bubble_mask: Optional[np.ndarray] = None,
 ) -> set[int]:
     """
     找出缺少 YOLO 支持的主检测框：
@@ -296,8 +297,7 @@ def _get_sfx_filtered_main_indices(
     # 让整页所有主检测框都通过过滤。
     threshold = max(1e-6, min(1.0, float(overlap_threshold)))
     filtered_indices = set()
-    bubble_mask: Optional[np.ndarray] = None
-    bubble_mask_ready = False
+    bubble_mask_ready = bubble_mask is not None
 
     for main_idx, main_box in enumerate(main_boxes):
         main_aabb = _box_aabb(main_box)
@@ -343,6 +343,7 @@ def merge_detection_boxes(
     use_sfx_filter: bool = False,
     image: Optional[np.ndarray] = None,
     sfx_filter_include_bubble_text: bool = False,
+    bubble_mask: Optional[np.ndarray] = None,
 ) -> List[Quadrilateral]:
     """
     合并主检测器和YOLO检测器的框，智能替换逻辑：
@@ -383,6 +384,7 @@ def merge_detection_boxes(
             overlap_threshold,
             image=image,
             sfx_filter_include_bubble_text=sfx_filter_include_bubble_text,
+            bubble_mask=bubble_mask,
         )
         if use_sfx_filter
         else set()

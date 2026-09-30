@@ -65,6 +65,9 @@ from ._vertical_types import (
 )
 
 _HORIZONTAL_SYMBOL_HALFWIDTH_MAP = str.maketrans({"！": "!", "？": "?"})
+# Keep join controls in horizontal strings for QTextLayout shaping. In the
+# per-character vertical path they have neither ink nor a character slot.
+_ZERO_WIDTH_JOIN_CONTROLS = frozenset(("\u200c", "\u200d"))
 # 普通自动旋转字符已移到 rich_text_rules.yaml。四个弯引号与四个日文
 # 角引号保留渲染引擎特殊路径：自动旋转 90°，再做顶右/底左定位。
 _VERTICAL_ROTATE_OPEN_SPECIALS = {"“", "‘", "「", "『"}
@@ -316,7 +319,7 @@ def _normalize_line_spacing(line_spacing: float) -> float:
 
 
 def calc_horizontal_line_spacing_px(font_size: int, line_spacing: float) -> int:
-    """Visible ink gap between adjacent horizontal lines.
+    """Gap between adjacent horizontal lines, excluding stroke and paint effects.
 
     ``line_spacing`` scales a 0.1-em natural gap.  Line boxes themselves are
     content-derived, so this is the only vertical whitespace added by layout.
@@ -659,6 +662,7 @@ def _build_horizontal_ruby_plan(
     ruby_font = max(1, round(run.font_size * RICH_TEXT_POLICY.horizontal_ruby_size))
     ruby_stroke_ratio = _style_stroke_ratio(ruby_style, ruby_font, 0.0, stroke_enabled)
     raw_glyphs = []
+    spacing_heights = []
     glyph_geometries = []
     ruby_shear = _style_italic_shear(ruby_style)
     with _style_font_scope(ruby_style):
@@ -682,6 +686,15 @@ def _build_horizontal_ruby_plan(
                 int(geometry["height"]), int(geometry["width"]), ruby_style, ruby_font
             )
             raw_glyphs.append((int(out_w), int(out_h)))
+            pad = int(geometry["pad"])
+            spacing_h, _, _, _ = _style_layer_effects_geometry(
+                int(geometry["height"]) - 2 * pad,
+                int(geometry["width"]) - 2 * pad,
+                ruby_style,
+                ruby_font,
+                include_paint_effects=False,
+            )
+            spacing_heights.append(int(spacing_h))
 
     visible = [glyph for glyph in raw_glyphs if glyph[0] > 0 and glyph[1] > 0]
     if not visible:
@@ -711,6 +724,7 @@ def _build_horizontal_ruby_plan(
         font_size=ruby_font,
         stroke_ratio=ruby_stroke_ratio,
         glyphs=glyphs,
+        spacing_height=max(spacing_heights),
         paint_start=float(
             math.floor(
                 min(
@@ -743,7 +757,7 @@ def _rich_horizontal_main_rect(
     *,
     include_paint_effects: bool = True,
 ) -> Rect:
-    """Transformed main-ink rectangle relative to run cursor and baseline."""
+    """Transformed paint or unstroked spacing frame relative to the baseline."""
     if not run.has_ink:
         return Rect(0.0, 0.0, 0.0, 0.0)
     span = run.span
@@ -751,6 +765,13 @@ def _rich_horizontal_main_rect(
     top = run.top_rel
     height = run.ink_height
     width = run.ink_width
+    if not include_paint_effects:
+        # 描边只扩展绘制包络；在旋转前还原字形框，避免描边参与行间推进。
+        pad = _stroke_pad_px(run.font_size, run.stroke_ratio)
+        left += pad
+        top += pad
+        height -= 2 * pad
+        width -= 2 * pad
     out_h, out_w, dx, dy = _style_layer_effects_geometry(
         height,
         width,
@@ -823,7 +844,7 @@ def _finalize_rich_horizontal_line(
             if ruby is not None:
                 gap = max(1, round(run.font_size * RICH_TEXT_POLICY.decoration_gap))
                 ruby_height = max(glyph.paint_height for glyph in ruby.glyphs)
-                ruby.cross_center = main_rect.y - gap - ruby_height / 2.0
+                ruby.cross_center = spacing_rect.y - gap - ruby.spacing_height / 2.0
                 paint_rects.append(
                     (
                         cursor + ruby.paint_start,
@@ -835,9 +856,9 @@ def _finalize_rich_horizontal_line(
                 spacing_rects.append(
                     (
                         cursor + ruby.paint_start,
-                        ruby.cross_center - ruby_height / 2.0,
+                        ruby.cross_center - ruby.spacing_height / 2.0,
                         ruby.paint_end - ruby.paint_start,
-                        float(ruby_height),
+                        float(ruby.spacing_height),
                     )
                 )
 
@@ -858,7 +879,7 @@ def _finalize_rich_horizontal_line(
                     tuple(intervals),
                     run.font_size,
                 )
-                top = main_rect.y + main_rect.height + gap
+                top = spacing_rect.y + spacing_rect.height + gap
                 emphasis.cross_center = top + emphasis.frame_size / 2.0
                 run.emphasis = emphasis
                 for main_center in emphasis.main_centers:
@@ -1357,6 +1378,8 @@ def _build_rich_vertical_layout(
             span_shear = _style_italic_shear(span.style)
             with _style_font_scope(span.style):
                 for char in span.text:
+                    if char in _ZERO_WIDTH_JOIN_CONTROLS:
+                        continue
                     if char == "＿":
                         items.append(
                             VerticalPlaceholderPlan(
@@ -1668,6 +1691,21 @@ def _vertical_base(
     scale_x: float = 1.0,
     scale_y: float = 1.0,
 ) -> VerticalGlyphBase:
+    if cdpt in _ZERO_WIDTH_JOIN_CONTROLS:
+        # Do not send invisible controls through the missing-glyph fallback,
+        # which would paint a question mark and reserve a full character slot.
+        return VerticalGlyphBase(
+            translated=cdpt,
+            rot_degree=0,
+            bitmap=None,
+            advance_y=0,
+            ink_x=0.0,
+            ink_w=0.0,
+            y=0,
+            advance_x=0,
+            glyph_left=0.0,
+            frame_width=0,
+        )
     state = _state()
     key = (
         state.font_family,

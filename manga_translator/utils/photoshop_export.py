@@ -446,14 +446,14 @@ def generate_text_layer_jsx(index: int, text_region, default_font: str, line_spa
     # 双重保险：强制移除所有可能的物理换行符，防止脚本语法错误
     if '\n' in text or '\r' in text:
         # 如果 escape_jsx_string 没有处理干净（理论上不应发生），这里强制处理
-        logger.warning(f"检测到文本层 {index} 内容中仍有物理换行符，正在强制清理")
+        logger.warning(f"Text layer {index} still contains physical line breaks, removing them")
         text = text.replace('\n', '\\r').replace('\r', '\\r')
     
     if not text:
-        logger.warning(f"文本层 {index} 的translation为空，跳过")
+        logger.warning(f"Text layer {index} has an empty translation, skipping")
         return ""
     
-    logger.debug(f"文本层 {index}: 原文='{' '.join(text_region.text)[:30]}', 译文='{raw_text[:30]}'")
+    logger.debug(f"Text layer {index}: source='{' '.join(text_region.text)[:30]}', translation='{raw_text[:30]}'")
     
     # 位置和尺寸 - 使用渲染阶段计算的 dst_points
     # dst_points 是 shape (1, 4, 2) 的数组，包含4个角点
@@ -701,9 +701,9 @@ def photoshop_export(output_file: str, ctx: Context, default_font: str = None, i
     if default_font and (os.path.sep in default_font or '/' in default_font or default_font.endswith('.ttf') or default_font.endswith('.otf')):
         # 从路径中提取文件名（不含扩展名）作为字体名称
         font_basename = os.path.splitext(os.path.basename(default_font))[0]
-        logger.warning(f"检测到 default_font 是文件路径: {default_font}")
-        logger.warning(f"已提取字体名称: {font_basename}")
-        logger.warning("提示: 请使用系统字体列表选择字体名称，而不是字体文件路径")
+        logger.warning(f"Detected a file path in default_font: {default_font}")
+        logger.warning(f"Extracted font name: {font_basename}")
+        logger.warning("Tip: Select a font name from the system font list instead of using a font file path")
         default_font = font_basename
     
     # 创建临时文件（只用于修复图和遮罩）
@@ -723,17 +723,17 @@ def photoshop_export(output_file: str, ctx: Context, default_font: str = None, i
     try:
         # PSD底图优先使用 editor_base，保持与编辑器中的“原图层”一致
         if not image_path or not os.path.exists(image_path):
-            raise ValueError(f"原图路径无效或文件不存在: {image_path}")
+            raise ValueError(f'Original image path is invalid or the file does not exist: {image_path}')
 
         from .path_manager import find_work_image_path, get_inpainted_path
 
         work_image_path = find_work_image_path(image_path)
         if work_image_path and os.path.exists(work_image_path):
             input_file = work_image_path
-            logger.info(f"PSD底图使用 editor_base: {input_file}")
+            logger.info(f"Using editor_base as the PSD base image: {input_file}")
         else:
             input_file = image_path
-            logger.info(f"PSD底图回退原图: {input_file}")
+            logger.info(f"Falling back to the original image as the PSD base image: {input_file}")
 
         # 修复图优先使用当前会话结果，避免吃到磁盘旧图
         inpainted_layer_code = ""
@@ -741,29 +741,29 @@ def photoshop_export(output_file: str, ctx: Context, default_font: str = None, i
             inpainted_layer_code = INPAINTED_LAYER_TEMPLATE.format(
                 inpainted_file=escape_jsx_path(inpainted_file)
             )
-            logger.info("PSD修复图使用当前会话结果")
+            logger.info("Using the current session result as the PSD inpainted image")
         elif image_path:
             inpainted_path = get_inpainted_path(image_path, create_dir=False)
             if os.path.exists(inpainted_path):
                 inpainted_layer_code = INPAINTED_LAYER_TEMPLATE.format(
                     inpainted_file=escape_jsx_path(inpainted_path)
                 )
-                logger.info(f"PSD修复图回退工作目录: {inpainted_path}")
+                logger.info(f"Falling back to the working directory for the PSD inpainted image: {inpainted_path}")
             else:
-                logger.debug(f"未找到可用修复图: {inpainted_path}")
+                logger.debug(f"No usable inpainted image found: {inpainted_path}")
         
         # 蒙版层 - 不添加
         mask_layer_code = ""
         
         # 生成文本层代码
         if default_font:
-            logger.info(f"PSD导出使用字体: {default_font}")
+            logger.info(f"Using font for PSD export: {default_font}")
         else:
-            logger.info("PSD导出使用 Photoshop 默认字体")
+            logger.info("Using the Photoshop default font for PSD export")
         text_layers_code = ""
         if hasattr(ctx, 'text_regions') and ctx.text_regions:
             filtered_regions = [r for r in ctx.text_regions if r.translation]
-            logger.info(f"准备添加 {len(filtered_regions)} 个文本层到 PSD")
+            logger.info(f"Preparing to add {len(filtered_regions)} text layers to the PSD")
             for i, region in enumerate(filtered_regions):
                 text_layers_code += generate_text_layer_jsx(i, region, default_font, line_spacing)
         
@@ -782,7 +782,7 @@ def photoshop_export(output_file: str, ctx: Context, default_font: str = None, i
         with open(jsx_file, 'w', encoding='utf-8-sig') as f:
             f.write(jsx_script)
         
-        logger.info(f"生成 JSX 脚本: {jsx_file}")
+        logger.info(f"Generated JSX script: {jsx_file}")
         
         # 如果启用verbose模式或script_only模式
         saved_script_path = None
@@ -807,27 +807,26 @@ def photoshop_export(output_file: str, ctx: Context, default_font: str = None, i
                     with open(debug_jsx_path, 'w', encoding='utf-8') as f:
                         f.write(jsx_script)
                     saved_script_path = debug_jsx_path
-                    logger.info(f"📝 JSX脚本已保存: {debug_jsx_path}")
+                    logger.info(f"📝 JSX script saved: {debug_jsx_path}")
             except Exception as e:
-                logger.warning(f"保存JSX脚本失败: {e}")
+                logger.warning(f"Failed to save JSX script: {e}")
         
         # 如果只生成脚本，直接返回
         if script_only:
-            logger.info("✅ 仅生成脚本模式：JSX脚本已保存，跳过Photoshop执行")
+            logger.info("✅ Script generation only: JSX script saved, skipping Photoshop execution")
             if saved_script_path:
-                logger.info(f"   脚本路径: {saved_script_path}")
+                logger.info(f"   Script path: {saved_script_path}")
             return
         
         # 执行 Photoshop
         ps_executable = find_photoshop_executable()
         if not ps_executable:
             raise FileNotFoundError(
-                "未找到 Photoshop 可执行文件。请确保已安装 Photoshop，"
-                "或设置环境变量 PHOTOSHOP_PATH 指向 Photoshop.exe"
+                'Photoshop executable not found. Ensure Photoshop is installed or set PHOTOSHOP_PATH to the Photoshop.exe path.'
             )
         
-        logger.info(f"使用 Photoshop: {ps_executable}")
-        logger.info(f"执行脚本: {jsx_file}")
+        logger.info(f"Using Photoshop: {ps_executable}")
+        logger.info(f"Executing script: {jsx_file}")
         
         # 运行 Photoshop（不等待进程退出，只等待 PSD 文件生成）
         import time
@@ -864,10 +863,10 @@ def photoshop_export(output_file: str, ctx: Context, default_font: str = None, i
             stdout, stderr = process.communicate(timeout=1)
             if stdout:
                 stdout_text = stdout.decode('utf-8', errors='replace')
-                logger.info(f"Photoshop 输出:\n{stdout_text}")
+                logger.info(f"Photoshop output:\n{stdout_text}")
             if stderr:
                 stderr_text = stderr.decode('utf-8', errors='replace')
-                logger.warning(f"Photoshop 错误输出:\n{stderr_text}")
+                logger.warning(f"Photoshop error output:\n{stderr_text}")
         except subprocess.TimeoutExpired:
             # Photoshop 还在运行，这是正常的
             pass
@@ -876,17 +875,17 @@ def photoshop_export(output_file: str, ctx: Context, default_font: str = None, i
         if os.path.exists(error_file):
             with open(error_file, 'r') as f:
                 error_msg = f.read()
-            logger.error(f"Photoshop 脚本执行错误: {error_msg}")
-            raise RuntimeError(f"Photoshop 脚本错误: {error_msg}")
+            logger.error(f"Photoshop script execution error: {error_msg}")
+            raise RuntimeError(f'Photoshop script error: {error_msg}')
         
         # 检查 PSD 文件是否成功生成
         if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
-            logger.info(f"PSD 文件已生成: {output_file}")
+            logger.info(f"PSD file generated: {output_file}")
         else:
             if elapsed >= timeout:
-                raise RuntimeError(f"Photoshop 执行超时 ({timeout}秒)，PSD 文件未生成")
+                raise RuntimeError(f'Photoshop execution timed out ({timeout}s); PSD file was not generated')
             else:
-                raise RuntimeError(f"PSD 文件生成失败: {output_file}")
+                raise RuntimeError(f'Failed to generate PSD file: {output_file}')
         
     finally:
         # 清理临时文件
@@ -895,14 +894,65 @@ def photoshop_export(output_file: str, ctx: Context, default_font: str = None, i
                 try:
                     os.unlink(temp_file)
                 except Exception as e:
-                    logger.warning(f"无法删除临时文件 {temp_file}: {e}")
+                    logger.warning(f"Failed to delete temporary file {temp_file}: {e}")
         
         # 如果不是verbose模式且不是script_only模式，删除JSX脚本
         if not verbose and not script_only and os.path.exists(jsx_file):
             try:
                 os.unlink(jsx_file)
             except Exception as e:
-                logger.warning(f"无法删除JSX脚本 {jsx_file}: {e}")
+                logger.warning(f"Failed to delete JSX script {jsx_file}: {e}")
+
+
+def _normalize_photoshop_path(value) -> Optional[str]:
+    """接受带引号的可执行文件路径或安装目录，并确认目标是文件。"""
+    if not isinstance(value, str):
+        return None
+    path = value.strip()
+    if len(path) >= 2 and path[0] == path[-1] and path[0] in ('"', "'"):
+        path = path[1:-1]
+    if not path:
+        return None
+    path = os.path.expanduser(os.path.expandvars(path))
+    if platform.system() == "Windows" and os.path.isdir(path):
+        path = os.path.join(path, "Photoshop.exe")
+    return path if os.path.isfile(path) else None
+
+
+def _find_photoshop_from_environment() -> Optional[str]:
+    """检查进程环境及 Windows 已保存的变量，兼容启动后修改系统变量。"""
+    value = os.getenv("PHOTOSHOP_PATH")
+    if value:
+        path = _normalize_photoshop_path(value)
+        if path:
+            logger.info(f"Found Photoshop via environment variable: {path}")
+            return path
+        logger.warning(f"The file specified by PHOTOSHOP_PATH does not exist: {value!r}")
+
+    if platform.system() != "Windows":
+        return None
+    try:
+        import winreg
+    except ImportError:
+        return None
+
+    # os.environ 是进程启动时的快照，系统设置里刚保存的值可能尚未继承。
+    for hkey, subkey, source in [
+        (winreg.HKEY_CURRENT_USER, r"Environment", 'user environment variable'),
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment", 'system environment variable'),
+    ]:
+        try:
+            with winreg.OpenKey(hkey, subkey) as key:
+                value, _ = winreg.QueryValueEx(key, "PHOTOSHOP_PATH")
+            path = _normalize_photoshop_path(value)
+            if path:
+                logger.info(f"Found Photoshop via {source}: {path}")
+                return path
+            logger.warning(f"The file specified by {source} PHOTOSHOP_PATH does not exist: {value!r}")
+        except OSError as e:
+            logger.debug(f"Failed to read {source} PHOTOSHOP_PATH: {e}")
+    return None
 
 
 def find_photoshop_from_registry() -> Optional[str]:
@@ -918,9 +968,25 @@ def find_photoshop_from_registry() -> Optional[str]:
     try:
         import winreg
     except ImportError:
-        logger.warning("无法导入 winreg 模块，跳过注册表查询")
+        logger.warning("Cannot import winreg, skipping registry lookup")
         return None
     
+    # App Paths 的默认值直接指向可执行文件，不受安装盘符限制。
+    for hkey in [winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE]:
+        for view in [winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY]:
+            try:
+                with winreg.OpenKey(
+                    hkey, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\Photoshop.exe",
+                    0, winreg.KEY_READ | view,
+                ) as key:
+                    value, _ = winreg.QueryValueEx(key, "")
+                ps_exe = _normalize_photoshop_path(value)
+                if ps_exe:
+                    logger.info(f"Found Photoshop via the App Paths registry: {ps_exe}")
+                    return ps_exe
+            except OSError:
+                continue
+
     # 可能的注册表路径
     registry_paths = [
         # Photoshop CC 及更新版本
@@ -957,21 +1023,19 @@ def find_photoshop_from_registry() -> Optional[str]:
                             for value_name in ["ApplicationPath", "InstallPath", "Path"]:
                                 try:
                                     install_path, _ = winreg.QueryValueEx(version_key, value_name)
-                                    if install_path:
-                                        # 构建可执行文件路径
-                                        ps_exe = os.path.join(install_path, "Photoshop.exe")
-                                        if os.path.exists(ps_exe):
-                                            logger.info(f"从注册表找到 Photoshop: {ps_exe}")
-                                            return ps_exe
+                                    ps_exe = _normalize_photoshop_path(install_path)
+                                    if ps_exe:
+                                        logger.info(f"Found Photoshop via the registry: {ps_exe}")
+                                        return ps_exe
                                 except FileNotFoundError:
                                     continue
                     except Exception as e:
-                        logger.debug(f"读取注册表版本 {version} 失败: {e}")
+                        logger.debug(f"Failed to read registry version {version}: {e}")
                         continue
         except FileNotFoundError:
             continue
         except Exception as e:
-            logger.debug(f"读取注册表路径 {subkey_path} 失败: {e}")
+            logger.debug(f"Failed to read registry path {subkey_path}: {e}")
             continue
     
     return None
@@ -982,7 +1046,7 @@ def find_photoshop_executable() -> Optional[str]:
     查找 Photoshop 可执行文件路径
     
     查找顺序：
-    1. 环境变量 PHOTOSHOP_PATH
+    1. 环境变量 PHOTOSHOP_PATH（含 Windows 当前保存的用户/系统变量）
     2. Windows 注册表（仅 Windows）
     3. 常见安装路径
     4. 遍历 Adobe 目录
@@ -992,9 +1056,8 @@ def find_photoshop_executable() -> Optional[str]:
     """
     
     # 1. 优先使用环境变量
-    ps_path = os.getenv("PHOTOSHOP_PATH")
-    if ps_path and os.path.exists(ps_path):
-        logger.info(f"从环境变量找到 Photoshop: {ps_path}")
+    ps_path = _find_photoshop_from_environment()
+    if ps_path:
         return ps_path
     
     system = platform.system()
@@ -1025,7 +1088,7 @@ def find_photoshop_executable() -> Optional[str]:
         # 搜索所有可能的路径
         for path in possible_paths:
             if os.path.exists(path):
-                logger.info(f"从常见路径找到 Photoshop: {path}")
+                logger.info(f"Found Photoshop in a common location: {path}")
                 return path
         
         # 4. 遍历 Program Files 中的 Adobe 目录
@@ -1042,10 +1105,10 @@ def find_photoshop_executable() -> Optional[str]:
                         if "Photoshop" in folder:
                             ps_exe = os.path.join(adobe_dir, folder, "Photoshop.exe")
                             if os.path.exists(ps_exe):
-                                logger.info(f"从 Adobe 目录找到 Photoshop: {ps_exe}")
+                                logger.info(f"Found Photoshop in the Adobe directory: {ps_exe}")
                                 return ps_exe
                 except Exception as e:
-                    logger.debug(f"遍历 Adobe 目录失败: {e}")
+                    logger.debug(f"Failed to scan the Adobe directory: {e}")
     
     elif system == "Darwin":  # macOS
         possible_paths = [
@@ -1058,10 +1121,10 @@ def find_photoshop_executable() -> Optional[str]:
         
         for path in possible_paths:
             if os.path.exists(path):
-                logger.info(f"从常见路径找到 Photoshop: {path}")
+                logger.info(f"Found Photoshop in a common location: {path}")
                 return path
     
-    logger.warning("未找到 Photoshop 安装")
+    logger.warning("Photoshop installation not found")
     return None
 
 
@@ -1074,8 +1137,8 @@ def test_photoshop_installation() -> bool:
     """
     ps_exe = find_photoshop_executable()
     if not ps_exe:
-        logger.error("未找到 Photoshop 安装")
+        logger.error("Photoshop installation not found")
         return False
     
-    logger.info(f"找到 Photoshop: {ps_exe}")
+    logger.info(f"Found Photoshop: {ps_exe}")
     return True

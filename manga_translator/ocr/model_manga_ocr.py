@@ -67,7 +67,7 @@ class InternalMangaOcr:
         elif isinstance(img_or_path, Image.Image):
             img = img_or_path
         else:
-            raise ValueError(f"img_or_path 必须是路径或 PIL.Image，得到: {type(img_or_path)}")
+            raise ValueError(f"img_or_path must be a path or PIL.Image; got: {type(img_or_path)}")
         
         # 转换为灰度再转回 RGB（manga_ocr 的预处理方式）
         img = img.convert("L").convert("RGB")
@@ -237,7 +237,7 @@ class ModelMangaOCR(OfflineOCR):
             return prob
         return float(np.exp(np.log(min(prob, 1.0)) / (token_count + 1)))
     
-    async def _infer(self, image: np.ndarray, textlines: List[Quadrilateral], config: OcrConfig, verbose: bool = False, ignore_bubble: int = 0) -> List[TextBlock]:
+    async def _infer(self, image: np.ndarray, textlines: List[Quadrilateral], config: OcrConfig, verbose: bool = False, ignore_bubble: int = 0, bubble_mask: np.ndarray = None) -> List[TextBlock]:
         text_height = 48
         max_chunk_size = 16
         ignore_bubble = config.ignore_bubble
@@ -282,7 +282,7 @@ class ModelMangaOCR(OfflineOCR):
                 # 使用基类的通用气泡过滤方法（支持高级检测）
                 if ignore_bubble > 0 or use_model_bubble_filter:
                     textline = quadrilaterals[idx][0]
-                    if self._should_ignore_region(region_imgs[idx], ignore_bubble, image, textline, config):
+                    if self._should_ignore_region(region_imgs[idx], ignore_bubble, image, textline, config, bubble_mask=bubble_mask):
                         self.logger.info(f'[FILTERED] Region {ix} ignored - Non-bubble area detected (ignore_bubble={ignore_bubble}, model_filter={use_model_bubble_filter})')
                         ix += 1
                         continue

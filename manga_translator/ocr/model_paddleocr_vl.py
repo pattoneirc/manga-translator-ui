@@ -267,10 +267,10 @@ class ModelPaddleOCRVL(OfflineOCR):
                 if device == 'cuda' or device == 'mps':
                     self.color_model = self.color_model.to(device)
             else:
-                self.logger.warning(f"48px 模型文件不存在: {dict_48px_path} 或 {ckpt_48px_path}")
+                self.logger.warning(f"48px model files not found: {dict_48px_path} or {ckpt_48px_path}")
                 self.color_model = None
         except Exception as e:
-            self.logger.warning(f"加载 48px 颜色模型失败: {e}")
+            self.logger.warning(f"Failed to load the 48px color model: {e}")
             self.color_model = None
 
     async def _unload(self):
@@ -483,9 +483,9 @@ class ModelPaddleOCRVL(OfflineOCR):
             # 如果出错，设置默认颜色
             textline.fg_r = textline.fg_g = textline.fg_b = 0
             textline.bg_r = textline.bg_g = textline.bg_b = 255
-            self.logger.debug(f"48px 颜色预测失败: {e}")
+            self.logger.debug(f"48px color prediction failed: {e}")
 
-    async def _infer(self, image: np.ndarray, textlines: List[Quadrilateral], config: OcrConfig, verbose: bool = False) -> List[Quadrilateral]:
+    async def _infer(self, image: np.ndarray, textlines: List[Quadrilateral], config: OcrConfig, verbose: bool = False, bubble_mask: np.ndarray = None) -> List[Quadrilateral]:
         """
         推理主函数
 
@@ -523,7 +523,7 @@ class ModelPaddleOCRVL(OfflineOCR):
             # 过滤非气泡区域
             if ignore_bubble > 0 or use_model_bubble_filter:
                 filter_region = q.get_transformed_region(image, direction, text_height)
-                should_ignore = self._should_ignore_region(filter_region, ignore_bubble, image, q, config)
+                should_ignore = self._should_ignore_region(filter_region, ignore_bubble, image, q, config, bubble_mask=bubble_mask)
                 self._cleanup_ocr_memory(filter_region)
                 if should_ignore:
                     self.logger.info(f'[FILTERED] Region {idx} ignored - Non-bubble area detected (ignore_bubble={ignore_bubble}, model_filter={use_model_bubble_filter})')
