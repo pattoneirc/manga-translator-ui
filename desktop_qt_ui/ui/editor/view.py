@@ -572,6 +572,14 @@ class EditorView(QWidget):
         """处理分布按钮点击。"""
         self.controller.distribute_regions(mode)
 
+    def _on_perspective_convert(self):
+        """将选中文本框转换为透视四边形（角点可自由拖动）。"""
+        self.graphics_view.convert_selected_to_perspective()
+
+    def _on_perspective_reset(self):
+        """将选中的透视文本框恢复为矩形（取四边形包围盒）。"""
+        self.graphics_view.reset_selected_to_rect()
+
     def _on_selection_changed_for_toolbar(self, selected_indices: list):
         """根据选区数量更新对齐/分布按钮的启用状态。"""
         count = len(selected_indices) if selected_indices else 0
@@ -870,7 +878,11 @@ class EditorView(QWidget):
             (self.model.regions_changed, self._on_regions_changed_for_rich_editor),
             (
                 self.model.brush_size_changed,
-                self.property_panel.sync_brush_size_from_model,
+                self.property_panel.on_model_brush_size_changed,
+            ),
+            (
+                self.model.eraser_size_changed,
+                self.property_panel.on_model_eraser_size_changed,
             ),
             (
                 self.model.brush_color_changed,
@@ -923,6 +935,14 @@ class EditorView(QWidget):
             ),
             (self.toolbar.align_requested, self._on_align_requested),
             (self.toolbar.distribute_requested, self._on_distribute_requested),
+            (
+                self.toolbar.perspective_convert_requested,
+                self._on_perspective_convert,
+            ),
+            (
+                self.toolbar.perspective_reset_requested,
+                self._on_perspective_reset,
+            ),
         ):
             signal.connect(slot)
         for signal, key in (
@@ -1069,6 +1089,7 @@ class EditorView(QWidget):
         )
         self.property_panel.mask_tool_changed.connect(self.model.set_active_tool)
         self.property_panel.brush_size_changed.connect(self.model.set_brush_size)
+        self.property_panel.eraser_size_changed.connect(self.model.set_eraser_size)
         self.property_panel.brush_color_changed.connect(self.model.set_brush_color)
 
         if self.rich_text_editor is not None:

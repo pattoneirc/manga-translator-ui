@@ -130,6 +130,40 @@ class GraphicsView(
         """设置文本框边/角拖拽是否围绕中心对称缩放。"""
         self._center_scale_enabled = bool(enabled)
 
+    def convert_selected_to_perspective(self) -> bool:
+        """把选中的文本框转换为透视四边形（角点可自由拖动）。"""
+        items = [
+            item
+            for item in self._region_items
+            if item is not None and item.isSelected()
+        ]
+        if not items:
+            return False
+        for item in items:
+            try:
+                if item.scene() is not None:
+                    item.enable_perspective()
+            except RuntimeError:
+                pass
+        return True
+
+    def reset_selected_to_rect(self) -> bool:
+        """把选中的透视文本框恢复为矩形（取四边形包围盒）。"""
+        items = [
+            item
+            for item in self._region_items
+            if item is not None and item.isSelected()
+        ]
+        if not items:
+            return False
+        for item in items:
+            try:
+                if item.scene() is not None:
+                    item.disable_perspective()
+            except RuntimeError:
+                pass
+        return True
+
     def clear_pending_geometry_edits(self) -> None:
         self._clear_pending_geometry_edits()
 
@@ -223,6 +257,7 @@ class GraphicsView(
         )
         self.model.active_tool_changed.connect(self._on_active_tool_changed)
         self.model.brush_size_changed.connect(self._on_brush_size_changed)
+        self.model.eraser_size_changed.connect(self._on_eraser_size_changed)
         self.model.brush_color_changed.connect(self._on_brush_color_changed)
 
     def get_view_state(self):
