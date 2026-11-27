@@ -352,6 +352,7 @@ class MangaTranslator:
         self.disable_onnx_gpu = False
 
         self._progress_hooks = []
+        self._file_completed_hooks = []
         self._add_logger_hook()
         
         # 取消检查回调（用于Web服务器等场景）
@@ -683,16 +684,17 @@ class MangaTranslator:
                 mode_label,
                 source_image=ctx.input,
             )
-            ctx.output_path = final_output_path
-            
             if success is None:
+                ctx.output_path = final_output_path
                 ctx.success = True
                 ctx.skipped = True
                 ctx.skip_reason = 'existing_output_race'
                 ctx.skip_message = f"Output file appeared during processing: {os.path.basename(final_output_path)}"
             elif success:
+                ctx.output_path = final_output_path
                 ctx.success = True
             else:
+                ctx.output_path = None
                 self._mark_context_failure(
                     ctx,
                     RuntimeError(f"Failed to save output file: {os.path.basename(final_output_path)}"),
@@ -888,8 +890,11 @@ class MangaTranslator:
 
         # 记录本次主翻译流程的输出目录，编辑器再次导出时回写到原目录
         final_output_dir = getattr(ctx, 'final_output_dir', None)
+        output_path = getattr(ctx, 'output_path', None)
         if final_output_dir:
             data_to_save['last_export_dir'] = final_output_dir
+        if output_path and isinstance(output_path, str):
+            data_to_save['last_output_path'] = output_path
         elif os.path.exists(text_output_file):
             # 本轮没有写图（例如仅导出 JSON 模式），保留已有的 last_export_dir
             try:
@@ -898,9 +903,13 @@ class MangaTranslator:
                 if existing_data and len(existing_data.values()) > 0:
                     existing_image_data = next(iter(existing_data.values()))
                     if isinstance(existing_image_data, dict):
-                        preserved_dir = existing_image_data.get('last_export_dir')
-                        if preserved_dir:
-                            data_to_save['last_export_dir'] = preserved_dir
+                        if 'last_export_dir' not in data_to_save:
+                            preserved_dir = existing_image_data.get('last_export_dir')
+                            if preserved_dir:
+                                data_to_save['last_export_dir'] = preserved_dir
+                        preserved_output = existing_image_data.get('last_output_path')
+                        if preserved_output:
+                            data_to_save['last_output_path'] = preserved_output
             except Exception as e:
                 logger.debug(f"Failed to preserve last_export_dir from existing JSON {text_output_file}: {e}")
 
@@ -922,6 +931,7 @@ class MangaTranslator:
 
             with open(text_output_file, 'wb') as f:
                 f.write(json_string.encode('utf-8'))
+            ctx.json_path = text_output_file
             logger.info(f"JSON saved to: {text_output_file}")
             return True
         except Exception as e:
@@ -1039,6 +1049,7 @@ class MangaTranslator:
                 self._mark_context_failure(ctx, exc, stage='export')
 
             results.append(ctx)
+            self._notify_file_completed(ctx)
             completed = min(global_offset + len(results), display_total)
             failed_count = sum(
                 1 for result in results if getattr(result, 'translation_error', None)
@@ -1256,13 +1267,9 @@ class MangaTranslator:
                 find_txt_files,
             )
             
-            # 获取默认模板路径
-            template_path = self._get_default_template_path()
-            if not template_path or not os.path.exists(template_path):
-                logger.warning("Template file not found, skipping TXT to JSON import")
-                return
-            
-            # 收集需要处理的图片路径
+            # 收集需要处理的图片路径（跳过已注册内存直通载荷的编辑器导出，
+            # 避免后台导出重写磁盘 JSON 并与编辑器保存发生文件锁/覆盖竞争）
+            preloaded_payloads = getattr(self, '_preloaded_load_text_payloads', None) or {}
             image_paths = []
             for image, config in images_with_configs:
                 image_path = None
@@ -1271,12 +1278,22 @@ class MangaTranslator:
                 elif isinstance(image, (str, os.PathLike)):
                     image_path = os.fspath(image)
 
-                if image_path:
-                    image_paths.append(image_path)
-                else:
+                if not image_path:
                     continue
+                if image_path in preloaded_payloads:
+                    logger.debug(
+                        f"Skipping TXT to JSON import for preloaded editor export: {os.path.basename(image_path)}"
+                    )
+                    continue
+                image_paths.append(image_path)
             
             if not image_paths:
+                return
+
+            # 获取默认模板路径
+            template_path = self._get_default_template_path()
+            if not template_path or not os.path.exists(template_path):
+                logger.warning("Template file not found, skipping TXT to JSON import")
                 return
             
             # 批量处理TXT导入
@@ -3239,7 +3256,10 @@ class MangaTranslator:
         img_for_inpaint = ctx.img_rgb
         mask_for_inpaint = ctx.mask
         solid_fill = getattr(config.inpainter, 'solid_fill_pure_bubbles', False)
-        per_block = getattr(config.inpainter, 'per_block_inpainting', False)
+        per_block = (
+            getattr(config.inpainter, 'per_block_inpainting', False)
+            and config.inpainter.inpainter != Inpainter.blur
+        )
         text_regions = getattr(ctx, 'text_regions', None) or []
         if (solid_fill and text_regions) or per_block:
             try:
@@ -3550,6 +3570,31 @@ class MangaTranslator:
 
     def add_progress_hook(self, ph):
         self._progress_hooks.append(ph)
+
+    def add_file_completed_hook(self, hook):
+        """注册单张图片翻译完成回调。"""
+        self._file_completed_hooks.append(hook)
+
+    def _notify_file_completed(self, ctx: Context):
+        """在单张图片成功完成处理或命中已有输出跳过时通知已注册的回调（幂等）。"""
+        if ctx is None:
+            return
+        if getattr(ctx, 'translation_error', None):
+            return
+        if getattr(ctx, 'skip_reason', None) == 'missing_required_original_text':
+            return
+        if getattr(ctx, 'success', None) is False:
+            return
+        if not (getattr(ctx, 'success', False) or getattr(ctx, 'result', None) is not None):
+            return
+        if getattr(ctx, '_file_completed_notified', False):
+            return
+        ctx._file_completed_notified = True
+        for hook in list(getattr(self, '_file_completed_hooks', ())):
+            try:
+                hook(ctx)
+            except Exception as exc:
+                logger.debug(f"File completed hook error (ignored): {exc}")
     
     def set_cancel_check_callback(self, callback):
         """设置取消检查回调函数"""
@@ -3618,6 +3663,10 @@ class MangaTranslator:
         self._prepare_resume_context(plan)
 
         if skipped_count:
+            for skipped_ctx in plan.skipped_contexts:
+                if getattr(skipped_ctx, 'skip_reason', None) == 'missing_required_original_text':
+                    continue
+                self._notify_file_completed(skipped_ctx)
             completed = min(processing_offset, display_total)
             await self._report_progress(
                 f"batch:{completed}:{completed}:{display_total}:0:{skipped_count}"
@@ -3637,8 +3686,20 @@ class MangaTranslator:
             return plan.merge_results(contexts)
 
         if self.load_text:
-            logger.info("Load text mode detected: Auto-importing translations from TXT to JSON...")
-            self._preprocess_load_text_mode(images_with_configs)
+            preloaded_payloads = getattr(self, '_preloaded_load_text_payloads', None) or {}
+            has_disk_load_text = False
+            for img, _ in images_with_configs:
+                img_path = None
+                if hasattr(img, 'name') and img.name:
+                    img_path = img.name
+                elif isinstance(img, (str, os.PathLike)):
+                    img_path = os.fspath(img)
+                if img_path and img_path not in preloaded_payloads:
+                    has_disk_load_text = True
+                    break
+            if has_disk_load_text:
+                logger.info("Load text mode detected: Auto-importing translations from TXT to JSON...")
+                self._preprocess_load_text_mode(images_with_configs)
 
         if self.replace_translation:
             logger.info("Replace translation mode detected: Will extract translations from translated images")
@@ -3739,6 +3800,8 @@ class MangaTranslator:
         results = []
 
         async def report_completed_image_progress():
+            if results:
+                self._notify_file_completed(results[-1])
             if display_total <= 0:
                 return
             completed = min(processing_offset + len(results), display_total)
@@ -4126,7 +4189,20 @@ class MangaTranslator:
                                 )
                                 ctx = await self._revert_upscale(config, ctx)
 
-                            # load_text模式：渲染后回写JSON（同步最新regions，包含translation/font_size等字段）
+                            # load_text 的结果有时会复用输入图片（例如无文本区域时
+                            # ctx.result = ctx.upscaled），或仍持有输入文件的惰性句柄。
+                            # 后续内存清理会关闭输入图片，因此必须先生成完全独立的结果，
+                            # 否则调用方在 translate() 返回后 copy/save 会报：
+                            # ValueError: Operation on closed image
+                            self._detach_context_result(ctx)
+
+                            if save_info and ctx.result is not None:
+                                try:
+                                    self._save_and_cleanup_context(ctx, save_info, config, "LOAD_TEXT")
+                                except Exception as save_err:
+                                    logger.error(f"Error saving load_text result for {os.path.basename(ctx.image_name)}: {save_err}")
+
+                            # load_text模式：渲染并保存输出图后回写JSON（同步最新regions及last_output_path）
                             # 编辑器导出（编辑器已自行持久化工程 JSON）时跳过回写
                             if (
                                 hasattr(ctx, 'text_regions') and ctx.text_regions is not None
@@ -4146,15 +4222,8 @@ class MangaTranslator:
                                         self._save_text_to_file(ctx.image_name, ctx, config)
                                     except Exception as save_json_err:
                                         logger.error(f"Error updating JSON in load_text mode for {os.path.basename(ctx.image_name)}: {save_json_err}")
-                            
-                            preprocessed_contexts.append((ctx, config))
 
-                            # load_text 的结果有时会复用输入图片（例如无文本区域时
-                            # ctx.result = ctx.upscaled），或仍持有输入文件的惰性句柄。
-                            # 后续内存清理会关闭输入图片，因此必须先生成完全独立的结果，
-                            # 否则调用方在 translate() 返回后 copy/save 会报：
-                            # ValueError: Operation on closed image
-                            self._detach_context_result(ctx)
+                            preprocessed_contexts.append((ctx, config))
 
                             # ✅ 每处理完一张图片后立即清理内存（保留result）
                             self._cleanup_context_memory(ctx, keep_result=True)
@@ -5857,6 +5926,8 @@ class MangaTranslator:
         
 
         async def report_completed_image_progress():
+            if results:
+                self._notify_file_completed(results[-1])
             if display_total <= 0:
                 return
             completed = min(global_offset + len(results), display_total)
